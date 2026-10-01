@@ -157,6 +157,13 @@ Flags win over environment variables.
 | `--commit-batch` | | `4096` | max events per fsync |
 | `--max-payload-bytes` | `VERILOG_MAX_PAYLOAD_BYTES` | 1 MiB | per-event payload limit; larger payloads get a per-event rejection (the gRPC receive limit is 4× this plus 1 MiB). Keep the SDK's `max_payload_bytes` at or below it |
 | `--stream-window` | | `1024` | unacknowledged events per stream |
+| `--max-agent-unanchored-events` | | `100000` | per-agent quota of unanchored events ([Resource limits](#resource-limits-and-backpressure); 0: none) |
+| `--max-agent-unanchored-bytes` | | 256 MiB | per-agent quota of unanchored canonical bytes (0: none) |
+| `--max-unanchored-bytes` | | 4 GiB | all agents' unanchored canonical bytes (0: none) |
+| `--max-anchor-queue` | | `1024` | sealed epochs awaiting a final anchor (0: none) |
+| `--agent-rate`, `--agent-burst` | | off, 1 s worth | per-agent ingest rate limit (events/s) and burst |
+| `--min-free-disk-bytes` | | 1 GiB | refuse events and log ERROR below this much free space in the data dir (0: off) |
+| `--metrics-listen` | `VERILOG_METRICS_LISTEN` | off | Prometheus `/metrics` address, e.g. `127.0.0.1:9464` |
 | `--log-level`, `--log-format` | `VERILOG_LOG_LEVEL`, `VERILOG_LOG_FORMAT` | `info`, `text` | logging |
 
 Credentials and API keys in the RPC URL (userinfo, query parameters, provider
@@ -329,6 +336,45 @@ or the anchor read at the final block does not match the receipt, it logs
 ERROR and anchors the epoch again. None of this loses events, since nothing
 is compacted before finality. An anchor not final after
 `--finality-timeout` is logged at ERROR and keeps waiting.
+
+## Resource limits and backpressure
+
+A flooding agent or a long RPC outage must not exhaust the daemon. Every event
+is checked against the limits above **before** it is written: one over a
+limit gets a rejection with `retryable` and `retry_after_ms` set, nothing is
+written, and the SDK keeps the event and sends it again, in order, for as long
+as it takes. An acknowledged event is never dropped. Events are
+"unanchored" from acknowledgement until their anchor is final.
+
+| Reason (`reason` label) | Refused when | Who |
+|---|---|---|
+| `agent_unanchored_events`, `agent_unanchored_bytes` | the agent is at its quota | that agent only |
+| `agent_rate` | the agent exceeds `--agent-rate` | that agent only |
+| `unanchored_bytes` | all agents together hold `--max-unanchored-bytes` | everyone |
+| `anchor_queue_full` | `--max-anchor-queue` epochs await anchoring | everyone |
+| `disk_low` | the data dir has less than `--min-free-disk-bytes` free (checked every 5 s; logged at ERROR) | everyone |
+
+Keep the per-agent quotas well below the global limits, so a single agent hits
+its own quota first and the others are unaffected. The anchor worker also
+takes agents in turn (each agent's epochs oldest first), so one agent's
+backlog does not delay another's epochs.
+
+**Memory.** Open and sealed epochs keep about 200 bytes per event (digests,
+leaf, WAL location), never payloads; bundles read the events back from the
+WAL. WAL replay at startup streams. Size memory from the event quotas, e.g.
+`--max-anchor-queue` × `--epoch-max-logs` sealed events. **Disk.** The WAL
+holds every unanchored event until its anchor is final, so an outage grows
+it; `--max-unanchored-bytes` and `--min-free-disk-bytes` bound that.
+
+**Observability.** The `stats` log line (every minute) carries the anchor
+queue, finality lag, unanchored events and bytes, WAL bytes, free disk and
+backpressure rejections. With `--metrics-listen`, the same are served as
+Prometheus metrics (`verilog_anchor_queue_epochs`, `verilog_finality_lag_seconds`,
+`verilog_unanchored_bytes`, `verilog_agent_unanchored_bytes{agent_id}`,
+`verilog_backpressure_rejections_total{reason}`, `verilog_wal_bytes`,
+`verilog_disk_free_bytes`, `verilog_disk_low`, ...). The endpoint has no
+authentication: keep it on loopback or a private network. Alert on
+`disk_low`, a growing anchor queue or finality lag, and sustained rejections.
 
 ## Transport security (mTLS)
 

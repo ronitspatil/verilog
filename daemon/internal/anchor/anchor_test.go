@@ -115,7 +115,9 @@ func newSimEnv(t *testing.T) *simEnv {
 	client := sim.Client()
 	chainID, _ := client.ChainID(context.Background())
 	opts, _ := bind.NewKeyedTransactorWithChainID(key, chainID)
-	addr, _, reg, err := registry.DeployVeriLogRegistry(opts, client, from, from)
+	// The admin (key admin) is a separate account; the anchorer never holds it.
+	admin := common.HexToAddress("0x000000000000000000000000000000000000ad01")
+	addr, _, reg, err := registry.DeployVeriLogRegistry(opts, client, admin, from)
 	if err != nil {
 		t.Fatal(err)
 	}

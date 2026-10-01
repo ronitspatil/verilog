@@ -1,21 +1,26 @@
+import hashlib
 import json
 import pathlib
 
 import pytest
 
+from verilog_sdk._keccak import keccak256
 from verilog_sdk.canonical import (
+    SIGNING_DOMAIN,
     canonical_event,
     canonical_json,
     content_digest,
     format_es6_float,
     format_timestamp,
+    signing_bytes,
 )
+from verilog_sdk.signer import Signer
 
-VECTORS = pathlib.Path(__file__).resolve().parents[3] / "testdata" / "canonical_vectors.json"
+TESTDATA = pathlib.Path(__file__).resolve().parents[3] / "testdata"
 
 
-def _cases():
-    return json.loads(VECTORS.read_text(encoding="utf-8"))["cases"]
+def _load(name):
+    return json.loads((TESTDATA / name).read_text(encoding="utf-8"))
 
 
 def _ns(ts: str) -> int:
@@ -27,13 +32,48 @@ def _ns(ts: str) -> int:
     return secs * 1_000_000_000 + int(frac)
 
 
-@pytest.mark.parametrize("case", _cases(), ids=lambda c: c["name"])
-def test_matches_go_vectors(case):
+def _vector_cases():
+    out = []
+    for name, key in (("canonical_vectors.json", "cases"), ("signed_vectors.json", "run")):
+        data = _load(name)
+        for case in data[key]:
+            out.append(pytest.param(data["seed"], case, id=f"{name}:{case['name']}"))
+    return out
+
+
+@pytest.mark.parametrize("seed,case", _vector_cases())
+def test_matches_go_signed_vectors(seed, case):
+    """Byte-exact parity with the Go canonicalization and Ed25519 signatures."""
+    signer = Signer.from_hex(seed)
+    assert "0x" + signer.key_id.hex() == case["key_id"]
     payload = json.loads(case["payload_json"])
     assert canonical_json(payload) == case["canonical_payload"]
-    text = canonical_event(case["agent_id"], case["step_number"], case["event_type"], payload, _ns(case["timestamp_utc"]))
+    prev = bytes.fromhex(case["prev_hash"][2:])
+    args = (case["agent_id"], case["run_id"], case["step_number"], prev, case["event_type"], payload,
+            _ns(case["timestamp_utc"]), signer.key_id)
+    msg = signing_bytes(*args)
+    assert msg == case["signing_bytes"].encode("utf-8")
+    sig = signer.sign(msg)
+    assert "0x" + sig.hex() == case["sig"]
+    text = canonical_event(*args, sig)
     assert text == case["canonical_event"]
     assert "0x" + content_digest(text).hex() == case["content_digest"]
+    assert "0x" + keccak256(content_digest(text)).hex() == case["leaf"]
+    assert "0x" + keccak256(case["agent_id"].encode()).hex() == case["agent_key"]
+
+
+def test_signed_vectors_form_a_chain():
+    data = _load("signed_vectors.json")
+    assert data["signing_domain"].encode() == SIGNING_DOMAIN
+    signer = Signer.from_hex(data["seed"])
+    assert "0x" + signer.public_key.hex() == data["public_key"]
+    assert "0x" + signer.key_id.hex() == data["key_id"]
+    prev = "0x" + "00" * 32
+    for i, case in enumerate(data["run"]):
+        assert case["step_number"] == i + 1
+        assert case["prev_hash"] == prev
+        prev = "0x" + hashlib.sha256(case["canonical_event"].encode()).hexdigest()
+    assert data["run"][-1]["event_type"] == "run_end"
 
 
 def test_key_order_and_whitespace():

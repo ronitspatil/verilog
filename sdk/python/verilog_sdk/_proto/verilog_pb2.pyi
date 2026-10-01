@@ -10,20 +10,28 @@ from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
 DESCRIPTOR: _descriptor.FileDescriptor
 
 class LogEvent(_message.Message):
-    __slots__ = ("agent_id", "step_number", "event_type", "payload_json", "timestamp_utc", "sequence")
+    __slots__ = ("agent_id", "step_number", "event_type", "payload_json", "timestamp_utc", "run_id", "prev_hash", "key_id", "signature", "sequence")
     AGENT_ID_FIELD_NUMBER: _ClassVar[int]
     STEP_NUMBER_FIELD_NUMBER: _ClassVar[int]
     EVENT_TYPE_FIELD_NUMBER: _ClassVar[int]
     PAYLOAD_JSON_FIELD_NUMBER: _ClassVar[int]
     TIMESTAMP_UTC_FIELD_NUMBER: _ClassVar[int]
+    RUN_ID_FIELD_NUMBER: _ClassVar[int]
+    PREV_HASH_FIELD_NUMBER: _ClassVar[int]
+    KEY_ID_FIELD_NUMBER: _ClassVar[int]
+    SIGNATURE_FIELD_NUMBER: _ClassVar[int]
     SEQUENCE_FIELD_NUMBER: _ClassVar[int]
     agent_id: str
     step_number: int
     event_type: str
     payload_json: str
     timestamp_utc: _timestamp_pb2.Timestamp
+    run_id: str
+    prev_hash: bytes
+    key_id: bytes
+    signature: bytes
     sequence: int
-    def __init__(self, agent_id: _Optional[str] = ..., step_number: _Optional[int] = ..., event_type: _Optional[str] = ..., payload_json: _Optional[str] = ..., timestamp_utc: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., sequence: _Optional[int] = ...) -> None: ...
+    def __init__(self, agent_id: _Optional[str] = ..., step_number: _Optional[int] = ..., event_type: _Optional[str] = ..., payload_json: _Optional[str] = ..., timestamp_utc: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., run_id: _Optional[str] = ..., prev_hash: _Optional[bytes] = ..., key_id: _Optional[bytes] = ..., signature: _Optional[bytes] = ..., sequence: _Optional[int] = ...) -> None: ...
 
 class Ack(_message.Message):
     __slots__ = ("sequence", "accepted", "error", "content_digest", "leaf", "duplicate")

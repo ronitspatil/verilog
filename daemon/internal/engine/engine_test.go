@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"crypto/ed25519"
 	"fmt"
 	"sync"
 	"testing"
@@ -84,12 +85,25 @@ func slowCfg() Config {
 }
 
 func event(agent string, step uint64) canonical.Event {
-	return canonical.Event{
+	ev := canonical.Event{
 		AgentID:      agent,
 		StepNumber:   step,
 		EventType:    "tool_start",
 		PayloadJSON:  []byte(fmt.Sprintf(`{"step":%d,"tool":"search"}`, step)),
 		TimestampUTC: time.Unix(1_800_000_000, int64(step)).UTC(),
+	}
+	sign(&ev)
+	return ev
+}
+
+var testKey = ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
+
+func sign(ev *canonical.Event) {
+	if ev.RunID == "" {
+		ev.RunID = "run-" + ev.AgentID
+	}
+	if err := ev.Sign(testKey); err != nil {
+		panic(err)
 	}
 }
 

@@ -25,6 +25,7 @@ import (
 	"github.com/ronitspatil/verilog/daemon/internal/config"
 	"github.com/ronitspatil/verilog/daemon/internal/engine"
 	"github.com/ronitspatil/verilog/daemon/internal/ingest"
+	"github.com/ronitspatil/verilog/daemon/internal/keys"
 	"github.com/ronitspatil/verilog/daemon/internal/store"
 	"github.com/ronitspatil/verilog/daemon/internal/wal"
 )
@@ -68,6 +69,12 @@ func run() error {
 		return err
 	}
 	logger.Info("chain ready", "chain_id", chain.ChainID(), "contract", cfg.Contract, "signer", chain.From())
+	keySource, err := keys.NewChainSource(cfg.Contract, eth)
+	if err != nil {
+		return err
+	}
+	// Agent keys are re-read every minute (revocations), unknown ones after 5s.
+	agentKeys := keys.NewCache(keySource, time.Minute, 5*time.Second)
 
 	// Storage and engine.
 	lock, err := lockDataDir(cfg.DataDir)
@@ -129,6 +136,7 @@ func run() error {
 	verilogv1.RegisterVeriLogServer(srv, ingest.NewServer(eng, st, ingest.Options{
 		MaxPayloadBytes: cfg.MaxPayloadBytes,
 		Window:          cfg.StreamWindow,
+		Keys:            agentKeys,
 	}, logger))
 	hs := health.NewServer()
 	healthpb.RegisterHealthServer(srv, hs)

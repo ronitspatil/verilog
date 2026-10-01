@@ -8,9 +8,11 @@ from langchain_core.prompts import PromptTemplate
 from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import tool
 
-from verilog_sdk import AsyncVeriLogLangGraphCallback, VeriLogClient, VeriLogLangGraphCallback
+from verilog_sdk import AsyncVeriLogLangGraphCallback, Signer, VeriLogClient, VeriLogLangGraphCallback
 
-from .conftest import unused_target
+from .conftest import TEST_SEED_HEX, check_chains, unused_target
+
+PUB = Signer.from_hex(TEST_SEED_HEX).public_key
 
 
 @tool
@@ -41,12 +43,17 @@ def test_records_real_langchain_run(fake_daemon):
     for required in ("chain_start", "llm_start", "llm_end", "tool_start", "tool_end", "chain_end"):
         assert required in types, (required, types)
 
-    # One root run: steps are 1..n in order and every event shares the root id.
+    # One root run: steps are 1..n in order, every event shares the root id,
+    # and the run is a valid signed hash chain closed by run_end.
     steps = [s for _, s, _ in events]
     assert steps == list(range(1, len(events) + 1))
-    roots = {p["root_run_id"] for _, _, p in events}
-    assert len(roots) == 1
+    runs = check_chains(fake_daemon.events, PUB)
+    assert len(runs) == 1
+    roots = {p["root_run_id"] for t, _, p in events if t != "run_end"}
+    assert roots == set(runs)
     assert all(e.agent_id == "agent-lc" for e in fake_daemon.events)
+    assert events[-1][0] == "run_end" and events[-1][2] == {"status": "ok", "steps": len(events) - 1}
+    events = events[:-1]
 
     tool_start = next(p for t, _, p in events if t == "tool_start")
     assert tool_start["name"] == "lookup_weather"
@@ -68,6 +75,9 @@ def test_step_numbers_restart_per_root_run(fake_daemon):
     events = _events(fake_daemon)
     assert first_run and events[first_run][1] == 1
     assert events[first_run][2]["root_run_id"] != events[0][2]["root_run_id"]
+    assert fake_daemon.events[first_run].run_id != fake_daemon.events[0].run_id
+    assert [e.event_type for e in fake_daemon.events].count("run_end") == 2
+    check_chains(fake_daemon.events, PUB)
 
 
 def test_errors_are_recorded(fake_daemon):
@@ -84,6 +94,7 @@ def test_errors_are_recorded(fake_daemon):
     handler.close()
     err = next(p for t, _, p in _events(fake_daemon) if t == "chain_error")
     assert err["error"] == {"type": "RuntimeError", "message": "tool exploded"}
+    assert _events(fake_daemon)[-1][0::2] == ("run_end", {"status": "error", "steps": 2})
 
 
 def test_handler_is_cheap_with_daemon_down():
@@ -105,7 +116,7 @@ def test_shared_client_and_bad_inputs_never_raise(fake_daemon):
     handler.on_chain_start({"id": ["x", "MyChain"]}, {"obj": object(), "nan": float("nan"), "b": b"xx"},
                            run_id=uuid.uuid4())
     assert handler.close(timeout=10)  # does not close a client it does not own
-    assert client.submit("agent-y", 9, "t", {}) is True
+    assert client.submit("agent-y", "other-run", "t", {}) is True
     client.close()
     payload = json.loads(fake_daemon.events[0].payload_json)
     assert payload["name"] == "MyChain" and payload["inputs"]["nan"] == "nan"
@@ -136,3 +147,16 @@ def test_sync_handler_with_ainvoke(fake_daemon):
     handler.close()
     steps = [s for _, s, _ in _events(fake_daemon)]
     assert sorted(steps) == list(range(1, len(steps) + 1))
+    check_chains(fake_daemon.events, PUB)
+
+
+def test_close_ends_open_runs(fake_daemon):
+    handler = VeriLogLangGraphCallback("agent-open", target=fake_daemon.target)
+    root = uuid.uuid4()
+    handler.on_chain_start({"name": "outer"}, {"x": 1}, run_id=root)
+    handler.on_tool_start({"name": "t"}, "in", run_id=uuid.uuid4(), parent_run_id=root)
+    assert handler.close(timeout=10)  # the agent never finished the run
+    events = _events(fake_daemon)
+    assert [t for t, _, _ in events] == ["chain_start", "tool_start", "run_end"]
+    assert events[-1][2] == {"status": "closed", "steps": 2}
+    check_chains(fake_daemon.events, PUB)

@@ -20,18 +20,32 @@ service VeriLog {
   rpc GetProof(GetProofRequest) returns (GetProofResponse);
 }
 
-// LogEvent is one step of an agent's execution trace.
+// LogEvent is one step of an agent's execution trace, signed by the agent.
 //
-// Fields 1-5 are the hashed content. The daemon canonicalizes them (RFC 8785
-// style JSON) and computes content_digest = SHA-256(canonical bytes).
+// Fields 1-9 are the hashed content (canonical event v2). The daemon rebuilds
+// the canonical JSON from them, verifies the Ed25519 signature against the key
+// registered on chain for (agent, key_id), and computes
+// content_digest = SHA-256(canonical bytes, including the signature).
 message LogEvent {
   string agent_id = 1;
+  // Position in the run's hash chain, starting at 1.
   uint64 step_number = 2;
   string event_type = 3;
   // UTF-8 JSON document. Re-canonicalized by the daemon, so key order and
   // whitespace do not matter, but the value must be valid JSON.
   string payload_json = 4;
   google.protobuf.Timestamp timestamp_utc = 5;
+  // Root run this event belongs to; each run is its own hash chain.
+  string run_id = 6;
+  // content_digest of the previous event of the run (32 bytes); 32 zero bytes
+  // for the first event.
+  bytes prev_hash = 7;
+  // keccak256 of the agent's Ed25519 public key (32 bytes). The key itself is
+  // looked up on chain (VeriLogRegistry.agentKeys).
+  bytes key_id = 8;
+  // Ed25519 signature (64 bytes) over "VeriLog/event/v1\n" followed by the
+  // canonical event JSON without the "sig" member.
+  bytes signature = 9;
 
   // Client-assigned stream sequence number, echoed in the Ack. Not hashed.
   uint64 sequence = 15;

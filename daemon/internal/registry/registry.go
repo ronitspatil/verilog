@@ -35,8 +35,8 @@ var (
 
 // VeriLogRegistryMetaData contains all meta data concerning the VeriLogRegistry contract.
 var VeriLogRegistryMetaData = &bind.MetaData{
-	ABI: "[{\"type\":\"constructor\",\"inputs\":[{\"name\":\"admin\",\"type\":\"address\",\"internalType\":\"address\"},{\"name\":\"anchorer\",\"type\":\"address\",\"internalType\":\"address\"}],\"stateMutability\":\"nonpayable\"},{\"type\":\"function\",\"name\":\"ANCHORER_ROLE\",\"inputs\":[],\"outputs\":[{\"name\":\"\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"}],\"stateMutability\":\"view\"},{\"type\":\"function\",\"name\":\"DEFAULT_ADMIN_ROLE\",\"inputs\":[],\"outputs\":[{\"name\":\"\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"}],\"stateMutability\":\"view\"},{\"type\":\"function\",\"name\":\"agentAnchors\",\"inputs\":[{\"name\":\"\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"},{\"name\":\"\",\"type\":\"uint256\",\"internalType\":\"uint256\"}],\"outputs\":[{\"name\":\"merkleRoot\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"},{\"name\":\"timestamp\",\"type\":\"uint64\",\"internalType\":\"uint64\"},{\"name\":\"logCount\",\"type\":\"uint32\",\"internalType\":\"uint32\"}],\"stateMutability\":\"view\"},{\"type\":\"function\",\"name\":\"anchorEpoch\",\"inputs\":[{\"name\":\"agentId\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"},{\"name\":\"merkleRoot\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"},{\"name\":\"logCount\",\"type\":\"uint32\",\"internalType\":\"uint32\"}],\"outputs\":[{\"name\":\"epochId\",\"type\":\"uint256\",\"internalType\":\"uint256\"}],\"stateMutability\":\"nonpayable\"},{\"type\":\"function\",\"name\":\"getRoleAdmin\",\"inputs\":[{\"name\":\"role\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"}],\"outputs\":[{\"name\":\"\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"}],\"stateMutability\":\"view\"},{\"type\":\"function\",\"name\":\"grantRole\",\"inputs\":[{\"name\":\"role\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"},{\"name\":\"account\",\"type\":\"address\",\"internalType\":\"address\"}],\"outputs\":[],\"stateMutability\":\"nonpayable\"},{\"type\":\"function\",\"name\":\"hasRole\",\"inputs\":[{\"name\":\"role\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"},{\"name\":\"account\",\"type\":\"address\",\"internalType\":\"address\"}],\"outputs\":[{\"name\":\"\",\"type\":\"bool\",\"internalType\":\"bool\"}],\"stateMutability\":\"view\"},{\"type\":\"function\",\"name\":\"latestEpoch\",\"inputs\":[{\"name\":\"\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"}],\"outputs\":[{\"name\":\"\",\"type\":\"uint256\",\"internalType\":\"uint256\"}],\"stateMutability\":\"view\"},{\"type\":\"function\",\"name\":\"renounceRole\",\"inputs\":[{\"name\":\"role\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"},{\"name\":\"callerConfirmation\",\"type\":\"address\",\"internalType\":\"address\"}],\"outputs\":[],\"stateMutability\":\"nonpayable\"},{\"type\":\"function\",\"name\":\"revokeRole\",\"inputs\":[{\"name\":\"role\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"},{\"name\":\"account\",\"type\":\"address\",\"internalType\":\"address\"}],\"outputs\":[],\"stateMutability\":\"nonpayable\"},{\"type\":\"function\",\"name\":\"supportsInterface\",\"inputs\":[{\"name\":\"interfaceId\",\"type\":\"bytes4\",\"internalType\":\"bytes4\"}],\"outputs\":[{\"name\":\"\",\"type\":\"bool\",\"internalType\":\"bool\"}],\"stateMutability\":\"view\"},{\"type\":\"function\",\"name\":\"verifyAnchoredLeaf\",\"inputs\":[{\"name\":\"agentId\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"},{\"name\":\"epochId\",\"type\":\"uint256\",\"internalType\":\"uint256\"},{\"name\":\"leaf\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"},{\"name\":\"proof\",\"type\":\"bytes32[]\",\"internalType\":\"bytes32[]\"}],\"outputs\":[{\"name\":\"\",\"type\":\"bool\",\"internalType\":\"bool\"}],\"stateMutability\":\"view\"},{\"type\":\"function\",\"name\":\"verifyProof\",\"inputs\":[{\"name\":\"leaf\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"},{\"name\":\"proof\",\"type\":\"bytes32[]\",\"internalType\":\"bytes32[]\"},{\"name\":\"root\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"}],\"outputs\":[{\"name\":\"\",\"type\":\"bool\",\"internalType\":\"bool\"}],\"stateMutability\":\"pure\"},{\"type\":\"event\",\"name\":\"LogAnchored\",\"inputs\":[{\"name\":\"agentId\",\"type\":\"bytes32\",\"indexed\":true,\"internalType\":\"bytes32\"},{\"name\":\"epochId\",\"type\":\"uint256\",\"indexed\":true,\"internalType\":\"uint256\"},{\"name\":\"merkleRoot\",\"type\":\"bytes32\",\"indexed\":false,\"internalType\":\"bytes32\"},{\"name\":\"logCount\",\"type\":\"uint32\",\"indexed\":false,\"internalType\":\"uint32\"},{\"name\":\"timestamp\",\"type\":\"uint64\",\"indexed\":false,\"internalType\":\"uint64\"}],\"anonymous\":false},{\"type\":\"event\",\"name\":\"RoleAdminChanged\",\"inputs\":[{\"name\":\"role\",\"type\":\"bytes32\",\"indexed\":true,\"internalType\":\"bytes32\"},{\"name\":\"previousAdminRole\",\"type\":\"bytes32\",\"indexed\":true,\"internalType\":\"bytes32\"},{\"name\":\"newAdminRole\",\"type\":\"bytes32\",\"indexed\":true,\"internalType\":\"bytes32\"}],\"anonymous\":false},{\"type\":\"event\",\"name\":\"RoleGranted\",\"inputs\":[{\"name\":\"role\",\"type\":\"bytes32\",\"indexed\":true,\"internalType\":\"bytes32\"},{\"name\":\"account\",\"type\":\"address\",\"indexed\":true,\"internalType\":\"address\"},{\"name\":\"sender\",\"type\":\"address\",\"indexed\":true,\"internalType\":\"address\"}],\"anonymous\":false},{\"type\":\"event\",\"name\":\"RoleRevoked\",\"inputs\":[{\"name\":\"role\",\"type\":\"bytes32\",\"indexed\":true,\"internalType\":\"bytes32\"},{\"name\":\"account\",\"type\":\"address\",\"indexed\":true,\"internalType\":\"address\"},{\"name\":\"sender\",\"type\":\"address\",\"indexed\":true,\"internalType\":\"address\"}],\"anonymous\":false},{\"type\":\"error\",\"name\":\"AccessControlBadConfirmation\",\"inputs\":[]},{\"type\":\"error\",\"name\":\"AccessControlUnauthorizedAccount\",\"inputs\":[{\"name\":\"account\",\"type\":\"address\",\"internalType\":\"address\"},{\"name\":\"neededRole\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"}]},{\"type\":\"error\",\"name\":\"EpochNotAnchored\",\"inputs\":[{\"name\":\"agentId\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"},{\"name\":\"epochId\",\"type\":\"uint256\",\"internalType\":\"uint256\"}]},{\"type\":\"error\",\"name\":\"ZeroAddress\",\"inputs\":[]},{\"type\":\"error\",\"name\":\"ZeroAgentId\",\"inputs\":[]},{\"type\":\"error\",\"name\":\"ZeroLogCount\",\"inputs\":[]},{\"type\":\"error\",\"name\":\"ZeroMerkleRoot\",\"inputs\":[]}]",
-	Bin: "0x608060405234801561000f575f5ffd5b50604051610d2e380380610d2e83398101604081905261002e9161016a565b6001600160a01b038216158061004b57506001600160a01b038116155b156100695760405163d92e233d60e01b815260040160405180910390fd5b6100735f836100a6565b5061009e7f4b3e6527f1b0d33beb6c20e3c362af276f03c4526b5f8b6d118672f0d75a60eb826100a6565b50505061019b565b5f828152602081815260408083206001600160a01b038516845290915281205460ff16610146575f838152602081815260408083206001600160a01b03861684529091529020805460ff191660011790556100fe3390565b6001600160a01b0316826001600160a01b0316847f2f8788117e7eff1d82e926ec794901d17c78024a50270940304540a733656f0d60405160405180910390a4506001610149565b505f5b92915050565b80516001600160a01b0381168114610165575f5ffd5b919050565b5f5f6040838503121561017b575f5ffd5b6101848361014f565b91506101926020840161014f565b90509250929050565b610b86806101a85f395ff3fe608060405234801561000f575f5ffd5b50600436106100da575f3560e01c806358161a4211610088578063a217fddf11610063578063a217fddf14610264578063abaad9ae1461026b578063c9ecaf6d1461027e578063d547741f1461029d575f5ffd5b806358161a42146101e75780637cfd9a51146101fa57806391d1485414610221575f5ffd5b8063248a9ca3116100b8578063248a9ca31461018f5780632f2ff15d146101bf57806336568abe146101d4575f5ffd5b806301ffc9a7146100de5780630819f81414610106578063231b80d21461017c575b5f5ffd5b6100f16100ec366004610936565b6102b0565b60405190151581526020015b60405180910390f35b610152610114366004610975565b600160208181525f93845260408085209091529183529120805491015467ffffffffffffffff81169068010000000000000000900463ffffffff1683565b6040805193845267ffffffffffffffff909216602084015263ffffffff16908201526060016100fd565b6100f161018a3660046109dd565b610348565b6101b161019d366004610a39565b5f9081526020819052604090206001015490565b6040519081526020016100fd565b6101d26101cd366004610a50565b6103be565b005b6101d26101e2366004610a50565b6103e8565b6100f16101f5366004610a96565b610446565b6101b17f4b3e6527f1b0d33beb6c20e3c362af276f03c4526b5f8b6d118672f0d75a60eb81565b6100f161022f366004610a50565b5f9182526020828152604080842073ffffffffffffffffffffffffffffffffffffffff93909316845291905290205460ff1690565b6101b15f81565b6101b1610279366004610ae5565b61045c565b6101b161028c366004610a39565b60026020525f908152604090205481565b6101d26102ab366004610a50565b610643565b5f7fffffffff0000000000000000000000000000000000000000000000000000000082167f7965db0b00000000000000000000000000000000000000000000000000000000148061034257507f01ffc9a7000000000000000000000000000000000000000000000000000000007fffffffff000000000000000000000000000000000000000000000000000000008316145b92915050565b5f858152600160209081526040808320878452909152812054806103a7576040517facaaf6ef00000000000000000000000000000000000000000000000000000000815260048101889052602481018790526044015b60405180910390fd5b6103b384848388610667565b979650505050505050565b5f828152602081905260409020600101546103d88161067e565b6103e2838361068b565b50505050565b73ffffffffffffffffffffffffffffffffffffffff81163314610437576040517f6697b23200000000000000000000000000000000000000000000000000000000815260040160405180910390fd5b6104418282610784565b505050565b5f61045384848488610667565b95945050505050565b5f7f4b3e6527f1b0d33beb6c20e3c362af276f03c4526b5f8b6d118672f0d75a60eb6104878161067e565b846104be576040517f42c5b17a00000000000000000000000000000000000000000000000000000000815260040160405180910390fd5b836104f5576040517f9266ee6200000000000000000000000000000000000000000000000000000000815260040160405180910390fd5b8263ffffffff165f03610534576040517ffb00b7a900000000000000000000000000000000000000000000000000000000815260040160405180910390fd5b5f8581526002602090815260408083208054600190810191829055825160608101845289815267ffffffffffffffff4281811683880190815263ffffffff808d168589019081528f8b52868a52888b20888c52909952988790209351845551929093018054965190971668010000000000000000027fffffffffffffffffffffffffffffffffffffffff000000000000000000000000909616911617939093179093555191935090839087907f0d7f028acbb0cc55a704d6d96e27d5ef5a8490693e35797fb31924541fcc7f30906106329089908990879092835263ffffffff91909116602083015267ffffffffffffffff16604082015260600190565b60405180910390a350509392505050565b5f8281526020819052604090206001015461065d8161067e565b6103e28383610784565b5f8261067486868561083d565b1495945050505050565b610688813361087e565b50565b5f8281526020818152604080832073ffffffffffffffffffffffffffffffffffffffff8516845290915281205460ff1661077d575f8381526020818152604080832073ffffffffffffffffffffffffffffffffffffffff86168452909152902080547fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0016600117905561071b3390565b73ffffffffffffffffffffffffffffffffffffffff168273ffffffffffffffffffffffffffffffffffffffff16847f2f8788117e7eff1d82e926ec794901d17c78024a50270940304540a733656f0d60405160405180910390a4506001610342565b505f610342565b5f8281526020818152604080832073ffffffffffffffffffffffffffffffffffffffff8516845290915281205460ff161561077d575f8381526020818152604080832073ffffffffffffffffffffffffffffffffffffffff8616808552925280832080547fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0016905551339286917ff6391f5c32d9c69d2a47ea670b442974b53935d1edc7fd64eb21e047a839171b9190a4506001610342565b5f81815b848110156108755761086b8287878481811061085f5761085f610b23565b90506020020135610907565b9150600101610841565b50949350505050565b5f8281526020818152604080832073ffffffffffffffffffffffffffffffffffffffff8516845290915290205460ff16610903576040517fe2517d3f00000000000000000000000000000000000000000000000000000000815273ffffffffffffffffffffffffffffffffffffffff821660048201526024810183905260440161039e565b5050565b5f818310610921575f82815260208490526040902061092f565b5f8381526020839052604090205b9392505050565b5f60208284031215610946575f5ffd5b81357fffffffff000000000000000000000000000000000000000000000000000000008116811461092f575f5ffd5b5f5f60408385031215610986575f5ffd5b50508035926020909101359150565b5f5f83601f8401126109a5575f5ffd5b50813567ffffffffffffffff8111156109bc575f5ffd5b6020830191508360208260051b85010111156109d6575f5ffd5b9250929050565b5f5f5f5f5f608086880312156109f1575f5ffd5b853594506020860135935060408601359250606086013567ffffffffffffffff811115610a1c575f5ffd5b610a2888828901610995565b969995985093965092949392505050565b5f60208284031215610a49575f5ffd5b5035919050565b5f5f60408385031215610a61575f5ffd5b82359150602083013573ffffffffffffffffffffffffffffffffffffffff81168114610a8b575f5ffd5b809150509250929050565b5f5f5f5f60608587031215610aa9575f5ffd5b84359350602085013567ffffffffffffffff811115610ac6575f5ffd5b610ad287828801610995565b9598909750949560400135949350505050565b5f5f5f60608486031215610af7575f5ffd5b8335925060208401359150604084013563ffffffff81168114610b18575f5ffd5b809150509250925092565b7f4e487b71000000000000000000000000000000000000000000000000000000005f52603260045260245ffdfea264697066735822122095e5d17bdbccf6aec81c8c605249c4299fccfae2713cf1349f7fbf07e3ea191e64736f6c634300081c0033",
+	ABI: "[{\"type\":\"constructor\",\"inputs\":[{\"name\":\"admin\",\"type\":\"address\",\"internalType\":\"address\"},{\"name\":\"anchorer\",\"type\":\"address\",\"internalType\":\"address\"}],\"stateMutability\":\"nonpayable\"},{\"type\":\"function\",\"name\":\"ANCHORER_ROLE\",\"inputs\":[],\"outputs\":[{\"name\":\"\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"}],\"stateMutability\":\"view\"},{\"type\":\"function\",\"name\":\"DEFAULT_ADMIN_ROLE\",\"inputs\":[],\"outputs\":[{\"name\":\"\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"}],\"stateMutability\":\"view\"},{\"type\":\"function\",\"name\":\"KEY_ADMIN_ROLE\",\"inputs\":[],\"outputs\":[{\"name\":\"\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"}],\"stateMutability\":\"view\"},{\"type\":\"function\",\"name\":\"agentAnchors\",\"inputs\":[{\"name\":\"\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"},{\"name\":\"\",\"type\":\"uint256\",\"internalType\":\"uint256\"}],\"outputs\":[{\"name\":\"merkleRoot\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"},{\"name\":\"timestamp\",\"type\":\"uint64\",\"internalType\":\"uint64\"},{\"name\":\"logCount\",\"type\":\"uint32\",\"internalType\":\"uint32\"}],\"stateMutability\":\"view\"},{\"type\":\"function\",\"name\":\"agentKeys\",\"inputs\":[{\"name\":\"agentId\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"},{\"name\":\"keyId\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"}],\"outputs\":[{\"name\":\"pubkey\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"},{\"name\":\"validFrom\",\"type\":\"uint64\",\"internalType\":\"uint64\"},{\"name\":\"revokedAt\",\"type\":\"uint64\",\"internalType\":\"uint64\"}],\"stateMutability\":\"view\"},{\"type\":\"function\",\"name\":\"anchorEpoch\",\"inputs\":[{\"name\":\"agentId\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"},{\"name\":\"merkleRoot\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"},{\"name\":\"logCount\",\"type\":\"uint32\",\"internalType\":\"uint32\"}],\"outputs\":[{\"name\":\"epochId\",\"type\":\"uint256\",\"internalType\":\"uint256\"}],\"stateMutability\":\"nonpayable\"},{\"type\":\"function\",\"name\":\"getRoleAdmin\",\"inputs\":[{\"name\":\"role\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"}],\"outputs\":[{\"name\":\"\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"}],\"stateMutability\":\"view\"},{\"type\":\"function\",\"name\":\"grantRole\",\"inputs\":[{\"name\":\"role\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"},{\"name\":\"account\",\"type\":\"address\",\"internalType\":\"address\"}],\"outputs\":[],\"stateMutability\":\"nonpayable\"},{\"type\":\"function\",\"name\":\"hasRole\",\"inputs\":[{\"name\":\"role\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"},{\"name\":\"account\",\"type\":\"address\",\"internalType\":\"address\"}],\"outputs\":[{\"name\":\"\",\"type\":\"bool\",\"internalType\":\"bool\"}],\"stateMutability\":\"view\"},{\"type\":\"function\",\"name\":\"latestEpoch\",\"inputs\":[{\"name\":\"\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"}],\"outputs\":[{\"name\":\"\",\"type\":\"uint256\",\"internalType\":\"uint256\"}],\"stateMutability\":\"view\"},{\"type\":\"function\",\"name\":\"registerAgentKey\",\"inputs\":[{\"name\":\"agentId\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"},{\"name\":\"pubkey\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"}],\"outputs\":[{\"name\":\"keyId\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"}],\"stateMutability\":\"nonpayable\"},{\"type\":\"function\",\"name\":\"renounceRole\",\"inputs\":[{\"name\":\"role\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"},{\"name\":\"callerConfirmation\",\"type\":\"address\",\"internalType\":\"address\"}],\"outputs\":[],\"stateMutability\":\"nonpayable\"},{\"type\":\"function\",\"name\":\"revokeAgentKey\",\"inputs\":[{\"name\":\"agentId\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"},{\"name\":\"keyId\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"}],\"outputs\":[],\"stateMutability\":\"nonpayable\"},{\"type\":\"function\",\"name\":\"revokeRole\",\"inputs\":[{\"name\":\"role\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"},{\"name\":\"account\",\"type\":\"address\",\"internalType\":\"address\"}],\"outputs\":[],\"stateMutability\":\"nonpayable\"},{\"type\":\"function\",\"name\":\"supportsInterface\",\"inputs\":[{\"name\":\"interfaceId\",\"type\":\"bytes4\",\"internalType\":\"bytes4\"}],\"outputs\":[{\"name\":\"\",\"type\":\"bool\",\"internalType\":\"bool\"}],\"stateMutability\":\"view\"},{\"type\":\"function\",\"name\":\"verifyAnchoredLeaf\",\"inputs\":[{\"name\":\"agentId\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"},{\"name\":\"epochId\",\"type\":\"uint256\",\"internalType\":\"uint256\"},{\"name\":\"leaf\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"},{\"name\":\"proof\",\"type\":\"bytes32[]\",\"internalType\":\"bytes32[]\"}],\"outputs\":[{\"name\":\"\",\"type\":\"bool\",\"internalType\":\"bool\"}],\"stateMutability\":\"view\"},{\"type\":\"function\",\"name\":\"verifyProof\",\"inputs\":[{\"name\":\"leaf\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"},{\"name\":\"proof\",\"type\":\"bytes32[]\",\"internalType\":\"bytes32[]\"},{\"name\":\"root\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"}],\"outputs\":[{\"name\":\"\",\"type\":\"bool\",\"internalType\":\"bool\"}],\"stateMutability\":\"pure\"},{\"type\":\"event\",\"name\":\"AgentKeyRegistered\",\"inputs\":[{\"name\":\"agentId\",\"type\":\"bytes32\",\"indexed\":true,\"internalType\":\"bytes32\"},{\"name\":\"keyId\",\"type\":\"bytes32\",\"indexed\":true,\"internalType\":\"bytes32\"},{\"name\":\"pubkey\",\"type\":\"bytes32\",\"indexed\":false,\"internalType\":\"bytes32\"},{\"name\":\"validFrom\",\"type\":\"uint64\",\"indexed\":false,\"internalType\":\"uint64\"}],\"anonymous\":false},{\"type\":\"event\",\"name\":\"AgentKeyRevoked\",\"inputs\":[{\"name\":\"agentId\",\"type\":\"bytes32\",\"indexed\":true,\"internalType\":\"bytes32\"},{\"name\":\"keyId\",\"type\":\"bytes32\",\"indexed\":true,\"internalType\":\"bytes32\"},{\"name\":\"revokedAt\",\"type\":\"uint64\",\"indexed\":false,\"internalType\":\"uint64\"}],\"anonymous\":false},{\"type\":\"event\",\"name\":\"LogAnchored\",\"inputs\":[{\"name\":\"agentId\",\"type\":\"bytes32\",\"indexed\":true,\"internalType\":\"bytes32\"},{\"name\":\"epochId\",\"type\":\"uint256\",\"indexed\":true,\"internalType\":\"uint256\"},{\"name\":\"merkleRoot\",\"type\":\"bytes32\",\"indexed\":false,\"internalType\":\"bytes32\"},{\"name\":\"logCount\",\"type\":\"uint32\",\"indexed\":false,\"internalType\":\"uint32\"},{\"name\":\"timestamp\",\"type\":\"uint64\",\"indexed\":false,\"internalType\":\"uint64\"}],\"anonymous\":false},{\"type\":\"event\",\"name\":\"RoleAdminChanged\",\"inputs\":[{\"name\":\"role\",\"type\":\"bytes32\",\"indexed\":true,\"internalType\":\"bytes32\"},{\"name\":\"previousAdminRole\",\"type\":\"bytes32\",\"indexed\":true,\"internalType\":\"bytes32\"},{\"name\":\"newAdminRole\",\"type\":\"bytes32\",\"indexed\":true,\"internalType\":\"bytes32\"}],\"anonymous\":false},{\"type\":\"event\",\"name\":\"RoleGranted\",\"inputs\":[{\"name\":\"role\",\"type\":\"bytes32\",\"indexed\":true,\"internalType\":\"bytes32\"},{\"name\":\"account\",\"type\":\"address\",\"indexed\":true,\"internalType\":\"address\"},{\"name\":\"sender\",\"type\":\"address\",\"indexed\":true,\"internalType\":\"address\"}],\"anonymous\":false},{\"type\":\"event\",\"name\":\"RoleRevoked\",\"inputs\":[{\"name\":\"role\",\"type\":\"bytes32\",\"indexed\":true,\"internalType\":\"bytes32\"},{\"name\":\"account\",\"type\":\"address\",\"indexed\":true,\"internalType\":\"address\"},{\"name\":\"sender\",\"type\":\"address\",\"indexed\":true,\"internalType\":\"address\"}],\"anonymous\":false},{\"type\":\"error\",\"name\":\"AccessControlBadConfirmation\",\"inputs\":[]},{\"type\":\"error\",\"name\":\"AccessControlUnauthorizedAccount\",\"inputs\":[{\"name\":\"account\",\"type\":\"address\",\"internalType\":\"address\"},{\"name\":\"neededRole\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"}]},{\"type\":\"error\",\"name\":\"AnchorerCannotAdminister\",\"inputs\":[{\"name\":\"account\",\"type\":\"address\",\"internalType\":\"address\"}]},{\"type\":\"error\",\"name\":\"EpochNotAnchored\",\"inputs\":[{\"name\":\"agentId\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"},{\"name\":\"epochId\",\"type\":\"uint256\",\"internalType\":\"uint256\"}]},{\"type\":\"error\",\"name\":\"KeyAlreadyRevoked\",\"inputs\":[{\"name\":\"agentId\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"},{\"name\":\"keyId\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"}]},{\"type\":\"error\",\"name\":\"KeyExists\",\"inputs\":[{\"name\":\"agentId\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"},{\"name\":\"keyId\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"}]},{\"type\":\"error\",\"name\":\"UnknownKey\",\"inputs\":[{\"name\":\"agentId\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"},{\"name\":\"keyId\",\"type\":\"bytes32\",\"internalType\":\"bytes32\"}]},{\"type\":\"error\",\"name\":\"ZeroAddress\",\"inputs\":[]},{\"type\":\"error\",\"name\":\"ZeroAgentId\",\"inputs\":[]},{\"type\":\"error\",\"name\":\"ZeroLogCount\",\"inputs\":[]},{\"type\":\"error\",\"name\":\"ZeroMerkleRoot\",\"inputs\":[]},{\"type\":\"error\",\"name\":\"ZeroPubkey\",\"inputs\":[]}]",
+	Bin: "0x608060405234801561000f575f5ffd5b5060405161152338038061152383398101604081905261002e916102c4565b6001600160a01b038216158061004b57506001600160a01b038116155b156100695760405163d92e233d60e01b815260040160405180910390fd5b6100735f836100ab565b5061008b5f5160206115035f395f51905f52836100ab565b506100a35f5160206114e35f395f51905f52826100ab565b5050506102f5565b5f5f5160206114e35f395f51905f52830361016e576001600160a01b0382165f9081527f4f39ad2d49660849ded16eb618fd35bd782bc9826b29c3464c6dd0a5826c2046602052604090205460ff168061013b57506001600160a01b0382165f9081527fad3228b676f7d3cd4284a5443f17f1962b36e491b30a40b2405849e597ba5fb5602052604090205460ff165b156101695760405163339304c160e21b81526001600160a01b03831660048201526024015b60405180910390fd5b6101ef565b5f5160206115035f395f51905f52831480610187575082155b156101ef576001600160a01b0382165f9081527ff9afc5eccc556dfbeedb3ca7bc93a51b4efbf91901a8edd8d8d95baa0671a408602052604090205460ff16156101ef5760405163339304c160e21b81526001600160a01b0383166004820152602401610160565b6101f98383610202565b90505b92915050565b5f828152602081815260408083206001600160a01b038516845290915281205460ff166102a2575f838152602081815260408083206001600160a01b03861684529091529020805460ff1916600117905561025a3390565b6001600160a01b0316826001600160a01b0316847f2f8788117e7eff1d82e926ec794901d17c78024a50270940304540a733656f0d60405160405180910390a45060016101fc565b505f6101fc565b80516001600160a01b03811681146102bf575f5ffd5b919050565b5f5f604083850312156102d5575f5ffd5b6102de836102a9565b91506102ec602084016102a9565b90509250929050565b6111e1806103025f395ff3fe608060405234801561000f575f5ffd5b5060043610610115575f3560e01c80636876f5d7116100ad578063a217fddf1161007d578063bfcedf5411610063578063bfcedf5414610306578063c9ecaf6d14610377578063d547741f14610396575f5ffd5b8063a217fddf146102ec578063abaad9ae146102f3575f5ffd5b80636876f5d71461025c5780637cfd9a511461026f5780639008fc541461029657806391d14854146102a9575f5ffd5b8063248a9ca3116100e8578063248a9ca3146101ff5780632f2ff15d1461022157806336568abe1461023657806358161a4214610249575f5ffd5b806301ffc9a7146101195780630819f8141461014157806309fe0387146101b7578063231b80d2146101ec575b5f5ffd5b61012c610127366004610f91565b6103a9565b60405190151581526020015b60405180910390f35b61018d61014f366004610fd0565b600160208181525f93845260408085209091529183529120805491015467ffffffffffffffff81169068010000000000000000900463ffffffff1683565b6040805193845267ffffffffffffffff909216602084015263ffffffff1690820152606001610138565b6101de7f460de93bc770bad3bedb94b9a38b09df8ac71a47512a218a7cb89bfe8008abdc81565b604051908152602001610138565b61012c6101fa366004611038565b610441565b6101de61020d366004611094565b5f9081526020819052604090206001015490565b61023461022f3660046110ab565b6104b7565b005b6102346102443660046110ab565b6104e1565b61012c6102573660046110f1565b61053f565b6101de61026a366004610fd0565b610555565b6101de7f4b3e6527f1b0d33beb6c20e3c362af276f03c4526b5f8b6d118672f0d75a60eb81565b6102346102a4366004610fd0565b61076a565b61012c6102b73660046110ab565b5f9182526020828152604080842073ffffffffffffffffffffffffffffffffffffffff93909316845291905290205460ff1690565b6101de5f81565b6101de610301366004611140565b6108d1565b610351610314366004610fd0565b600360209081525f92835260408084209091529082529020805460019091015467ffffffffffffffff808216916801000000000000000090041683565b6040805193845267ffffffffffffffff9283166020850152911690820152606001610138565b6101de610385366004611094565b60026020525f908152604090205481565b6102346103a43660046110ab565b610ab8565b5f7fffffffff0000000000000000000000000000000000000000000000000000000082167f7965db0b00000000000000000000000000000000000000000000000000000000148061043b57507f01ffc9a7000000000000000000000000000000000000000000000000000000007fffffffff000000000000000000000000000000000000000000000000000000008316145b92915050565b5f858152600160209081526040808320878452909152812054806104a0576040517facaaf6ef00000000000000000000000000000000000000000000000000000000815260048101889052602481018790526044015b60405180910390fd5b6104ac84848388610adc565b979650505050505050565b5f828152602081905260409020600101546104d181610af3565b6104db8383610b00565b50505050565b73ffffffffffffffffffffffffffffffffffffffff81163314610530576040517f6697b23200000000000000000000000000000000000000000000000000000000815260040160405180910390fd5b61053a8282610ce9565b505050565b5f61054c84848488610adc565b95945050505050565b5f7f460de93bc770bad3bedb94b9a38b09df8ac71a47512a218a7cb89bfe8008abdc61058081610af3565b836105b7576040517f42c5b17a00000000000000000000000000000000000000000000000000000000815260040160405180910390fd5b826105ee576040517f4935505f00000000000000000000000000000000000000000000000000000000815260040160405180910390fd5b604080516020810185905201604080517fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe081840301815291815281516020928301205f8781526003845282812082825290935291205490925015610688576040517f3b6af2de0000000000000000000000000000000000000000000000000000000081526004810185905260248101839052604401610497565b6040805160608101825284815267ffffffffffffffff4281811660208085019182525f8587018181528b8252600383528782208a8352909252869020945185559051600190940180549151841668010000000000000000027fffffffffffffffffffffffffffffffff0000000000000000000000000000000090921694909316939093179290921790559051839086907f6ee71b52095caaca792b0200e1634f78566623b204e3c6c48291c9e186793b689061075a908890869091825267ffffffffffffffff16602082015260400190565b60405180910390a3505092915050565b7f460de93bc770bad3bedb94b9a38b09df8ac71a47512a218a7cb89bfe8008abdc61079481610af3565b5f838152600360209081526040808320858452909152902080546107ee576040517f2f5b76ac0000000000000000000000000000000000000000000000000000000081526004810185905260248101849052604401610497565b600181015468010000000000000000900467ffffffffffffffff161561084a576040517fb0d6c16f0000000000000000000000000000000000000000000000000000000081526004810185905260248101849052604401610497565b6001810180547fffffffffffffffffffffffffffffffff0000000000000000ffffffffffffffff16680100000000000000004267ffffffffffffffff81169182029290921790925560405191825290849086907ffb49e6b1293208eb0202e1aa157a08660d0780049f4db27b7bc48d275f3fa9f59060200160405180910390a35050505050565b5f7f4b3e6527f1b0d33beb6c20e3c362af276f03c4526b5f8b6d118672f0d75a60eb6108fc81610af3565b84610933576040517f42c5b17a00000000000000000000000000000000000000000000000000000000815260040160405180910390fd5b8361096a576040517f9266ee6200000000000000000000000000000000000000000000000000000000815260040160405180910390fd5b8263ffffffff165f036109a9576040517ffb00b7a900000000000000000000000000000000000000000000000000000000815260040160405180910390fd5b5f8581526002602090815260408083208054600190810191829055825160608101845289815267ffffffffffffffff4281811683880190815263ffffffff808d168589019081528f8b52868a52888b20888c52909952988790209351845551929093018054965190971668010000000000000000027fffffffffffffffffffffffffffffffffffffffff000000000000000000000000909616911617939093179093555191935090839087907f0d7f028acbb0cc55a704d6d96e27d5ef5a8490693e35797fb31924541fcc7f3090610aa79089908990879092835263ffffffff91909116602083015267ffffffffffffffff16604082015260600190565b60405180910390a350509392505050565b5f82815260208190526040902060010154610ad281610af3565b6104db8383610ce9565b5f82610ae9868685610da9565b1495945050505050565b610afd8133610dea565b50565b5f7f4b3e6527f1b0d33beb6c20e3c362af276f03c4526b5f8b6d118672f0d75a60eb8303610c115773ffffffffffffffffffffffffffffffffffffffff82165f9081527f4f39ad2d49660849ded16eb618fd35bd782bc9826b29c3464c6dd0a5826c2046602052604090205460ff1680610bbd575073ffffffffffffffffffffffffffffffffffffffff82165f9081527fad3228b676f7d3cd4284a5443f17f1962b36e491b30a40b2405849e597ba5fb5602052604090205460ff165b15610c0c576040517fce4c130400000000000000000000000000000000000000000000000000000000815273ffffffffffffffffffffffffffffffffffffffff83166004820152602401610497565b610cd8565b7f460de93bc770bad3bedb94b9a38b09df8ac71a47512a218a7cb89bfe8008abdc831480610c3d575082155b15610cd85773ffffffffffffffffffffffffffffffffffffffff82165f9081527ff9afc5eccc556dfbeedb3ca7bc93a51b4efbf91901a8edd8d8d95baa0671a408602052604090205460ff1615610cd8576040517fce4c130400000000000000000000000000000000000000000000000000000000815273ffffffffffffffffffffffffffffffffffffffff83166004820152602401610497565b610ce28383610e73565b9392505050565b5f8281526020818152604080832073ffffffffffffffffffffffffffffffffffffffff8516845290915281205460ff1615610da2575f8381526020818152604080832073ffffffffffffffffffffffffffffffffffffffff8616808552925280832080547fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0016905551339286917ff6391f5c32d9c69d2a47ea670b442974b53935d1edc7fd64eb21e047a839171b9190a450600161043b565b505f61043b565b5f81815b84811015610de157610dd782878784818110610dcb57610dcb61117e565b90506020020135610f65565b9150600101610dad565b50949350505050565b5f8281526020818152604080832073ffffffffffffffffffffffffffffffffffffffff8516845290915290205460ff16610e6f576040517fe2517d3f00000000000000000000000000000000000000000000000000000000815273ffffffffffffffffffffffffffffffffffffffff8216600482015260248101839052604401610497565b5050565b5f8281526020818152604080832073ffffffffffffffffffffffffffffffffffffffff8516845290915281205460ff16610da2575f8381526020818152604080832073ffffffffffffffffffffffffffffffffffffffff86168452909152902080547fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff00166001179055610f033390565b73ffffffffffffffffffffffffffffffffffffffff168273ffffffffffffffffffffffffffffffffffffffff16847f2f8788117e7eff1d82e926ec794901d17c78024a50270940304540a733656f0d60405160405180910390a450600161043b565b5f818310610f7f575f828152602084905260409020610ce2565b5f838152602083905260409020610ce2565b5f60208284031215610fa1575f5ffd5b81357fffffffff0000000000000000000000000000000000000000000000000000000081168114610ce2575f5ffd5b5f5f60408385031215610fe1575f5ffd5b50508035926020909101359150565b5f5f83601f840112611000575f5ffd5b50813567ffffffffffffffff811115611017575f5ffd5b6020830191508360208260051b8501011115611031575f5ffd5b9250929050565b5f5f5f5f5f6080868803121561104c575f5ffd5b853594506020860135935060408601359250606086013567ffffffffffffffff811115611077575f5ffd5b61108388828901610ff0565b969995985093965092949392505050565b5f602082840312156110a4575f5ffd5b5035919050565b5f5f604083850312156110bc575f5ffd5b82359150602083013573ffffffffffffffffffffffffffffffffffffffff811681146110e6575f5ffd5b809150509250929050565b5f5f5f5f60608587031215611104575f5ffd5b84359350602085013567ffffffffffffffff811115611121575f5ffd5b61112d87828801610ff0565b9598909750949560400135949350505050565b5f5f5f60608486031215611152575f5ffd5b8335925060208401359150604084013563ffffffff81168114611173575f5ffd5b809150509250925092565b7f4e487b71000000000000000000000000000000000000000000000000000000005f52603260045260245ffdfea26469706673582212203357e9dda2c135231711e0bffe549002a72050ea1384cbeb2331354784bb8b6f64736f6c634300081c00334b3e6527f1b0d33beb6c20e3c362af276f03c4526b5f8b6d118672f0d75a60eb460de93bc770bad3bedb94b9a38b09df8ac71a47512a218a7cb89bfe8008abdc",
 }
 
 // VeriLogRegistryABI is the input ABI used to generate the binding from.
@@ -268,6 +268,37 @@ func (_VeriLogRegistry *VeriLogRegistryCallerSession) DEFAULTADMINROLE() ([32]by
 	return _VeriLogRegistry.Contract.DEFAULTADMINROLE(&_VeriLogRegistry.CallOpts)
 }
 
+// KEYADMINROLE is a free data retrieval call binding the contract method 0x09fe0387.
+//
+// Solidity: function KEY_ADMIN_ROLE() view returns(bytes32)
+func (_VeriLogRegistry *VeriLogRegistryCaller) KEYADMINROLE(opts *bind.CallOpts) ([32]byte, error) {
+	var out []interface{}
+	err := _VeriLogRegistry.contract.Call(opts, &out, "KEY_ADMIN_ROLE")
+
+	if err != nil {
+		return *new([32]byte), err
+	}
+
+	out0 := *abi.ConvertType(out[0], new([32]byte)).(*[32]byte)
+
+	return out0, err
+
+}
+
+// KEYADMINROLE is a free data retrieval call binding the contract method 0x09fe0387.
+//
+// Solidity: function KEY_ADMIN_ROLE() view returns(bytes32)
+func (_VeriLogRegistry *VeriLogRegistrySession) KEYADMINROLE() ([32]byte, error) {
+	return _VeriLogRegistry.Contract.KEYADMINROLE(&_VeriLogRegistry.CallOpts)
+}
+
+// KEYADMINROLE is a free data retrieval call binding the contract method 0x09fe0387.
+//
+// Solidity: function KEY_ADMIN_ROLE() view returns(bytes32)
+func (_VeriLogRegistry *VeriLogRegistryCallerSession) KEYADMINROLE() ([32]byte, error) {
+	return _VeriLogRegistry.Contract.KEYADMINROLE(&_VeriLogRegistry.CallOpts)
+}
+
 // AgentAnchors is a free data retrieval call binding the contract method 0x0819f814.
 //
 // Solidity: function agentAnchors(bytes32 , uint256 ) view returns(bytes32 merkleRoot, uint64 timestamp, uint32 logCount)
@@ -316,6 +347,56 @@ func (_VeriLogRegistry *VeriLogRegistryCallerSession) AgentAnchors(arg0 [32]byte
 	LogCount   uint32
 }, error) {
 	return _VeriLogRegistry.Contract.AgentAnchors(&_VeriLogRegistry.CallOpts, arg0, arg1)
+}
+
+// AgentKeys is a free data retrieval call binding the contract method 0xbfcedf54.
+//
+// Solidity: function agentKeys(bytes32 agentId, bytes32 keyId) view returns(bytes32 pubkey, uint64 validFrom, uint64 revokedAt)
+func (_VeriLogRegistry *VeriLogRegistryCaller) AgentKeys(opts *bind.CallOpts, agentId [32]byte, keyId [32]byte) (struct {
+	Pubkey    [32]byte
+	ValidFrom uint64
+	RevokedAt uint64
+}, error) {
+	var out []interface{}
+	err := _VeriLogRegistry.contract.Call(opts, &out, "agentKeys", agentId, keyId)
+
+	outstruct := new(struct {
+		Pubkey    [32]byte
+		ValidFrom uint64
+		RevokedAt uint64
+	})
+	if err != nil {
+		return *outstruct, err
+	}
+
+	outstruct.Pubkey = *abi.ConvertType(out[0], new([32]byte)).(*[32]byte)
+	outstruct.ValidFrom = *abi.ConvertType(out[1], new(uint64)).(*uint64)
+	outstruct.RevokedAt = *abi.ConvertType(out[2], new(uint64)).(*uint64)
+
+	return *outstruct, err
+
+}
+
+// AgentKeys is a free data retrieval call binding the contract method 0xbfcedf54.
+//
+// Solidity: function agentKeys(bytes32 agentId, bytes32 keyId) view returns(bytes32 pubkey, uint64 validFrom, uint64 revokedAt)
+func (_VeriLogRegistry *VeriLogRegistrySession) AgentKeys(agentId [32]byte, keyId [32]byte) (struct {
+	Pubkey    [32]byte
+	ValidFrom uint64
+	RevokedAt uint64
+}, error) {
+	return _VeriLogRegistry.Contract.AgentKeys(&_VeriLogRegistry.CallOpts, agentId, keyId)
+}
+
+// AgentKeys is a free data retrieval call binding the contract method 0xbfcedf54.
+//
+// Solidity: function agentKeys(bytes32 agentId, bytes32 keyId) view returns(bytes32 pubkey, uint64 validFrom, uint64 revokedAt)
+func (_VeriLogRegistry *VeriLogRegistryCallerSession) AgentKeys(agentId [32]byte, keyId [32]byte) (struct {
+	Pubkey    [32]byte
+	ValidFrom uint64
+	RevokedAt uint64
+}, error) {
+	return _VeriLogRegistry.Contract.AgentKeys(&_VeriLogRegistry.CallOpts, agentId, keyId)
 }
 
 // GetRoleAdmin is a free data retrieval call binding the contract method 0x248a9ca3.
@@ -546,6 +627,27 @@ func (_VeriLogRegistry *VeriLogRegistryTransactorSession) GrantRole(role [32]byt
 	return _VeriLogRegistry.Contract.GrantRole(&_VeriLogRegistry.TransactOpts, role, account)
 }
 
+// RegisterAgentKey is a paid mutator transaction binding the contract method 0x6876f5d7.
+//
+// Solidity: function registerAgentKey(bytes32 agentId, bytes32 pubkey) returns(bytes32 keyId)
+func (_VeriLogRegistry *VeriLogRegistryTransactor) RegisterAgentKey(opts *bind.TransactOpts, agentId [32]byte, pubkey [32]byte) (*types.Transaction, error) {
+	return _VeriLogRegistry.contract.Transact(opts, "registerAgentKey", agentId, pubkey)
+}
+
+// RegisterAgentKey is a paid mutator transaction binding the contract method 0x6876f5d7.
+//
+// Solidity: function registerAgentKey(bytes32 agentId, bytes32 pubkey) returns(bytes32 keyId)
+func (_VeriLogRegistry *VeriLogRegistrySession) RegisterAgentKey(agentId [32]byte, pubkey [32]byte) (*types.Transaction, error) {
+	return _VeriLogRegistry.Contract.RegisterAgentKey(&_VeriLogRegistry.TransactOpts, agentId, pubkey)
+}
+
+// RegisterAgentKey is a paid mutator transaction binding the contract method 0x6876f5d7.
+//
+// Solidity: function registerAgentKey(bytes32 agentId, bytes32 pubkey) returns(bytes32 keyId)
+func (_VeriLogRegistry *VeriLogRegistryTransactorSession) RegisterAgentKey(agentId [32]byte, pubkey [32]byte) (*types.Transaction, error) {
+	return _VeriLogRegistry.Contract.RegisterAgentKey(&_VeriLogRegistry.TransactOpts, agentId, pubkey)
+}
+
 // RenounceRole is a paid mutator transaction binding the contract method 0x36568abe.
 //
 // Solidity: function renounceRole(bytes32 role, address callerConfirmation) returns()
@@ -567,6 +669,27 @@ func (_VeriLogRegistry *VeriLogRegistryTransactorSession) RenounceRole(role [32]
 	return _VeriLogRegistry.Contract.RenounceRole(&_VeriLogRegistry.TransactOpts, role, callerConfirmation)
 }
 
+// RevokeAgentKey is a paid mutator transaction binding the contract method 0x9008fc54.
+//
+// Solidity: function revokeAgentKey(bytes32 agentId, bytes32 keyId) returns()
+func (_VeriLogRegistry *VeriLogRegistryTransactor) RevokeAgentKey(opts *bind.TransactOpts, agentId [32]byte, keyId [32]byte) (*types.Transaction, error) {
+	return _VeriLogRegistry.contract.Transact(opts, "revokeAgentKey", agentId, keyId)
+}
+
+// RevokeAgentKey is a paid mutator transaction binding the contract method 0x9008fc54.
+//
+// Solidity: function revokeAgentKey(bytes32 agentId, bytes32 keyId) returns()
+func (_VeriLogRegistry *VeriLogRegistrySession) RevokeAgentKey(agentId [32]byte, keyId [32]byte) (*types.Transaction, error) {
+	return _VeriLogRegistry.Contract.RevokeAgentKey(&_VeriLogRegistry.TransactOpts, agentId, keyId)
+}
+
+// RevokeAgentKey is a paid mutator transaction binding the contract method 0x9008fc54.
+//
+// Solidity: function revokeAgentKey(bytes32 agentId, bytes32 keyId) returns()
+func (_VeriLogRegistry *VeriLogRegistryTransactorSession) RevokeAgentKey(agentId [32]byte, keyId [32]byte) (*types.Transaction, error) {
+	return _VeriLogRegistry.Contract.RevokeAgentKey(&_VeriLogRegistry.TransactOpts, agentId, keyId)
+}
+
 // RevokeRole is a paid mutator transaction binding the contract method 0xd547741f.
 //
 // Solidity: function revokeRole(bytes32 role, address account) returns()
@@ -586,6 +709,323 @@ func (_VeriLogRegistry *VeriLogRegistrySession) RevokeRole(role [32]byte, accoun
 // Solidity: function revokeRole(bytes32 role, address account) returns()
 func (_VeriLogRegistry *VeriLogRegistryTransactorSession) RevokeRole(role [32]byte, account common.Address) (*types.Transaction, error) {
 	return _VeriLogRegistry.Contract.RevokeRole(&_VeriLogRegistry.TransactOpts, role, account)
+}
+
+// VeriLogRegistryAgentKeyRegisteredIterator is returned from FilterAgentKeyRegistered and is used to iterate over the raw logs and unpacked data for AgentKeyRegistered events raised by the VeriLogRegistry contract.
+type VeriLogRegistryAgentKeyRegisteredIterator struct {
+	Event *VeriLogRegistryAgentKeyRegistered // Event containing the contract specifics and raw log
+
+	contract *bind.BoundContract // Generic contract to use for unpacking event data
+	event    string              // Event name to use for unpacking event data
+
+	logs chan types.Log        // Log channel receiving the found contract events
+	sub  ethereum.Subscription // Subscription for errors, completion and termination
+	done bool                  // Whether the subscription completed delivering logs
+	fail error                 // Occurred error to stop iteration
+}
+
+// Next advances the iterator to the subsequent event, returning whether there
+// are any more events found. In case of a retrieval or parsing error, false is
+// returned and Error() can be queried for the exact failure.
+func (it *VeriLogRegistryAgentKeyRegisteredIterator) Next() bool {
+	// If the iterator failed, stop iterating
+	if it.fail != nil {
+		return false
+	}
+	// If the iterator completed, deliver directly whatever's available
+	if it.done {
+		select {
+		case log := <-it.logs:
+			it.Event = new(VeriLogRegistryAgentKeyRegistered)
+			if err := it.contract.UnpackLog(it.Event, it.event, log); err != nil {
+				it.fail = err
+				return false
+			}
+			it.Event.Raw = log
+			return true
+
+		default:
+			return false
+		}
+	}
+	// Iterator still in progress, wait for either a data or an error event
+	select {
+	case log := <-it.logs:
+		it.Event = new(VeriLogRegistryAgentKeyRegistered)
+		if err := it.contract.UnpackLog(it.Event, it.event, log); err != nil {
+			it.fail = err
+			return false
+		}
+		it.Event.Raw = log
+		return true
+
+	case err := <-it.sub.Err():
+		it.done = true
+		it.fail = err
+		return it.Next()
+	}
+}
+
+// Error returns any retrieval or parsing error occurred during filtering.
+func (it *VeriLogRegistryAgentKeyRegisteredIterator) Error() error {
+	return it.fail
+}
+
+// Close terminates the iteration process, releasing any pending underlying
+// resources.
+func (it *VeriLogRegistryAgentKeyRegisteredIterator) Close() error {
+	it.sub.Unsubscribe()
+	return nil
+}
+
+// VeriLogRegistryAgentKeyRegistered represents a AgentKeyRegistered event raised by the VeriLogRegistry contract.
+type VeriLogRegistryAgentKeyRegistered struct {
+	AgentId   [32]byte
+	KeyId     [32]byte
+	Pubkey    [32]byte
+	ValidFrom uint64
+	Raw       types.Log // Blockchain specific contextual infos
+}
+
+// FilterAgentKeyRegistered is a free log retrieval operation binding the contract event 0x6ee71b52095caaca792b0200e1634f78566623b204e3c6c48291c9e186793b68.
+//
+// Solidity: event AgentKeyRegistered(bytes32 indexed agentId, bytes32 indexed keyId, bytes32 pubkey, uint64 validFrom)
+func (_VeriLogRegistry *VeriLogRegistryFilterer) FilterAgentKeyRegistered(opts *bind.FilterOpts, agentId [][32]byte, keyId [][32]byte) (*VeriLogRegistryAgentKeyRegisteredIterator, error) {
+
+	var agentIdRule []interface{}
+	for _, agentIdItem := range agentId {
+		agentIdRule = append(agentIdRule, agentIdItem)
+	}
+	var keyIdRule []interface{}
+	for _, keyIdItem := range keyId {
+		keyIdRule = append(keyIdRule, keyIdItem)
+	}
+
+	logs, sub, err := _VeriLogRegistry.contract.FilterLogs(opts, "AgentKeyRegistered", agentIdRule, keyIdRule)
+	if err != nil {
+		return nil, err
+	}
+	return &VeriLogRegistryAgentKeyRegisteredIterator{contract: _VeriLogRegistry.contract, event: "AgentKeyRegistered", logs: logs, sub: sub}, nil
+}
+
+// WatchAgentKeyRegistered is a free log subscription operation binding the contract event 0x6ee71b52095caaca792b0200e1634f78566623b204e3c6c48291c9e186793b68.
+//
+// Solidity: event AgentKeyRegistered(bytes32 indexed agentId, bytes32 indexed keyId, bytes32 pubkey, uint64 validFrom)
+func (_VeriLogRegistry *VeriLogRegistryFilterer) WatchAgentKeyRegistered(opts *bind.WatchOpts, sink chan<- *VeriLogRegistryAgentKeyRegistered, agentId [][32]byte, keyId [][32]byte) (event.Subscription, error) {
+
+	var agentIdRule []interface{}
+	for _, agentIdItem := range agentId {
+		agentIdRule = append(agentIdRule, agentIdItem)
+	}
+	var keyIdRule []interface{}
+	for _, keyIdItem := range keyId {
+		keyIdRule = append(keyIdRule, keyIdItem)
+	}
+
+	logs, sub, err := _VeriLogRegistry.contract.WatchLogs(opts, "AgentKeyRegistered", agentIdRule, keyIdRule)
+	if err != nil {
+		return nil, err
+	}
+	return event.NewSubscription(func(quit <-chan struct{}) error {
+		defer sub.Unsubscribe()
+		for {
+			select {
+			case log := <-logs:
+				// New log arrived, parse the event and forward to the user
+				event := new(VeriLogRegistryAgentKeyRegistered)
+				if err := _VeriLogRegistry.contract.UnpackLog(event, "AgentKeyRegistered", log); err != nil {
+					// If the signature doesn't match, skip this log.
+					if errors.Is(err, bind.ErrEventSignatureMismatch) {
+						continue
+					}
+					return err
+				}
+				event.Raw = log
+
+				select {
+				case sink <- event:
+				case err := <-sub.Err():
+					return err
+				case <-quit:
+					return nil
+				}
+			case err := <-sub.Err():
+				return err
+			case <-quit:
+				return nil
+			}
+		}
+	}), nil
+}
+
+// ParseAgentKeyRegistered is a log parse operation binding the contract event 0x6ee71b52095caaca792b0200e1634f78566623b204e3c6c48291c9e186793b68.
+//
+// Solidity: event AgentKeyRegistered(bytes32 indexed agentId, bytes32 indexed keyId, bytes32 pubkey, uint64 validFrom)
+func (_VeriLogRegistry *VeriLogRegistryFilterer) ParseAgentKeyRegistered(log types.Log) (*VeriLogRegistryAgentKeyRegistered, error) {
+	event := new(VeriLogRegistryAgentKeyRegistered)
+	if err := _VeriLogRegistry.contract.UnpackLog(event, "AgentKeyRegistered", log); err != nil {
+		return nil, err
+	}
+	event.Raw = log
+	return event, nil
+}
+
+// VeriLogRegistryAgentKeyRevokedIterator is returned from FilterAgentKeyRevoked and is used to iterate over the raw logs and unpacked data for AgentKeyRevoked events raised by the VeriLogRegistry contract.
+type VeriLogRegistryAgentKeyRevokedIterator struct {
+	Event *VeriLogRegistryAgentKeyRevoked // Event containing the contract specifics and raw log
+
+	contract *bind.BoundContract // Generic contract to use for unpacking event data
+	event    string              // Event name to use for unpacking event data
+
+	logs chan types.Log        // Log channel receiving the found contract events
+	sub  ethereum.Subscription // Subscription for errors, completion and termination
+	done bool                  // Whether the subscription completed delivering logs
+	fail error                 // Occurred error to stop iteration
+}
+
+// Next advances the iterator to the subsequent event, returning whether there
+// are any more events found. In case of a retrieval or parsing error, false is
+// returned and Error() can be queried for the exact failure.
+func (it *VeriLogRegistryAgentKeyRevokedIterator) Next() bool {
+	// If the iterator failed, stop iterating
+	if it.fail != nil {
+		return false
+	}
+	// If the iterator completed, deliver directly whatever's available
+	if it.done {
+		select {
+		case log := <-it.logs:
+			it.Event = new(VeriLogRegistryAgentKeyRevoked)
+			if err := it.contract.UnpackLog(it.Event, it.event, log); err != nil {
+				it.fail = err
+				return false
+			}
+			it.Event.Raw = log
+			return true
+
+		default:
+			return false
+		}
+	}
+	// Iterator still in progress, wait for either a data or an error event
+	select {
+	case log := <-it.logs:
+		it.Event = new(VeriLogRegistryAgentKeyRevoked)
+		if err := it.contract.UnpackLog(it.Event, it.event, log); err != nil {
+			it.fail = err
+			return false
+		}
+		it.Event.Raw = log
+		return true
+
+	case err := <-it.sub.Err():
+		it.done = true
+		it.fail = err
+		return it.Next()
+	}
+}
+
+// Error returns any retrieval or parsing error occurred during filtering.
+func (it *VeriLogRegistryAgentKeyRevokedIterator) Error() error {
+	return it.fail
+}
+
+// Close terminates the iteration process, releasing any pending underlying
+// resources.
+func (it *VeriLogRegistryAgentKeyRevokedIterator) Close() error {
+	it.sub.Unsubscribe()
+	return nil
+}
+
+// VeriLogRegistryAgentKeyRevoked represents a AgentKeyRevoked event raised by the VeriLogRegistry contract.
+type VeriLogRegistryAgentKeyRevoked struct {
+	AgentId   [32]byte
+	KeyId     [32]byte
+	RevokedAt uint64
+	Raw       types.Log // Blockchain specific contextual infos
+}
+
+// FilterAgentKeyRevoked is a free log retrieval operation binding the contract event 0xfb49e6b1293208eb0202e1aa157a08660d0780049f4db27b7bc48d275f3fa9f5.
+//
+// Solidity: event AgentKeyRevoked(bytes32 indexed agentId, bytes32 indexed keyId, uint64 revokedAt)
+func (_VeriLogRegistry *VeriLogRegistryFilterer) FilterAgentKeyRevoked(opts *bind.FilterOpts, agentId [][32]byte, keyId [][32]byte) (*VeriLogRegistryAgentKeyRevokedIterator, error) {
+
+	var agentIdRule []interface{}
+	for _, agentIdItem := range agentId {
+		agentIdRule = append(agentIdRule, agentIdItem)
+	}
+	var keyIdRule []interface{}
+	for _, keyIdItem := range keyId {
+		keyIdRule = append(keyIdRule, keyIdItem)
+	}
+
+	logs, sub, err := _VeriLogRegistry.contract.FilterLogs(opts, "AgentKeyRevoked", agentIdRule, keyIdRule)
+	if err != nil {
+		return nil, err
+	}
+	return &VeriLogRegistryAgentKeyRevokedIterator{contract: _VeriLogRegistry.contract, event: "AgentKeyRevoked", logs: logs, sub: sub}, nil
+}
+
+// WatchAgentKeyRevoked is a free log subscription operation binding the contract event 0xfb49e6b1293208eb0202e1aa157a08660d0780049f4db27b7bc48d275f3fa9f5.
+//
+// Solidity: event AgentKeyRevoked(bytes32 indexed agentId, bytes32 indexed keyId, uint64 revokedAt)
+func (_VeriLogRegistry *VeriLogRegistryFilterer) WatchAgentKeyRevoked(opts *bind.WatchOpts, sink chan<- *VeriLogRegistryAgentKeyRevoked, agentId [][32]byte, keyId [][32]byte) (event.Subscription, error) {
+
+	var agentIdRule []interface{}
+	for _, agentIdItem := range agentId {
+		agentIdRule = append(agentIdRule, agentIdItem)
+	}
+	var keyIdRule []interface{}
+	for _, keyIdItem := range keyId {
+		keyIdRule = append(keyIdRule, keyIdItem)
+	}
+
+	logs, sub, err := _VeriLogRegistry.contract.WatchLogs(opts, "AgentKeyRevoked", agentIdRule, keyIdRule)
+	if err != nil {
+		return nil, err
+	}
+	return event.NewSubscription(func(quit <-chan struct{}) error {
+		defer sub.Unsubscribe()
+		for {
+			select {
+			case log := <-logs:
+				// New log arrived, parse the event and forward to the user
+				event := new(VeriLogRegistryAgentKeyRevoked)
+				if err := _VeriLogRegistry.contract.UnpackLog(event, "AgentKeyRevoked", log); err != nil {
+					// If the signature doesn't match, skip this log.
+					if errors.Is(err, bind.ErrEventSignatureMismatch) {
+						continue
+					}
+					return err
+				}
+				event.Raw = log
+
+				select {
+				case sink <- event:
+				case err := <-sub.Err():
+					return err
+				case <-quit:
+					return nil
+				}
+			case err := <-sub.Err():
+				return err
+			case <-quit:
+				return nil
+			}
+		}
+	}), nil
+}
+
+// ParseAgentKeyRevoked is a log parse operation binding the contract event 0xfb49e6b1293208eb0202e1aa157a08660d0780049f4db27b7bc48d275f3fa9f5.
+//
+// Solidity: event AgentKeyRevoked(bytes32 indexed agentId, bytes32 indexed keyId, uint64 revokedAt)
+func (_VeriLogRegistry *VeriLogRegistryFilterer) ParseAgentKeyRevoked(log types.Log) (*VeriLogRegistryAgentKeyRevoked, error) {
+	event := new(VeriLogRegistryAgentKeyRevoked)
+	if err := _VeriLogRegistry.contract.UnpackLog(event, "AgentKeyRevoked", log); err != nil {
+		return nil, err
+	}
+	event.Raw = log
+	return event, nil
 }
 
 // VeriLogRegistryLogAnchoredIterator is returned from FilterLogAnchored and is used to iterate over the raw logs and unpacked data for LogAnchored events raised by the VeriLogRegistry contract.

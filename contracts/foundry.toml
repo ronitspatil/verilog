@@ -8,6 +8,10 @@ solc_version = "0.8.28"
 evm_version = "cancun"
 optimizer = true
 optimizer_runs = 10000
+# Only the remappings below: auto-detected ones depend on which nested
+# submodules happen to be checked out and would change the metadata hash in
+# the bytecode, so `make bindings` would not be reproducible.
+auto_detect_remappings = false
 remappings = [
     "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
     "forge-std/=lib/forge-std/src/",

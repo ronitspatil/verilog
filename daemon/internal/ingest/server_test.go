@@ -1,10 +1,13 @@
 package ingest
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
+	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -20,6 +23,7 @@ import (
 	"github.com/ronitspatil/verilog/daemon/internal/anchor"
 	"github.com/ronitspatil/verilog/daemon/internal/canonical"
 	"github.com/ronitspatil/verilog/daemon/internal/engine"
+	"github.com/ronitspatil/verilog/daemon/internal/keys"
 	"github.com/ronitspatil/verilog/daemon/internal/merkle"
 	"github.com/ronitspatil/verilog/daemon/internal/store"
 	"github.com/ronitspatil/verilog/daemon/internal/wal"
@@ -36,6 +40,31 @@ type env struct {
 	client verilogv1.VeriLogClient
 	eng    *engine.Engine
 	sink   *jobSink
+	keys   *fakeKeys
+}
+
+// fakeKeys is an in-memory key registry: keyID -> key, for every agent.
+type fakeKeys struct {
+	mu   sync.Mutex
+	keys map[canonical.Digest]keys.Key
+	err  error
+}
+
+func (f *fakeKeys) AgentKey(_ context.Context, _, keyID canonical.Digest) (keys.Key, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return keys.Key{}, f.err
+	}
+	return f.keys[keyID], nil
+}
+
+func (f *fakeKeys) set(priv ed25519.PrivateKey, k keys.Key) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	pub := priv.Public().(ed25519.PublicKey)
+	k.Pubkey = pub
+	f.keys[canonical.KeyID(pub)] = k
 }
 
 func newEnv(t *testing.T) *env {
@@ -57,7 +86,9 @@ func newEnv(t *testing.T) *env {
 
 	lis := bufconn.Listen(1 << 20)
 	srv := grpc.NewServer()
-	verilogv1.RegisterVeriLogServer(srv, NewServer(eng, st, Options{MaxPayloadBytes: 4096, Window: 64}, nil))
+	reg := &fakeKeys{keys: map[canonical.Digest]keys.Key{}}
+	reg.set(testKey, keys.Key{ValidFrom: 1})
+	verilogv1.RegisterVeriLogServer(srv, NewServer(eng, st, Options{MaxPayloadBytes: 4096, Window: 64, Keys: reg}, nil))
 	go srv.Serve(lis)
 	conn, err := grpc.NewClient("passthrough:///bufnet",
 		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return lis.Dial() }),
@@ -72,7 +103,7 @@ func newEnv(t *testing.T) *env {
 		eng.Close()
 		w.Close()
 	})
-	return &env{client: verilogv1.NewVeriLogClient(conn), eng: eng, sink: sink}
+	return &env{client: verilogv1.NewVeriLogClient(conn), eng: eng, sink: sink, keys: reg}
 }
 
 var testKey = ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
@@ -288,5 +319,88 @@ func TestGetProof(t *testing.T) {
 	_, err = e.client.GetProof(ctx, &verilogv1.GetProofRequest{AgentId: "agent-p"})
 	if status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("missing epoch: %v", err)
+	}
+}
+
+func TestStreamEnforcesSignatures(t *testing.T) {
+	e := newEnv(t)
+	unregistered := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{1}, ed25519.SeedSize))
+	revoked := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{2}, ed25519.SeedSize))
+	e.keys.set(revoked, keys.Key{ValidFrom: 1, RevokedAt: 2})
+
+	good := logEvent("agent-s", 1)
+	unsigned := logEvent("agent-s", 2)
+	unsigned.Signature = nil
+	// Claims the registered key but is signed by another one (a forgery).
+	wrongKey := logEventWith(unregistered, "agent-s", 3)
+	wrongKey.KeyId = good.KeyId
+	unknownKey := logEventWith(unregistered, "agent-s", 4)
+	revokedKey := logEventWith(revoked, "agent-s", 5)
+	// A valid signature over different content (payload altered after signing).
+	altered := logEvent("agent-s", 6)
+	altered.PayloadJson = `{"output": "something else", "ok": true}`
+	shortKeyID := logEvent("agent-s", 7)
+	shortKeyID.KeyId = shortKeyID.KeyId[:31]
+	good2 := logEvent("agent-s", 8)
+
+	cases := []struct {
+		msg      *verilogv1.LogEvent
+		accepted bool
+		errHas   string
+	}{
+		{good, true, ""},
+		{unsigned, false, "not signed"},
+		{wrongKey, false, "signature does not verify"},
+		{unknownKey, false, "not registered"},
+		{revokedKey, false, "revoked"},
+		{altered, false, "signature does not verify"},
+		{shortKeyID, false, "key_id must be 32 bytes"},
+		{good2, true, ""},
+	}
+	stream, err := e.client.IngestStream(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range cases {
+		if err := stream.Send(c.msg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stream.CloseSend()
+	for _, c := range cases {
+		ack, err := stream.Recv()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ack.Sequence != c.msg.Sequence || ack.Accepted != c.accepted || !strings.Contains(ack.Error, c.errHas) {
+			t.Errorf("event %d: ack %+v, want accepted=%v error containing %q", c.msg.Sequence, ack, c.accepted, c.errHas)
+		}
+	}
+	if got := e.eng.Stats().Accepted; got != 2 {
+		t.Fatalf("accepted = %d, want 2", got)
+	}
+}
+
+func TestStreamFailsWhenKeyRegistryIsDown(t *testing.T) {
+	e := newEnv(t)
+	stream, err := e.client.IngestStream(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Send(logEvent("agent-d", 1)); err != nil {
+		t.Fatal(err)
+	}
+	if ack, err := stream.Recv(); err != nil || !ack.Accepted {
+		t.Fatalf("first event: %+v %v", ack, err)
+	}
+	// Registry outage: the event is neither accepted nor rejected; the stream
+	// fails with UNAVAILABLE so the client re-sends it after reconnecting.
+	e.keys.mu.Lock()
+	e.keys.err = errors.New("rpc down")
+	e.keys.mu.Unlock()
+	stream.Send(logEventWith(ed25519.NewKeyFromSeed(bytes.Repeat([]byte{3}, 32)), "agent-d", 2))
+	_, err = stream.Recv()
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("err = %v, want Unavailable", err)
 	}
 }

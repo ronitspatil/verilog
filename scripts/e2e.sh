@@ -68,24 +68,53 @@ echo "registry: $CONTRACT"
 
 AGENT_KEY="$(cast keccak "$AGENT_ID")"
 
-# keygen <file>: a new agent signing key (seed file, mode 0600); prints the public key.
+# keygen <file>: a new agent signing key (seed file, mode 0600); prints the
+# public key. The proof of possession is in <file>.out.
 keygen() {
   "$PYTHON" -m verilog_sdk keygen --out "$1" --agent-id "$AGENT_ID" >"$1.out" || fail "keygen failed"
   awk '/^pubkey:/ {print $2}' "$1.out"
 }
+pop_of() { awk '/^pop:/ {print $2}' "$1.out"; }
 seed_of() { tr -d '\n' <"$1"; }
-register_key() { # <pubkey>, as the key admin
-  cast send "$CONTRACT" 'registerAgentKey(bytes32,bytes32)' "$AGENT_KEY" "$1" --private-key "$ADMIN_KEY" --rpc-url "$RPC" >/dev/null \
+register_key() { # <key file>: the key admin checks the key and its proof of possession, then registers it
+  local pub; pub="$(awk '/^pubkey:/ {print $2}' "$1.out")"
+  "$VERIFY" keycheck --agent-id "$AGENT_ID" --pubkey "$pub" --pop "$(pop_of "$1")" >"$WORK/keycheck.out" 2>/dev/null \
+    || { cat "$WORK/keycheck.out"; fail "keycheck refused a freshly generated key"; }
+  cast send "$CONTRACT" 'registerAgentKey(bytes32,bytes32)' "$AGENT_KEY" "$pub" --private-key "$ADMIN_KEY" --rpc-url "$RPC" >/dev/null \
     || fail "registering agent key failed"
 }
-revoke_key() { # <pubkey>, as the key admin
-  cast send "$CONTRACT" 'revokeAgentKey(bytes32,bytes32)' "$AGENT_KEY" "$(cast keccak "$1")" --private-key "$ADMIN_KEY" --rpc-url "$RPC" >/dev/null \
-    || fail "revoking agent key failed"
+chain_time() { cast block latest -f timestamp --rpc-url "$RPC"; }
+revoke_key() { # <pubkey> <seconds from now>: schedule the revocation, as the key admin
+  local at=$(( $(chain_time) + $2 ))
+  cast send "$CONTRACT" 'revokeAgentKey(bytes32,bytes32,uint64)' "$AGENT_KEY" "$(cast keccak "$1")" "$at" \
+    --private-key "$ADMIN_KEY" --rpc-url "$RPC" >/dev/null || fail "revoking agent key failed"
 }
+advance_time() { cast rpc evm_increaseTime "${1:-10}" --rpc-url "$RPC" >/dev/null && cast rpc evm_mine --rpc-url "$RPC" >/dev/null; }
 
-log "generating the agent signing key"
+log "generating the agent signing key (with a proof of possession)"
 PUBKEY="$(keygen "$WORK/agent.key")"
 echo "agent pubkey: $PUBKEY  key_id: $(cast keccak "$PUBKEY")"
+
+log "a small-order key is refused by keycheck and by the registry (expect [KEY REJECTED] and a revert)"
+IDENTITY="0x0100000000000000000000000000000000000000000000000000000000000000"
+set +e
+"$VERIFY" keycheck --agent-id "$AGENT_ID" --pubkey "$IDENTITY" --pop "0x01$(printf '0%.0s' $(seq 1 126))" >"$WORK/weak.out" 2>/dev/null
+code=$?
+set -e
+[ "$code" = 1 ] && grep -q "^\[KEY REJECTED\].*small order" "$WORK/weak.out" || { cat "$WORK/weak.out"; fail "keycheck accepted the identity point"; }
+cat "$WORK/weak.out"
+if cast send "$CONTRACT" 'registerAgentKey(bytes32,bytes32)' "$AGENT_KEY" "$IDENTITY" --private-key "$ADMIN_KEY" \
+    --rpc-url "$RPC" >"$WORK/weak-register.log" 2>&1; then
+  fail "the registry accepted the identity point as an agent key"
+fi
+grep -qi "revert" "$WORK/weak-register.log" || { cat "$WORK/weak-register.log"; fail "unexpected error"; }
+echo "registry refused: $(grep -i -m1 -o 'revert.*' "$WORK/weak-register.log" | cut -c1-120)"
+
+log "a proof of possession made for another agent id is refused (expect [KEY REJECTED])"
+if "$VERIFY" keycheck --agent-id "another-agent" --pubkey "$PUBKEY" --pop "$(pop_of "$WORK/agent.key")" >"$WORK/pop.out" 2>/dev/null; then
+  fail "keycheck accepted a proof of possession for another agent"
+fi
+cat "$WORK/pop.out"
 
 log "the anchorer cannot register agent keys (expect revert)"
 if cast send "$CONTRACT" 'registerAgentKey(bytes32,bytes32)' "$AGENT_KEY" "$PUBKEY" --private-key "$ANCHOR_KEY" \
@@ -95,8 +124,8 @@ fi
 grep -qi "revert" "$WORK/anchorer-register.log" || { cat "$WORK/anchorer-register.log"; fail "unexpected error"; }
 echo "refused: $(grep -i -m1 -o 'revert.*' "$WORK/anchorer-register.log" | cut -c1-120)"
 
-log "registering the agent key as the key admin"
-register_key "$PUBKEY"
+log "registering the agent key as the key admin (after keycheck)"
+register_key "$WORK/agent.key"
 
 start_daemon() {
   VERILOG_PRIVATE_KEY="$ANCHOR_KEY" "$WORK/bin/verilogd" \
@@ -104,8 +133,9 @@ start_daemon() {
     --epoch-interval 2s --epoch-max-logs 1000 --confirm-timeout 30s --retry-initial 200ms \
     >>"$WORK/daemon.log" 2>&1 &
   DAEMON_PID=$!
+  local n; n="$(grep -c "verilogd listening" "$WORK/daemon.log" || true)"
   for _ in $(seq 1 100); do
-    grep -q "verilogd listening" "$WORK/daemon.log" && return 0
+    [ "$(grep -c "verilogd listening" "$WORK/daemon.log" || true)" -gt "$n" ] && return 0
     kill -0 "$DAEMON_PID" 2>/dev/null || fail "verilogd exited during startup"
     sleep 0.1
   done
@@ -118,10 +148,22 @@ stop_daemon() {
   DAEMON_PID=""
 }
 
-wait_bundle() { # epoch
-  local f="$DATA/evidence/$AGENT_KEY/epoch-$1.json"
-  for _ in $(seq 1 300); do [ -f "$f" ] && { echo "$f"; return 0; }; sleep 0.2; done
-  fail "epoch $1 was not anchored in time"
+EVIDENCE="$DATA/evidence/$AGENT_KEY"
+latest_epoch() { cast call "$CONTRACT" 'latestEpoch(bytes32)(uint256)' "$AGENT_KEY" --rpc-url "$RPC"; }
+anchored_count() { # events in the daemon's bundles
+  "$PYTHON" -c 'import glob,json,sys; print(sum(json.load(open(f))["log_count"] for f in glob.glob(sys.argv[1]+"/epoch-*.json")))' "$EVIDENCE" 2>/dev/null || echo 0
+}
+wait_anchored() { # <total events>: wait until the daemon's bundles hold them all
+  for _ in $(seq 1 300); do [ "$(anchored_count)" -ge "$1" ] && return 0; sleep 0.2; done
+  fail "only $(anchored_count) of $1 events anchored in time"
+}
+
+# The complete evidence of the agent: the daemon's bundles plus the bundles
+# of every epoch the attacker anchors below ($ATTACK). Run mode needs all.
+ATTACK="$WORK/attacker-evidence"
+mkdir -p "$ATTACK"
+all_evidence() { # <dir>: a fresh copy of the complete evidence
+  rm -rf "$1" && mkdir -p "$1" && cp "$EVIDENCE"/epoch-*.json "$1"/ && { cp "$ATTACK"/epoch-*.json "$1"/ 2>/dev/null || true; }
 }
 
 # expect_verify <expected-exit> <expected-stdout> args...
@@ -141,6 +183,7 @@ expect_stderr() { grep -q "$1" "$WORK/verify.err" || fail "expected stderr to ma
 
 SUCCESS="[SUCCESS] Log Integrity Verified"
 FAILURE="[FAILURE] Tampered Log Detected"
+INCOMPLETE="[SUCCESS-INCOMPLETE] Log Integrity Verified, Run Incomplete"
 
 log "starting verilogd"
 start_daemon
@@ -153,35 +196,38 @@ fi
 grep -q "in use by another verilogd" "$WORK/second.log" || { cat "$WORK/second.log"; fail "unexpected second-daemon error"; }
 echo "refused: $(tail -n 1 "$WORK/second.log")"
 
-log "an agent signing with an unregistered key is rejected by the daemon"
+log "an agent signing with an unregistered key is rejected by the daemon (after a bounded retry)"
 keygen "$WORK/rogue.key" >/dev/null
 if VERILOG_SIGNING_KEY_FILE="$WORK/rogue.key" "$PYTHON" "$ROOT/scripts/e2e_agent.py" --target "$TARGET" \
-    --agent-id "$AGENT_ID" --runs 1 >/dev/null 2>"$WORK/rogue.log"; then
+    --agent-id "$AGENT_ID" --runs 1 --key-wait 2 >/dev/null 2>"$WORK/rogue.log"; then
   fail "events signed with an unregistered key were accepted"
 fi
 grep -q "acked=0 rejected=" "$WORK/rogue.log" || { cat "$WORK/rogue.log"; fail "unexpected rogue agent outcome"; }
 grep -q "is not registered for agent" "$WORK/rogue.log" || { cat "$WORK/rogue.log"; fail "no 'not registered' rejection"; }
+grep -q "retrying in" "$WORK/rogue.log" || { cat "$WORK/rogue.log"; fail "'not registered' rejections were not retried"; }
 echo "rejected: $(grep -o 'acked=0 rejected=[0-9]*' "$WORK/rogue.log")"
 
 export VERILOG_SIGNING_KEY_FILE="$WORK/agent.key"
-log "running the LangChain agent through the Python SDK (signing with the registered key)"
-ACKED="$("$PYTHON" "$ROOT/scripts/e2e_agent.py" --target "$TARGET" --agent-id "$AGENT_ID" --runs 3)" || fail "agent run failed"
+CRASHED_RUN="crashed-run-1"
+log "running the LangChain agent through the Python SDK (plus a run that never ends)"
+ACKED="$("$PYTHON" "$ROOT/scripts/e2e_agent.py" --target "$TARGET" --agent-id "$AGENT_ID" --runs 3 --open-run "$CRASHED_RUN")" \
+  || fail "agent run failed"
 echo "events acknowledged: $ACKED"
 [ "$ACKED" -gt 0 ] || fail "no events acknowledged"
 
-log "waiting for epoch 1 to be anchored"
-BUNDLE1="$(wait_bundle 1)"
-COUNT1="$("$PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["log_count"])' "$BUNDLE1")"
-echo "bundle: $BUNDLE1 ($COUNT1 events)"
-[ "$COUNT1" = "$ACKED" ] || fail "epoch 1 holds $COUNT1 events, expected $ACKED"
+log "waiting for the events to be anchored"
+wait_anchored "$ACKED"
+BUNDLE1="$EVIDENCE/epoch-1.json"
 ONCHAIN_COUNT="$(cast call "$CONTRACT" 'agentAnchors(bytes32,uint256)(bytes32,uint64,uint32)' "$AGENT_KEY" 1 --rpc-url "$RPC" | sed -n 3p)"
+COUNT1="$("$PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["log_count"])' "$BUNDLE1")"
 [ "$ONCHAIN_COUNT" = "$COUNT1" ] || fail "on-chain logCount $ONCHAIN_COUNT != $COUNT1"
+echo "anchored in $(latest_epoch) epoch(s)"
 
 # ---------------------------------------------------------- single-event mode
 COMMON=(--epoch 1 --agent-id "$AGENT_ID" --rpc "$RPC" --contract "$CONTRACT")
 
 log "export from bundle + verify untouched event (expect SUCCESS)"
-"$VERIFY" export --bundle "$BUNDLE1" --index 3 --out "$WORK/ev" 2>/dev/null
+"$VERIFY" export --bundle "$BUNDLE1" --index 1 --out "$WORK/ev" 2>/dev/null
 expect_verify 0 "$SUCCESS" --event "$WORK/ev/event.json" --proof "$WORK/ev/proof.json" "${COMMON[@]}"
 expect_stderr "signing key:    valid at anchor time"
 
@@ -206,53 +252,74 @@ log "one-byte structural corruption (expect FAILURE)"
 "$PYTHON" -c 'import sys; b=open(sys.argv[1],"rb").read(); open(sys.argv[2],"wb").write(b[:-2]+b"]"+b[-1:])' "$WORK/ev/event.json" "$WORK/corrupt.json"
 expect_verify 1 "$FAILURE" --event "$WORK/corrupt.json" --proof "$WORK/ev/proof.json" "${COMMON[@]}"
 
-log "un-anchored epoch (expect exit 2, no verdict)"
-expect_verify 2 "" --event "$WORK/ev/event.json" --proof "$WORK/ev/proof.json" --epoch 999 --agent-id "$AGENT_ID" --rpc "$RPC" --contract "$CONTRACT"
+log "the same event re-spelled (reformatted, non-canonical file) (expect FAILURE)"
+"$PYTHON" -c 'import json,sys; open(sys.argv[2],"w").write(json.dumps(json.load(open(sys.argv[1])), indent=2))' "$WORK/ev/event.json" "$WORK/respelled.json"
+expect_verify 1 "$FAILURE" --event "$WORK/respelled.json" --proof "$WORK/ev/proof.json" "${COMMON[@]}"
+expect_stderr "not in canonical form"
+expect_stderr "signed bytes:"
+
+log "an epoch that is not anchored (expect FAILURE: false evidence, not 'no verdict')"
+expect_verify 1 "$FAILURE" --event "$WORK/ev/event.json" --proof "$WORK/ev/proof.json" --epoch 999 --agent-id "$AGENT_ID" --rpc "$RPC" --contract "$CONTRACT"
+expect_stderr "epoch 999 is not anchored"
 
 log "RPC unreachable (expect exit 2, no verdict)"
 expect_verify 2 "" --event "$WORK/ev/event.json" --proof "$WORK/ev/proof.json" --epoch 1 --agent-id "$AGENT_ID" --rpc "http://127.0.0.1:1" --contract "$CONTRACT"
 
 # ------------------------------------------------------------------- run mode
-EVIDENCE="$DATA/evidence/$AGENT_KEY"
 RUN_ID="$("$PYTHON" -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["events"][0]["canonical_event"])["run_id"])' "$BUNDLE1")"
 RUN=(--run-id "$RUN_ID" --agent-id "$AGENT_ID" --rpc "$RPC" --contract "$CONTRACT")
 echo "run under test: $RUN_ID"
 
-log "run mode on the untouched evidence (expect SUCCESS)"
+log "run mode on the complete evidence (expect SUCCESS)"
 expect_verify 0 "$SUCCESS" "${RUN[@]}" --bundles "$EVIDENCE"
 expect_stderr 'run_end:        status "ok"'
 
-# drop_event <src bundle> <dst bundle> <python condition on ev>: copy the
-# bundle without the one event of $RUN_ID matching the condition.
+# drop_event <evidence dir> <python condition on ev>: remove the one event of
+# $RUN_ID matching the condition from whichever bundle holds it.
 drop_event() {
-  mkdir -p "$(dirname "$2")"
-  "$PYTHON" - "$1" "$2" "$RUN_ID" "$3" <<'PY'
-import json, sys
-src, dst, run, cond = sys.argv[1:5]
-b = json.load(open(src))
-def match(e):
-    ev = json.loads(e["canonical_event"])
-    return ev["run_id"] == run and eval(cond, {"ev": ev})
-keep = [e for e in b["events"] if not match(e)]
-assert len(keep) == len(b["events"]) - 1, "expected to drop exactly one event"
-b["events"] = keep
-json.dump(b, open(dst, "w"), indent=2)
+  "$PYTHON" - "$1" "$RUN_ID" "$2" <<'PY'
+import glob, json, sys
+d, run, cond = sys.argv[1:4]
+dropped = 0
+for f in glob.glob(d + "/epoch-*.json"):
+    b = json.load(open(f))
+    def match(e):
+        ev = json.loads(e["canonical_event"])
+        return ev["run_id"] == run and eval(cond, {"ev": ev})
+    keep = [e for e in b["events"] if not match(e)]
+    if len(keep) != len(b["events"]):
+        dropped += len(b["events"]) - len(keep)
+        b["events"] = keep
+        json.dump(b, open(f, "w"), indent=2)
+assert dropped == 1, dropped
 PY
 }
 
 log "run mode, a middle event withheld from the evidence (expect FAILURE)"
-drop_event "$BUNDLE1" "$WORK/drop/epoch-1.json" 'ev["step_number"] == 3'
+all_evidence "$WORK/drop"
+drop_event "$WORK/drop" 'ev["step_number"] == 3'
 expect_verify 1 "$FAILURE" "${RUN[@]}" --bundles "$WORK/drop"
-expect_stderr "events missing from the run: step 2 is followed by step 4"
+expect_stderr "does not match the on-chain anchors"
 
-log "run mode, run_end withheld (expect FAILURE)"
-drop_event "$BUNDLE1" "$WORK/trunc/epoch-1.json" 'ev["event_type"] == "run_end"'
-expect_verify 1 "$FAILURE" "${RUN[@]}" --bundles "$WORK/trunc"
-expect_stderr "run ended without terminal event after step"
+log "run mode, a decoy bundle for an unanchored epoch next to the gap (expect FAILURE, not 'no verdict')"
+"$PYTHON" -c 'import json,sys; b=json.load(open(sys.argv[1])); b["epoch_id"]=999; json.dump(b, open(sys.argv[2],"w"))' "$BUNDLE1" "$WORK/drop/epoch-999.json"
+echo '{not json' >"$WORK/drop/garbage.json"
+expect_verify 1 "$FAILURE" "${RUN[@]}" --bundles "$WORK/drop"
+expect_stderr "epoch 999 is not anchored for this agent"
 
-log "run mode, run_end withheld, --allow-incomplete (expect SUCCESS with a warning)"
-expect_verify 0 "$SUCCESS" "${RUN[@]}" --bundles "$WORK/trunc" --allow-incomplete
-expect_stderr "warning: .*run ended without terminal event"
+log "run mode, an anchored epoch missing from the evidence (expect FAILURE)"
+mkdir -p "$WORK/none"
+expect_verify 1 "$FAILURE" "${RUN[@]}" --bundles "$WORK/none"
+expect_stderr "evidence is incomplete"
+
+log "run mode, a run that never ended (expect FAILURE)"
+CRASH=(--run-id "$CRASHED_RUN" --agent-id "$AGENT_ID" --rpc "$RPC" --contract "$CONTRACT" --bundles "$EVIDENCE")
+expect_verify 1 "$FAILURE" "${CRASH[@]}"
+expect_stderr "run ended without terminal event after step 2"
+
+log "run mode, the same run with --allow-incomplete (expect the distinct [SUCCESS-INCOMPLETE], exit 3)"
+expect_verify 3 "$INCOMPLETE" "${CRASH[@]}" --allow-incomplete
+expect_stderr "warning: .*INCOMPLETE"
 
 log "run mode, RPC unreachable (expect exit 2, no verdict)"
 expect_verify 2 "" --run-id "$RUN_ID" --bundles "$EVIDENCE" --agent-id "$AGENT_ID" --rpc "http://127.0.0.1:1" --contract "$CONTRACT"
@@ -263,25 +330,46 @@ stop_daemon
 start_daemon
 grep -q "engine: recovered from WAL" "$WORK/daemon.log" || fail "no recovery log line"
 
-log "second agent session after restart -> epoch 2"
-ACKED2="$("$PYTHON" "$ROOT/scripts/e2e_agent.py" --target "$TARGET" --agent-id "$AGENT_ID" --runs 2)" || fail "second agent run failed"
-BUNDLE2="$(wait_bundle 2)"
-"$VERIFY" export --bundle "$BUNDLE2" --digest "$("$PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["events"][-1]["content_digest"])' "$BUNDLE2")" --out "$WORK/ev2" 2>/dev/null
-expect_verify 0 "$SUCCESS" --event "$WORK/ev2/event.json" --proof "$WORK/ev2/proof.json" --epoch 2 --agent-id "$AGENT_KEY" --rpc "$RPC" --contract "$CONTRACT"
-log "an epoch-1 proof does not verify against epoch 2 (expect FAILURE)"
-expect_verify 1 "$FAILURE" --event "$WORK/ev/event.json" --proof "$WORK/ev/proof.json" --epoch 2 --agent-id "$AGENT_ID" --rpc "$RPC" --contract "$CONTRACT"
+log "second agent session after restart, with a 1.5 MB tool output (over the 1 MiB payload limit)"
+BEFORE="$(anchored_count)"
+"$PYTHON" "$ROOT/scripts/e2e_agent.py" --target "$TARGET" --agent-id "$AGENT_ID" --runs 2 --big-output 1572864 \
+  >"$WORK/agent2.out" 2>"$WORK/agent2.log" || { tail -n 20 "$WORK/agent2.log"; fail "second agent run failed"; }
+ACKED2="$(cat "$WORK/agent2.out")"
+grep -Eq "truncated=[1-9][0-9]* chain_gaps=0" "$WORK/agent2.log" || { tail -n 5 "$WORK/agent2.log"; fail "the oversized payload was not replaced"; }
+wait_anchored $(( BEFORE + ACKED2 ))
+BIG_RUN="$("$PYTHON" - "$EVIDENCE" <<'PY'
+import glob, json, sys
+for f in sorted(glob.glob(sys.argv[1] + "/epoch-*.json")):
+    for e in json.load(open(f))["events"]:
+        ev = json.loads(e["canonical_event"])
+        if ev["payload"].get("truncated") is True:
+            print(ev["run_id"]); sys.exit(0)
+sys.exit(1)
+PY
+)" || fail "no signed stand-in for the oversized payload in the evidence"
+log "run mode on the run with the oversized tool output (expect SUCCESS)"
+expect_verify 0 "$SUCCESS" --run-id "$BIG_RUN" --bundles "$EVIDENCE" --agent-id "$AGENT_ID" --rpc "$RPC" --contract "$CONTRACT"
 
-[ "$(cast call "$CONTRACT" 'latestEpoch(bytes32)(uint256)' "$AGENT_KEY" --rpc-url "$RPC")" = "2" ] || fail "latestEpoch != 2"
+LATEST="$(latest_epoch)"
+BUNDLE2="$EVIDENCE/epoch-$LATEST.json"
+"$VERIFY" export --bundle "$BUNDLE2" --digest "$("$PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["events"][-1]["content_digest"])' "$BUNDLE2")" --out "$WORK/ev2" 2>/dev/null
+expect_verify 0 "$SUCCESS" --event "$WORK/ev2/event.json" --proof "$WORK/ev2/proof.json" --epoch "$LATEST" --agent-id "$AGENT_KEY" --rpc "$RPC" --contract "$CONTRACT"
+log "an epoch-1 proof does not verify against epoch $LATEST (expect FAILURE)"
+expect_verify 1 "$FAILURE" --event "$WORK/ev/event.json" --proof "$WORK/ev/proof.json" --epoch "$LATEST" --agent-id "$AGENT_ID" --rpc "$RPC" --contract "$CONTRACT"
 stop_daemon
 
 # ---------------------------------------------------------------------------
 # A compromised daemon host: it holds the anchorer key and can anchor any
-# root it likes, but it cannot sign as the agent or register keys.
+# root it likes, but it cannot sign as the agent or register keys. Every
+# epoch it anchors also gets a bundle in $ATTACK, so the evidence stays
+# complete for run mode.
 FORGE="$ROOT/scripts/e2e_forge.py"
-next_epoch() { echo $(( $(cast call "$CONTRACT" 'latestEpoch(bytes32)(uint256)' "$AGENT_KEY" --rpc-url "$RPC") + 1 )); }
-attacker_anchor() { # <root> <count>: anchor as the anchorer; prints the new epoch
+next_epoch() { echo $(( $(latest_epoch) + 1 )); }
+attacker_anchor() { # bundle args for e2e_forge (without --epoch/--out): anchor as the anchorer; prints the new epoch
   local want; want="$(next_epoch)"
-  cast send "$CONTRACT" 'anchorEpoch(bytes32,bytes32,uint32)' "$AGENT_KEY" "$1" "$2" --private-key "$ANCHOR_KEY" --rpc-url "$RPC" >/dev/null \
+  local root count
+  read -r root count < <("$PYTHON" "$FORGE" bundle "$@" --agent-id "$AGENT_ID" --epoch "$want" --out "$ATTACK/epoch-$want.json")
+  cast send "$CONTRACT" 'anchorEpoch(bytes32,bytes32,uint32)' "$AGENT_KEY" "$root" "$count" --private-key "$ANCHOR_KEY" --rpc-url "$RPC" >/dev/null \
     || fail "attacker anchoring failed"
   [ "$(next_epoch)" = "$((want + 1))" ] || fail "unexpected epoch numbering"
   echo "$want"
@@ -290,33 +378,67 @@ attacker_anchor() { # <root> <count>: anchor as the anchorer; prints the new epo
 log "forged event re-signed with an unregistered key, anchored by the anchorer (expect FAILURE)"
 keygen "$WORK/attacker.key" >/dev/null
 mkdir -p "$WORK/forged"
-LEAF="$("$PYTHON" "$FORGE" resign "$WORK/ev/event.json" "$WORK/forged/event.json" --seed "$(seed_of "$WORK/attacker.key")" \
-  --payload '{"text":"approve the wire transfer"}')"
-EPOCH="$(attacker_anchor "$LEAF" 1)"
+"$PYTHON" "$FORGE" resign "$WORK/ev/event.json" "$WORK/forged/event.json" --seed "$(seed_of "$WORK/attacker.key")" \
+  --payload '{"text":"approve the wire transfer"}' >/dev/null
+EPOCH="$(attacker_anchor --event "$WORK/forged/event.json")"
 expect_verify 1 "$FAILURE" --event "$WORK/forged/event.json" --proof "$WORK/forged/proof.json" \
   --epoch "$EPOCH" --agent-id "$AGENT_ID" --rpc "$RPC" --contract "$CONTRACT"
 expect_stderr "is not registered on chain"
+log "...and in run mode, the forgery inside the run fails it (expect FAILURE)"
+all_evidence "$WORK/all"
+expect_verify 1 "$FAILURE" "${RUN[@]}" --bundles "$WORK/all"
+expect_stderr "is not registered on chain"
 
-advance_time() { cast rpc evm_increaseTime 10 --rpc-url "$RPC" >/dev/null && cast rpc evm_mine --rpc-url "$RPC" >/dev/null; }
-
-log "key rotation: an event signed with an old key verifies in an epoch anchored before the revocation (expect SUCCESS)"
+log "key rotation: an event signed with a second key, anchored before that key's revocation"
 OLD_PUB="$(keygen "$WORK/old.key")"
-register_key "$OLD_PUB"
+register_key "$WORK/old.key"
+advance_time
 mkdir -p "$WORK/late"
-LEAF="$("$PYTHON" "$FORGE" resign "$WORK/ev/event.json" "$WORK/late/event.json" --seed "$(seed_of "$WORK/old.key")")"
-advance_time
-EPOCH="$(attacker_anchor "$LEAF" 1)"
-advance_time
-revoke_key "$OLD_PUB"
+"$PYTHON" "$FORGE" resign "$WORK/ev/event.json" "$WORK/late/event.json" --seed "$(seed_of "$WORK/old.key")" >/dev/null
+LATE_EPOCH="$(attacker_anchor --event "$WORK/late/event.json")"
+
+log "an agent session signed with the second key, anchored by the daemon"
+start_daemon
+BEFORE="$(anchored_count)"
+OLD_ACKED="$(VERILOG_SIGNING_KEY_FILE="$WORK/old.key" "$PYTHON" "$ROOT/scripts/e2e_agent.py" --target "$TARGET" --agent-id "$AGENT_ID" --runs 1)" \
+  || fail "old-key agent run failed"
+wait_anchored $(( BEFORE + OLD_ACKED ))
+OLD_BUNDLE="$EVIDENCE/epoch-$(latest_epoch).json"
+OLD_RUN="$("$PYTHON" -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["events"][0]["canonical_event"])["run_id"])' "$OLD_BUNDLE")"
+
+log "revoking the second key (effective in 30 s, then 40 s pass)"
+revoke_key "$OLD_PUB" 30
+advance_time 40
+
+log "replaying the revoked key's events to the daemon: nothing is anchored (seal-time revocation check)"
+EPOCHS_BEFORE="$(latest_epoch)"
+"$PYTHON" "$FORGE" replay --bundle "$OLD_BUNDLE" --target "$TARGET" | tee "$WORK/replay.out"
+sleep 5
+[ "$(latest_epoch)" = "$EPOCHS_BEFORE" ] || fail "events signed with a revoked key were anchored again"
+if ! grep -q "accepted=0" "$WORK/replay.out"; then
+  grep -q "signed with a revoked key left out of the epoch" "$WORK/daemon.log" || fail "accepted replays were not left out at seal time"
+fi
+stop_daemon
+
+log "the event anchored before the revocation still verifies (expect SUCCESS)"
 expect_verify 0 "$SUCCESS" --event "$WORK/late/event.json" --proof "$WORK/late/proof.json" \
-  --epoch "$EPOCH" --agent-id "$AGENT_ID" --rpc "$RPC" --contract "$CONTRACT"
+  --epoch "$LATE_EPOCH" --agent-id "$AGENT_ID" --rpc "$RPC" --contract "$CONTRACT"
 
 log "the same event anchored after the key's revocation (expect FAILURE)"
-advance_time
-EPOCH="$(attacker_anchor "$LEAF" 1)"
+EPOCH="$(attacker_anchor --event "$WORK/late/event.json")"
 expect_verify 1 "$FAILURE" --event "$WORK/late/event.json" --proof "$WORK/late/proof.json" \
   --epoch "$EPOCH" --agent-id "$AGENT_ID" --rpc "$RPC" --contract "$CONTRACT"
 expect_stderr "was not valid when epoch"
+
+log "replay after revocation: a copy of an honest run's step 2 re-anchored by the anchorer (expect SUCCESS with a warning)"
+STEP2="$("$PYTHON" -c '
+import json,sys
+evs = json.load(open(sys.argv[1]))["events"]
+print(next(i for i, e in enumerate(evs) if json.loads(e["canonical_event"])["step_number"] == 2))' "$OLD_BUNDLE")"
+attacker_anchor --from-bundle "$OLD_BUNDLE" --indices "$STEP2" >/dev/null
+all_evidence "$WORK/all"
+expect_verify 0 "$SUCCESS" --run-id "$OLD_RUN" --bundles "$WORK/all" --agent-id "$AGENT_ID" --rpc "$RPC" --contract "$CONTRACT"
+expect_stderr "step 2: a copy anchored in epoch .* was ignored"
 
 log "genuine run with step 2 withheld and anchored after step 3 (expect FAILURE)"
 "$PYTHON" "$ROOT/scripts/e2e_agent.py" --capture "$WORK/captured.jsonl" --agent-id "$AGENT_ID" --runs 1 >/dev/null 2>"$WORK/capture.log" \
@@ -324,18 +446,34 @@ log "genuine run with step 2 withheld and anchored after step 3 (expect FAILURE)
 CAPTURED_RUN="$("$PYTHON" -c 'import json,sys; print(json.loads(open(sys.argv[1]).readline())["run_id"])' "$WORK/captured.jsonl")"
 N="$(wc -l <"$WORK/captured.jsonl" | tr -d ' ')"
 REST="$("$PYTHON" -c 'import sys; print(",".join(str(i) for i in range(int(sys.argv[1])) if i != 1))' "$N")"
-E1="$(next_epoch)"
-read -r ROOT_A COUNT_A < <("$PYTHON" "$FORGE" bundle --events "$WORK/captured.jsonl" --indices "$REST" --agent-id "$AGENT_ID" --epoch "$E1" --out "$WORK/swap/epoch-$E1.json")
-[ "$(attacker_anchor "$ROOT_A" "$COUNT_A")" = "$E1" ] || fail "epoch mismatch"
-E2="$(next_epoch)"
-read -r ROOT_B COUNT_B < <("$PYTHON" "$FORGE" bundle --events "$WORK/captured.jsonl" --indices 1 --agent-id "$AGENT_ID" --epoch "$E2" --out "$WORK/swap/epoch-$E2.json")
-[ "$(attacker_anchor "$ROOT_B" "$COUNT_B")" = "$E2" ] || fail "epoch mismatch"
+LATER="$("$PYTHON" -c 'import sys; print(",".join(str(i) for i in range(1, int(sys.argv[1]))))' "$N")"
+E1="$(attacker_anchor --events "$WORK/captured.jsonl" --indices "$REST")"
+E2="$(attacker_anchor --events "$WORK/captured.jsonl" --indices 1)"
+CAP=(--run-id "$CAPTURED_RUN" --agent-id "$AGENT_ID" --rpc "$RPC" --contract "$CONTRACT")
 # Each event on its own is genuine, signed and included...
-"$VERIFY" export --bundle "$WORK/swap/epoch-$E2.json" --index 0 --out "$WORK/swap-ev" 2>/dev/null
+"$VERIFY" export --bundle "$ATTACK/epoch-$E2.json" --index 0 --out "$WORK/swap-ev" 2>/dev/null
 expect_verify 0 "$SUCCESS" --event "$WORK/swap-ev/event.json" --proof "$WORK/swap-ev/proof.json" \
   --epoch "$E2" --agent-id "$AGENT_ID" --rpc "$RPC" --contract "$CONTRACT"
 # ...but the run shows step 2 anchored after step 3.
-expect_verify 1 "$FAILURE" --run-id "$CAPTURED_RUN" --bundles "$WORK/swap" --agent-id "$AGENT_ID" --rpc "$RPC" --contract "$CONTRACT"
+all_evidence "$WORK/all"
+expect_verify 1 "$FAILURE" "${CAP[@]}" --bundles "$WORK/all"
 expect_stderr "step 2 was anchored in epoch $E2, after its successor step 3"
 
-printf '\nE2E PASSED: %s + %s signed events anchored in 2 epochs; single-event and run mode SUCCESS, FAILURE (tamper, withheld, truncated, forged, revoked key, reordered), key rotation and operational exits verified.\n' "$ACKED" "$ACKED2"
+log "curated re-anchor: steps 2..$N anchored again, only the later copies presented (expect FAILURE)"
+E3="$(attacker_anchor --events "$WORK/captured.jsonl" --indices "$LATER")"
+all_evidence "$WORK/all"
+expect_verify 1 "$FAILURE" "${CAP[@]}" --bundles "$WORK/all"
+expect_stderr "step 2 was anchored in epoch $E2, after its successor step 3"
+all_evidence "$WORK/curated"
+"$PYTHON" "$FORGE" bundle --events "$WORK/captured.jsonl" --indices 0 --agent-id "$AGENT_ID" --epoch "$E1" --out "$WORK/curated/epoch-$E1.json" >/dev/null
+rm "$WORK/curated/epoch-$E2.json"
+expect_verify 1 "$FAILURE" "${CAP[@]}" --bundles "$WORK/curated"
+expect_stderr "evidence is incomplete"
+cp "$ATTACK/epoch-$E2.json" "$WORK/curated/"
+expect_verify 1 "$FAILURE" "${CAP[@]}" --bundles "$WORK/curated"
+expect_stderr "does not match the on-chain anchors"
+
+log "an untouched run still verifies against the complete evidence, attacks included (expect SUCCESS)"
+expect_verify 0 "$SUCCESS" --run-id "$BIG_RUN" --bundles "$WORK/all" --agent-id "$AGENT_ID" --rpc "$RPC" --contract "$CONTRACT"
+
+printf '\nE2E PASSED: %s + %s + %s signed events anchored by the daemon; weak key refused at registration; single-event and run mode SUCCESS, FAILURE (tamper, re-spelled file, withheld, decoy, missing epoch, forged, revoked key, reordered, curated re-anchor), SUCCESS-INCOMPLETE, oversized payload, replay after revocation, key rotation and operational exits verified.\n' "$ACKED" "$ACKED2" "$OLD_ACKED"

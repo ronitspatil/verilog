@@ -6,10 +6,16 @@ anchorer key but not the agent's signing key.
       with another Ed25519 key, writes it to OUT and an empty proof next to it
       (a one-event epoch has root == leaf). Prints the leaf to anchor.
 
-  bundle --events FILE --indices 0,2,3 --agent-id ID --epoch N --out PATH
-      Builds an epoch from the chosen captured events (JSON lines with
-      "canonical_event"), writes an evidence bundle and prints
-      "<merkle root> <event count>" for the caller to anchor with cast.
+  bundle (--events FILE --indices 0,2,3 | --event FILE... | --from-bundle FILE --indices 1)
+         --agent-id ID --epoch N --out PATH
+      Builds an epoch from the chosen events (captured JSON lines with
+      "canonical_event", exported event.json files, or events of a bundle),
+      writes an evidence bundle and prints "<merkle root> <event count>" for
+      the caller to anchor with cast.
+
+  replay --bundle FILE --target HOST:PORT
+      Sends every event of a bundle to a daemon again, byte for byte (what
+      anyone who can reach the ingest port can do). Prints accepted/rejected.
 """
 
 import argparse
@@ -79,8 +85,14 @@ def proof_of(levels, index):
 
 
 def bundle(args) -> int:
-    lines = [json.loads(line) for line in pathlib.Path(args.events).read_text().splitlines() if line.strip()]
-    chosen = [lines[int(i)]["canonical_event"] for i in args.indices.split(",")]
+    if args.event:
+        chosen = [pathlib.Path(f).read_text().rstrip("\n") for f in args.event]
+    elif args.from_bundle:
+        src = json.loads(pathlib.Path(args.from_bundle).read_text())["events"]
+        chosen = [src[int(i)]["canonical_event"] for i in args.indices.split(",")]
+    else:
+        lines = [json.loads(line) for line in pathlib.Path(args.events).read_text().splitlines() if line.strip()]
+        chosen = [lines[int(i)]["canonical_event"] for i in args.indices.split(",")]
     leaves = [leaf_of(c) for c in chosen]
     levels = build_tree(leaves)
     root = levels[-1][0]
@@ -105,6 +117,28 @@ def bundle(args) -> int:
     return 0
 
 
+def replay(args) -> int:
+    import grpc
+    from google.protobuf.timestamp_pb2 import Timestamp
+    from verilog_sdk._proto import verilog_pb2, verilog_pb2_grpc
+
+    msgs = []
+    for i, e in enumerate(json.loads(pathlib.Path(args.bundle).read_text())["events"]):
+        ev = json.loads(e["canonical_event"])
+        ts = Timestamp()
+        ts.FromNanoseconds(_ns(ev["timestamp_utc"]))
+        msgs.append(verilog_pb2.LogEvent(
+            agent_id=ev["agent_id"], run_id=ev["run_id"], step_number=ev["step_number"],
+            prev_hash=bytes.fromhex(ev["prev_hash"][2:]), event_type=ev["event_type"],
+            payload_json=canonical_json(ev["payload"]), timestamp_utc=ts,
+            key_id=bytes.fromhex(ev["key_id"][2:]), signature=bytes.fromhex(ev["sig"][2:]), sequence=i + 1))
+    with grpc.insecure_channel(args.target) as ch:
+        acks = list(verilog_pb2_grpc.VeriLogStub(ch).IngestStream(iter(msgs), timeout=30))
+    accepted = sum(a.accepted for a in acks)
+    print(f"accepted={accepted} rejected={len(acks) - accepted}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -114,13 +148,18 @@ def main() -> int:
     r.add_argument("--seed", required=True)
     r.add_argument("--payload")
     b = sub.add_parser("bundle")
-    b.add_argument("--events", required=True)
-    b.add_argument("--indices", required=True)
+    b.add_argument("--events")
+    b.add_argument("--event", action="append")
+    b.add_argument("--from-bundle")
+    b.add_argument("--indices")
     b.add_argument("--agent-id", required=True)
     b.add_argument("--epoch", type=int, required=True)
     b.add_argument("--out", required=True)
+    p = sub.add_parser("replay")
+    p.add_argument("--bundle", required=True)
+    p.add_argument("--target", required=True)
     args = ap.parse_args()
-    return resign(args) if args.cmd == "resign" else bundle(args)
+    return {"resign": resign, "bundle": bundle, "replay": replay}[args.cmd](args)
 
 
 if __name__ == "__main__":

@@ -51,7 +51,7 @@ type harness struct {
 
 func start(t *testing.T, dir string, cfg Config) *harness {
 	t.Helper()
-	w, recs, err := wal.Open(dir+"/wal", 1<<20, nil)
+	w, err := wal.Open(dir+"/wal", 1<<20, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +64,7 @@ func start(t *testing.T, dir string, cfg Config) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := eng.Recover(recs); err != nil {
+	if err := eng.Recover(); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -356,7 +356,7 @@ func TestSubmitAfterClose(t *testing.T) {
 
 func BenchmarkSubmitParallel(b *testing.B) {
 	dir := b.TempDir()
-	w, _, _ := wal.Open(dir+"/wal", 64<<20, nil)
+	w, _ := wal.Open(dir+"/wal", 64<<20, nil)
 	st, _ := store.Open(dir)
 	eng, _ := New(Config{EpochInterval: time.Hour, EpochMaxLogs: 1 << 24}, w, st, &jobSink{}, nil)
 	ctx, cancel := context.WithCancel(context.Background())

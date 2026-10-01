@@ -165,7 +165,7 @@ class VeriLogClient:
         # Chain state, owned by whichever request iterator holds _chain_lock.
         self._chain_lock = threading.Lock()
         self._chains: Dict[RunKey, _Chain] = {}
-        self._ended: "collections.OrderedDict[RunKey, None]" = collections.OrderedDict()
+        self._ended: "collections.OrderedDict[RunKey, None]" = collections.OrderedDict()  # guarded by _cond
 
         self._thread = threading.Thread(target=self._run, name="verilog-sdk-sender", daemon=True)
         self._thread.start()
@@ -388,7 +388,9 @@ class VeriLogClient:
     def _chain(self, item: _Item) -> bool:
         """Assign step, prev_hash and signature (caller holds _chain_lock)."""
         run: RunKey = (item.agent_id, item.run_id)
-        if run in self._ended:
+        with self._cond:
+            ended = run in self._ended
+        if ended:
             log.warning("verilog_sdk: dropping %s event for run %s after its run_end", item.event_type, item.run_id)
             with self._cond:
                 self._stats.dropped += 1
@@ -424,9 +426,10 @@ class VeriLogClient:
         chain.prev_hash, chain.next_step = digest, chain.next_step + 1
         if item.event_type == EVENT_RUN_END:
             del self._chains[run]
-            self._ended[run] = None
-            while len(self._ended) > _ENDED_RUNS_MEMORY:
-                self._ended.popitem(last=False)
+            with self._cond:  # _ended is also read by submit()
+                self._ended[run] = None
+                while len(self._ended) > _ENDED_RUNS_MEMORY:
+                    self._ended.popitem(last=False)
         return True
 
     def _to_proto(self, item: _Item) -> verilog_pb2.LogEvent:

@@ -451,7 +451,24 @@ func TestReorgKeepsNonceOrderWhilePipelining(t *testing.T) {
 	if st, _ := final(t, c, testReq); st != Pending { // resends the first anchor
 		t.Fatalf("%v", st)
 	}
+	dbg := func(at string) {
+		ctx := context.Background()
+		p, _ := env.client.PendingNonceAt(ctx, env.addr)
+		m, _ := env.client.NonceAt(ctx, env.addr, nil)
+		h, _ := env.client.HeaderByNumber(ctx, nil)
+		var serr error
+		for _, mt := range c.mined {
+			if mt.tx != nil {
+				serr = env.client.SendTransaction(ctx, mt.tx)
+			}
+		}
+		t.Logf("DEBUG %s: pending=%d mined=%d head=%d resend=%v nmined=%d", at, p, m, h.Number, serr, len(c.mined))
+	}
+	dbg("after final")
 	waitPending(t, env, c, testReq)
+	dbg("after waitPending")
+	time.Sleep(time.Second)
+	dbg("after 1s")
 	c.opts.ConfirmTimeout = 30 * time.Second
 	res2 := anchorMined(t, env, c, req2)
 	env.sim.Commit()

@@ -14,6 +14,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/ronitspatil/verilog/daemon/internal/canonical"
 	"github.com/ronitspatil/verilog/daemon/internal/registry"
@@ -88,14 +89,30 @@ func (c *ChainSource) AgentKey(ctx context.Context, agentKey, keyID canonical.Di
 // (a new registration is seen quickly, while a flood of events signed with an
 // unknown key does not turn into a flood of RPC calls); revoked keys are final
 // (revokedAt cannot change once set).
+//
+// The cache is a bounded LRU, so lookups of junk key ids evict only the least
+// recently used entries, never the whole cache. Concurrent lookups of the same
+// (agent, key_id) share one RPC. Lookups that find no key are rate-limited per
+// agent: beyond NegativeBurst, further uncached lookups of that agent are
+// answered "not registered" (which the daemon rejects as retryable) without an
+// RPC until the agent's budget refills at NegativeRate per second.
 type Cache struct {
 	src         Source
 	ttl         time.Duration
 	negativeTTL time.Duration
 	now         func() time.Time
 
+	// MaxEntries bounds the cached keys; NegativeRate and NegativeBurst bound
+	// lookups per agent that find no key. Set before first use.
+	MaxEntries    int
+	NegativeRate  float64
+	NegativeBurst float64
+
+	flight singleflight.Group
+
 	mu      sync.Mutex
-	entries map[[64]byte]cacheEntry
+	entries *lru[[64]byte, cacheEntry]
+	budgets *lru[canonical.Digest, *bucket]
 }
 
 type cacheEntry struct {
@@ -103,12 +120,20 @@ type cacheEntry struct {
 	expires time.Time // zero: never
 }
 
-// maxEntries bounds the cache; it is cleared when full.
-const maxEntries = 1 << 16
+// Defaults for Cache limits.
+const (
+	DefaultMaxEntries    = 1 << 16
+	DefaultNegativeRate  = 1.0 // per second, per agent
+	DefaultNegativeBurst = 20
+	maxBudgets           = 1 << 14
+)
 
 // NewCache wraps src. ttl applies to registered keys, negativeTTL to unknown ones.
 func NewCache(src Source, ttl, negativeTTL time.Duration) *Cache {
-	return &Cache{src: src, ttl: ttl, negativeTTL: negativeTTL, now: time.Now, entries: map[[64]byte]cacheEntry{}}
+	return &Cache{
+		src: src, ttl: ttl, negativeTTL: negativeTTL, now: time.Now,
+		MaxEntries: DefaultMaxEntries, NegativeRate: DefaultNegativeRate, NegativeBurst: DefaultNegativeBurst,
+	}
 }
 
 // AgentKey implements Source.
@@ -118,15 +143,30 @@ func (c *Cache) AgentKey(ctx context.Context, agentKey, keyID canonical.Digest) 
 	copy(id[32:], keyID[:])
 	now := c.now()
 	c.mu.Lock()
-	e, ok := c.entries[id]
-	c.mu.Unlock()
+	c.init()
+	e, ok := c.entries.get(id)
 	if ok && (e.expires.IsZero() || now.Before(e.expires)) {
+		c.mu.Unlock()
 		return e.key, nil
 	}
-	k, err := c.src.AgentKey(ctx, agentKey, keyID)
+	limited := !c.budget(agentKey, now).available(now)
+	c.mu.Unlock()
+	if limited {
+		// This agent keeps asking for keys that do not exist: answer
+		// "not registered" without an RPC until its budget refills.
+		return Key{}, nil
+	}
+
+	v, err, _ := c.flight.Do(string(id[:]), func() (any, error) {
+		// The caller's context must not cancel the lookup shared by others.
+		lctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		return c.src.AgentKey(lctx, agentKey, keyID)
+	})
 	if err != nil {
 		return Key{}, err
 	}
+	k := v.(Key)
 	e = cacheEntry{key: k}
 	switch {
 	case !k.Registered():
@@ -135,13 +175,48 @@ func (c *Cache) AgentKey(ctx context.Context, agentKey, keyID canonical.Digest) 
 		e.expires = now.Add(c.ttl)
 	}
 	c.mu.Lock()
-	if len(c.entries) >= maxEntries {
-		clear(c.entries)
+	if !k.Registered() {
+		c.budget(agentKey, now).take(now)
 	}
-	c.entries[id] = e
+	c.entries.put(id, e)
 	c.mu.Unlock()
 	return k, nil
 }
+
+// init sets up the LRUs (caller holds mu).
+func (c *Cache) init() {
+	if c.entries == nil {
+		c.entries = newLRU[[64]byte, cacheEntry](max(c.MaxEntries, 1))
+		c.budgets = newLRU[canonical.Digest, *bucket](maxBudgets)
+	}
+}
+
+// budget returns the agent's negative-lookup bucket (caller holds mu).
+func (c *Cache) budget(agentKey canonical.Digest, now time.Time) *bucket {
+	b, ok := c.budgets.get(agentKey)
+	if !ok {
+		b = &bucket{rate: c.NegativeRate, burst: c.NegativeBurst, tokens: c.NegativeBurst, last: now}
+		c.budgets.put(agentKey, b)
+	}
+	return b
+}
+
+// bucket is a token bucket.
+type bucket struct {
+	rate, burst, tokens float64
+	last                time.Time
+}
+
+func (b *bucket) refill(now time.Time) {
+	if dt := now.Sub(b.last).Seconds(); dt > 0 {
+		b.tokens = min(b.burst, b.tokens+dt*b.rate)
+	}
+	b.last = now
+}
+
+func (b *bucket) available(now time.Time) bool { b.refill(now); return b.tokens >= 1 }
+
+func (b *bucket) take(now time.Time) { b.refill(now); b.tokens = max(0, b.tokens-1) }
 
 // RevocationCheck answers engine.KeyChecker from a Source (it should be
 // uncached, so a revocation is seen as soon as it is on chain) and a clock.

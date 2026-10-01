@@ -6,7 +6,9 @@ key must therefore live with the agent and never on the daemon host.
 
 The key is a 32-byte Ed25519 seed, stored hex-encoded. It is loaded from the
 file named by ``VERILOG_SIGNING_KEY_FILE`` (preferred) or from the hex value
-in ``VERILOG_SIGNING_KEY``. Its public key is registered on chain by the key
+in ``VERILOG_SIGNING_KEY`` (which logs a warning). A key file readable by
+group or others is refused unless ``insecure_key_file_perms=True`` or
+``VERILOG_INSECURE_KEY_FILE_PERMS=1`` (development only). Its public key is registered on chain by the key
 admin (``VeriLogRegistry.registerAgentKey``) under the agent's id; events
 carry ``key_id = keccak256(public_key)``.
 """
@@ -23,13 +25,15 @@ from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption,
 
 from ._keccak import keccak256
 
-__all__ = ["Signer", "ENV_KEY_FILE", "ENV_KEY", "POP_DOMAIN", "keccak256", "write_key_file"]
+__all__ = ["Signer", "ENV_KEY_FILE", "ENV_KEY", "ENV_INSECURE_PERMS", "POP_DOMAIN", "keccak256", "write_key_file"]
 
 #: Prefix of the proof-of-possession message (see Signer.proof_of_possession).
 POP_DOMAIN = b"VeriLog/pop/v1\n"
 
 ENV_KEY_FILE = "VERILOG_SIGNING_KEY_FILE"
 ENV_KEY = "VERILOG_SIGNING_KEY"
+#: Development escape hatch: accept a key file readable by group or others.
+ENV_INSECURE_PERMS = "VERILOG_INSECURE_KEY_FILE_PERMS"
 
 log = logging.getLogger("verilog_sdk")
 
@@ -87,10 +91,19 @@ class Signer:
         return cls(_parse_seed(text))
 
     @classmethod
-    def from_file(cls, path: str) -> "Signer":
+    def from_file(cls, path: str, *, insecure_key_file_perms: bool = False) -> "Signer":
+        """Load the key file. A file readable by group or others raises
+        PermissionError unless ``insecure_key_file_perms`` (development only)."""
         st = os.stat(path)
-        if st.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
-            log.warning("verilog_sdk: signing key file %s is readable by group or others; chmod 600 recommended", path)
+        mode = stat.S_IMODE(st.st_mode)
+        if mode & (stat.S_IRWXG | stat.S_IRWXO) and os.name != "nt":
+            if not insecure_key_file_perms:
+                raise PermissionError(
+                    f"signing key file {path} has mode {mode:#o} and is readable by group or others; "
+                    f"run chmod 600 on it (or set {ENV_INSECURE_PERMS}=1 for development only)"
+                )
+            log.warning("verilog_sdk: signing key file %s has mode %#o (readable by group or others); "
+                        "accepted because insecure key file permissions were allowed", path, mode)
         with open(path, "r", encoding="ascii") as f:
             return cls(_parse_seed(f.read()))
 
@@ -99,9 +112,12 @@ class Signer:
         """Load from VERILOG_SIGNING_KEY_FILE, else VERILOG_SIGNING_KEY."""
         path = getenv(ENV_KEY_FILE)
         if path:
-            return cls.from_file(path)
+            insecure = (getenv(ENV_INSECURE_PERMS) or "").strip().lower() in ("1", "true", "yes")
+            return cls.from_file(path, insecure_key_file_perms=insecure)
         value = getenv(ENV_KEY)
         if value:
+            log.warning("verilog_sdk: signing key read from the %s environment variable; prefer %s (mode 0600)",
+                        ENV_KEY, ENV_KEY_FILE)
             return cls.from_hex(value)
         raise ValueError(f"no signing key: set {ENV_KEY_FILE} (preferred) or {ENV_KEY}, or pass signer=")
 

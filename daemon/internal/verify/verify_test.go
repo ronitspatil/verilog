@@ -40,6 +40,16 @@ type chainEnv struct {
 	reg      *registry.VeriLogRegistry
 	admin    *bind.TransactOpts
 	anchorer *bind.TransactOpts
+	// epochs records the events of every anchored epoch, in leaf order: the
+	// complete evidence of agentID.
+	epochs map[uint64][][]byte
+}
+
+// Evidence is one event with its inclusion proof (single-event mode input).
+type Evidence struct {
+	EpochID   uint64
+	EventJSON []byte
+	Proof     []merkle.Hash
 }
 
 func newChainEnv(t *testing.T) *chainEnv {
@@ -60,7 +70,7 @@ func newChainEnv(t *testing.T) *chainEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e := &chainEnv{t: t, sim: sim, client: client, contract: addr, reg: reg, admin: admin, anchorer: anchorer}
+	e := &chainEnv{t: t, sim: sim, client: client, contract: addr, reg: reg, admin: admin, anchorer: anchorer, epochs: map[uint64][][]byte{}}
 	e.commit()
 	e.register(agentPriv)
 	return e
@@ -81,11 +91,39 @@ func (e *chainEnv) register(priv ed25519.PrivateKey) {
 	e.commit()
 }
 
-func (e *chainEnv) revoke(priv ed25519.PrivateKey) {
-	if _, err := e.reg.RevokeAgentKey(e.admin, canonical.AgentKey(agentID), canonical.KeyID(priv.Public().(ed25519.PublicKey))); err != nil {
+// revoke revokes priv's key, effective in the block that records it.
+func (e *chainEnv) revoke(priv ed25519.PrivateKey) { e.revokeAfter(priv, 0) }
+
+// revokeAfter schedules the revocation of priv's key delay seconds after the
+// block that records it.
+func (e *chainEnv) revokeAfter(priv ed25519.PrivateKey, delay uint64) {
+	e.t.Helper()
+	if _, err := e.reg.RevokeAgentKey(e.admin, canonical.AgentKey(agentID), canonical.KeyID(priv.Public().(ed25519.PublicKey)), e.nextBlockTime()+delay); err != nil {
 		e.t.Fatal(err)
 	}
 	e.commit()
+}
+
+// nextBlockTime is the timestamp of the block that includes a transaction
+// sent now (the simulated chain mines it one second after the head).
+func (e *chainEnv) nextBlockTime() uint64 {
+	h, err := e.client.HeaderByNumber(context.Background(), nil)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	return h.Time + 1
+}
+
+// all returns the complete evidence: every anchored epoch's events.
+func (e *chainEnv) all() []EpochEvidence {
+	var out []EpochEvidence
+	for ep := uint64(1); ; ep++ {
+		evs, ok := e.epochs[ep]
+		if !ok {
+			return out
+		}
+		out = append(out, EpochEvidence{Source: fmt.Sprintf("epoch-%d", ep), EpochID: ep, Events: evs})
+	}
 }
 
 // anchor anchors the events as the next epoch (as the daemon would, or as an
@@ -106,6 +144,7 @@ func (e *chainEnv) anchor(events ...[]byte) []Evidence {
 	}
 	e.commit()
 	epoch, _ := e.reg.LatestEpoch(&bind.CallOpts{}, agent)
+	e.epochs[epoch.Uint64()] = append([][]byte(nil), events...)
 	out := make([]Evidence, len(events))
 	for i, ev := range events {
 		p, _ := tree.Proof(i)
@@ -167,11 +206,23 @@ func TestVerifySuccess(t *testing.T) {
 			t.Fatalf("event %d: %+v", i, rep)
 		}
 	}
-	// Raw bytes32 agent key and a reformatted (non-canonical) event file also verify.
-	in := Input{EventJSON: []byte(strings.Replace(string(evs[1].EventJSON), ",", ",\n  ", -1)), Proof: evs[1].Proof,
+	// Raw bytes32 agent key, and the exported file form (one trailing newline).
+	in := Input{EventJSON: append(append([]byte(nil), evs[1].EventJSON...), '\n'), Proof: evs[1].Proof,
 		EpochID: evs[1].EpochID, AgentID: canonical.AgentKey(agentID).Hex(), Contract: e.contract}
 	if rep, err := Verify(context.Background(), e.client, in); err != nil || !rep.Verified {
-		t.Fatalf("raw key / reformatted: %+v %v", rep, err)
+		t.Fatalf("raw key / trailing newline: %+v %v", rep, err)
+	}
+	// Any other spelling of the same event is refused, with the signed bytes shown.
+	for name, doc := range map[string]string{
+		"reformatted":    strings.Replace(string(evs[1].EventJSON), ",", ",\n  ", -1),
+		"two newlines":   string(evs[1].EventJSON) + "\n\n",
+		"escaped letter": strings.Replace(string(evs[1].EventJSON), "hello", `\u0068ello`, 1),
+	} {
+		in.EventJSON = []byte(doc)
+		rep, err := Verify(context.Background(), e.client, in)
+		if err != nil || rep.Verified || !strings.Contains(rep.Reason, "not in canonical form") || !bytes.Equal(rep.Canonical, evs[1].EventJSON) {
+			t.Fatalf("%s: %+v %v", name, rep, err)
+		}
 	}
 }
 
@@ -299,19 +350,26 @@ func TestVerifyKeyValidityUsesAnchorTime(t *testing.T) {
 	}
 }
 
+// Evidence that names an epoch the chain does not have is false evidence: a
+// FAILURE, never "no verdict".
+func TestVerifyUnanchoredEpochIsFailure(t *testing.T) {
+	e := newChainEnv(t)
+	ev := e.anchor(signedRun(t, "run-v", 1, false)...)[0]
+	in := Input{EventJSON: ev.EventJSON, Proof: ev.Proof, EpochID: 2, AgentID: agentID, Contract: e.contract}
+	if rep, err := Verify(context.Background(), e.client, in); err != nil || rep.Verified || !strings.Contains(rep.Reason, "epoch 2 is not anchored") {
+		t.Fatalf("unanchored epoch: %+v %v", rep, err)
+	}
+	in.EpochID, in.AgentID = 1, "agent-unknown"
+	if rep, err := Verify(context.Background(), e.client, in); err != nil || rep.Verified || !strings.Contains(rep.Reason, "not anchored") {
+		t.Fatalf("unknown agent: %+v %v", rep, err)
+	}
+}
+
 func TestVerifyOperationalErrors(t *testing.T) {
 	e := newChainEnv(t)
 	ev := e.anchor(signedRun(t, "run-v", 1, false)...)[0]
 	var oe *OperationalError
-	in := Input{EventJSON: ev.EventJSON, Proof: ev.Proof, EpochID: 2, AgentID: agentID, Contract: e.contract}
-	if _, err := Verify(context.Background(), e.client, in); !errors.As(err, &oe) || !strings.Contains(err.Error(), "not anchored") {
-		t.Fatalf("unanchored epoch: %v", err)
-	}
-	in.EpochID, in.AgentID = 1, "agent-unknown"
-	if _, err := Verify(context.Background(), e.client, in); !errors.As(err, &oe) {
-		t.Fatalf("unknown agent: %v", err)
-	}
-	in.AgentID, in.Contract = agentID, common.HexToAddress("0x1234")
+	in := Input{EventJSON: ev.EventJSON, Proof: ev.Proof, EpochID: 1, AgentID: agentID, Contract: common.HexToAddress("0x1234")}
 	if _, err := Verify(context.Background(), e.client, in); !errors.As(err, &oe) {
 		t.Fatalf("no contract: %v", err)
 	}

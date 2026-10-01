@@ -17,13 +17,15 @@ handler.close()  # end open runs, flush and stop the background sender
 
 Every event is signed in the agent process with the agent's Ed25519 key, so
 the daemon host cannot forge or rearrange events. Generate a key on the agent
-host and give the printed public key to the key admin, who registers it on
-chain:
+host and give the printed public key and proof of possession to the key
+admin, who checks them with `verilog-verify keycheck` and registers the key
+on chain:
 
 ```sh
 python -m verilog_sdk keygen --out /etc/verilog/support-bot.key --agent-id support-bot
-# key file: ... (mode 0600)   pubkey: 0x...   key_id: 0x...
-# register (as KEY_ADMIN_ROLE):
+# key file: ... (mode 0600)   pubkey: 0x...   key_id: 0x...   pop: 0x...
+# the key admin checks, then registers (as KEY_ADMIN_ROLE):
+#   verilog-verify keycheck --agent-id support-bot --pubkey 0x... --pop 0x...
 #   cast send <REGISTRY> 'registerAgentKey(bytes32,bytes32)' <agentId> <pubkey> ...
 export VERILOG_SIGNING_KEY_FILE=/etc/verilog/support-bot.key
 ```
@@ -32,7 +34,8 @@ The SDK loads the seed from `VERILOG_SIGNING_KEY_FILE` (preferred) or the hex
 value in `VERILOG_SIGNING_KEY`, or you pass `signer=Signer.from_file(...)`. The
 seed is never logged. Keep it on the agent host only: never on the daemon host
 and never in credentials the daemon can read. Rotation: generate a new key,
-have it registered, restart the agent with it, then have the old key revoked.
+have it registered, restart the agent with it, then have the old key revoked
+once its last events are anchored (see "Rotation" in the main README).
 
 - Hooks: `on_llm_start`, `on_chat_model_start`, `on_llm_end`, `on_llm_error`,
   `on_tool_start`, `on_tool_end`, `on_tool_error`, `on_chain_start`,
@@ -45,6 +48,24 @@ have it registered, restart the agent with it, then have the old key revoked.
   `OverflowPolicy.BLOCK` (waits up to `block_timeout`, then drops the new
   event). Drops are counted in `client.stats()`.
 - SDK errors are logged on the `verilog_sdk` logger and never raised.
+- Oversized payloads: a payload whose canonical JSON exceeds
+  `max_payload_bytes` (default 1 MiB, the daemon's default limit) is replaced
+  before signing by `{"bytes": n, "sha256": "0x...", "truncated": true}`, the
+  size and SHA-256 of the original canonical JSON. Pass
+  `on_oversize=callable(agent_id, run_id, event_type, sha256, payload_json)`
+  to keep the original elsewhere. Counted in `stats().truncated`.
+- Rejections: events the daemon rejects as retryable ("key not registered",
+  e.g. right after registration) are re-sent with backoff for up to
+  `key_wait_timeout` seconds (default 60), in order. Any other rejection of a
+  chained event leaves a gap in its run: it is logged at ERROR and counted in
+  `stats().chain_gaps`; alert on it.
+- Late events: an event submitted after its run's `run_end` is recorded as
+  its own run `<run_id>#late-<n>` closed by `run_end`
+  `{"status": "late", "late_for_run": <run_id>}` (`stats().late_events`).
+  At most `max_open_runs` (default 10,000) runs stay open; beyond that the
+  least recently used one is closed with `run_end` status `"evicted"`.
+- Timestamps passed to `submit` must lie in 1970..9999; others are reported as
+  a dropped event.
 - Each root run (`parent_run_id is None`) is a hash chain. The background
   thread assigns `step_number` (from 1) and `prev_hash` (the previous event's
   content digest) after dequeue, then signs. Overflow drops therefore never

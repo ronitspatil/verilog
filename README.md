@@ -8,8 +8,9 @@ the agent's Ed25519 key and hash-chained to the previous event of its run. A
 daemon commits events into per-agent Merkle trees and periodically anchors
 each root on an EVM chain. With an event, its inclusion proof and an RPC
 endpoint, anyone can later prove the agent produced exactly that event, that
-it has not been edited, and (in run mode) that no event of the run was
-dropped, inserted or reordered, even if the daemon host was compromised.
+it has not been edited, and (in run mode, given the evidence of every epoch
+anchored for the agent) that no event of the run was dropped, inserted or
+anchored out of order, even if the daemon host was compromised.
 
 ```
  LangChain / LangGraph agent
@@ -31,18 +32,22 @@ dropped, inserted or reordered, even if the daemon host was compromised.
 
 ## What it guarantees
 
-- **Signed at the source.** Events are signed in the agent process; the
-  daemon cannot forge or alter them.
-- **Complete runs.** Run-mode verification proves a run is complete from step
-  1 to `run_end`, in order, with nothing inserted, removed or replayed.
+- **Signed at the source.** Events are signed in the agent process with a
+  registered, checked key; the daemon cannot forge or alter them.
+- **Complete runs.** Given a bundle for every epoch anchored for the agent,
+  run mode proves a run is complete from step 1 to `run_end`, with no event
+  removed, no event of another run or another branch inserted, and no event
+  first anchored in a later epoch than its successor. Order is checked per
+  epoch, not within one.
 - **Tamper-evident once anchored.** Changing any byte of an anchored event or
   its proof fails verification, locally and through the contract.
 - **Durable acks.** An event is acknowledged only after its WAL record is
   fsynced.
 
-It does **not** detect suppression of a whole run, cannot tell a truncated
-run from a crashed agent, and cannot protect against a stolen agent key or
-agents that share a host with the daemon. See [docs/security.md](docs/security.md)
+It does **not** detect suppression or delay of a whole run, cannot tell a
+truncated run from a crashed agent, keeps only the hash of an oversized
+payload, and cannot protect against a stolen agent key or agents that share
+a host with the daemon. See [docs/security.md](docs/security.md)
 for the threat model and the full list of limits.
 
 ## Quickstart
@@ -67,7 +72,8 @@ management, the production multisig hand-off and all daemon flags):
 cd contracts && VERILOG_ANCHORER=0xDaemonAddress forge script script/Deploy.s.sol \
     --rpc-url "$RPC" --private-key "$DEPLOYER_KEY" --broadcast && cd ..
 
-# 2. On the agent host: create the agent's signing key; the key admin registers the printed pubkey.
+# 2. On the agent host: create the agent's signing key. The key admin runs the printed
+#    `verilog-verify keycheck` (proof of possession), then registers the pubkey.
 python -m verilog_sdk keygen --out /etc/verilog/support-bot.key --agent-id support-bot
 
 # 3. Start the daemon (its signer needs ANCHORER_ROLE).
@@ -90,13 +96,16 @@ bin/verilog-verify export --bundle /var/lib/verilog/evidence/<agentKey>/epoch-3.
 bin/verilog-verify --event case-42/event.json --proof case-42/proof.json \
     --epoch 3 --agent-id support-bot --rpc "$RPC" --contract 0xRegistry
 
-# ...or a whole run from a copy of the evidence bundles.
+# ...or a whole run from a copy of all the agent's evidence bundles.
 bin/verilog-verify --run-id <run_id> --bundles ./evidence/<agentKey> \
     --agent-id support-bot --rpc "$RPC" --contract 0xRegistry
 ```
 
 `verilog-verify` prints one verdict line and exits `0` (verified), `1`
-(tampered) or `2` (no verdict, e.g. bad arguments or RPC failure).
+(tampered, including any defect in the evidence), `3` (run mode with
+`--allow-incomplete`: verified but no `run_end`) or `2` (no verdict: bad
+arguments, unreadable files or RPC failure). See
+[docs/operations.md](docs/operations.md#verifying-logs).
 
 ## Deployment requirement
 

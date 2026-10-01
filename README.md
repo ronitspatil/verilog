@@ -1,5 +1,7 @@
 # VeriLog
 
+[![CI](https://github.com/ronitspatil/verilog/actions/workflows/ci.yml/badge.svg)](https://github.com/ronitspatil/verilog/actions/workflows/ci.yml)
+
 Tamper-evident audit logging for autonomous AI agents.
 
 VeriLog records an agent's execution trace (prompts, tool calls, state

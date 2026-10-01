@@ -7,7 +7,7 @@ internals see [design.md](design.md); for the threat model see
 ## Build and test
 
 Toolchain (as used on macOS, Apple Silicon): Go 1.27, Foundry (`forge`,
-`anvil`, `cast`), `protoc` 3.x, Python 3.12 and `jq`.
+`anvil`, `cast`; CI uses v1.7.1), `protoc` 3.20.3, Python 3.12 and `jq`.
 
 ```sh
 brew install go                                            # Go toolchain
@@ -16,8 +16,8 @@ curl -L https://foundry.paradigm.xyz | bash && foundryup   # Foundry, if not ins
 git clone --recurse-submodules git@github.com:ronitspatil/verilog.git
 cd verilog                    # existing clone: git submodule update --init --recursive
 
-make tools                    # protoc-gen-go, protoc-gen-go-grpc, abigen
-make venv PYTHON=python3.12   # sdk/python/.venv with the SDK installed editable
+make tools                    # pinned protoc-gen-go, protoc-gen-go-grpc, abigen
+make venv PYTHON=python3.12   # sdk/python/.venv from the hashed lock, SDK editable
 make build                    # bin/verilogd, bin/verilog-verify
 make test                     # go vet + go test -race, forge test, pytest
 make e2e                      # anvil → deploy → daemon (mTLS) → SDK → anchor → verify
@@ -36,6 +36,30 @@ hash scheme: `make proto`, `make bindings`, `make vectors`. If you change
 canonicalization or hashing, run `make vectors` and commit the updated
 `testdata/`. The Go vectors test fails until you do; Foundry and pytest pick
 up the new vectors.
+
+Python dependencies are locked with hashes in
+`sdk/python/requirements-dev.txt`; after changing `pyproject.toml`, run
+`make lock` (needs `uv`) and commit the result. The contract libraries are
+git submodules pinned to release tags: OpenZeppelin Contracts v5.6.1 and
+forge-std v1.17.0.
+
+## CI
+
+GitHub Actions (`.github/workflows/ci.yml`) runs on every pull request and
+on pushes to `main`, as parallel jobs:
+
+- **go**: `gofmt -l`, `go build`, `go vet`, `go test -race -count=1`, `govulncheck`.
+- **contracts**: `forge build`, `forge test`.
+- **python**: venv from the lock (`--require-hashes`), `pytest`, `pip-audit` on the lock.
+- **reproducible**: `make tools proto bindings vectors`, then `git diff --exit-code`,
+  so committed stubs, bindings (including the bytecode the Go tests deploy)
+  and vectors must match their sources. Uses protoc 3.20.3 and Foundry v1.7.1.
+- **e2e**: `make e2e` against anvil; logs are uploaded as an artifact on failure.
+
+Reproduce locally with the same commands: the Go and contract steps above,
+`make venv test-python`, `make tools proto bindings vectors && git diff
+--exit-code`, and `make e2e`. Actions are pinned to commit SHAs; Dependabot
+proposes weekly grouped updates for actions, Go modules, pip and submodules.
 
 ## Deployment requirements
 

@@ -1,7 +1,9 @@
 package config
 
 import (
+	"bytes"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -72,5 +74,88 @@ func TestLoadKey(t *testing.T) {
 	}
 	if _, err := c.LoadKey(envOf(nil), nil); err == nil {
 		t.Fatal("expected missing key error")
+	}
+}
+
+func TestLoadKeyFilePermissions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "key")
+	os.WriteFile(path, []byte(strings.TrimPrefix(devKey, "0x")), 0o600)
+	os.Chmod(path, 0o644)
+	c := &Config{PrivateKeyFile: path}
+	_, err := c.LoadKey(envOf(nil), nil)
+	if err == nil || !strings.Contains(err.Error(), "chmod 600") || !strings.Contains(err.Error(), "--insecure-key-file-perms") {
+		t.Fatalf("group/world-readable key file: err = %v", err)
+	}
+	var logs bytes.Buffer
+	c.InsecureKeyFilePerms = true
+	if _, err := c.LoadKey(envOf(nil), slog.New(slog.NewTextHandler(&logs, nil))); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(logs.String(), "level=WARN") || !strings.Contains(logs.String(), "insecure-key-file-perms") {
+		t.Fatalf("no warning: %s", logs.String())
+	}
+	os.Chmod(path, 0o640)
+	c.InsecureKeyFilePerms = false
+	if _, err := c.LoadKey(envOf(nil), nil); err == nil {
+		t.Fatal("accepted a group-readable key file")
+	}
+	os.Chmod(path, 0o400)
+	if _, err := c.LoadKey(envOf(nil), nil); err != nil {
+		t.Fatalf("0400 must be accepted: %v", err)
+	}
+}
+
+func TestLoadKeyFromEnvWarns(t *testing.T) {
+	var logs bytes.Buffer
+	c := &Config{}
+	if _, err := c.LoadKey(envOf(map[string]string{EnvPrivateKey: devKey}), slog.New(slog.NewTextHandler(&logs, nil))); err != nil {
+		t.Fatal(err)
+	}
+	out := logs.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "--private-key-file") || !strings.Contains(out, "aws-kms") {
+		t.Fatalf("no warning: %s", out)
+	}
+	if strings.Contains(out, strings.TrimPrefix(devKey, "0x")) {
+		t.Fatal("warning leaks the key")
+	}
+}
+
+func TestLoadSignerAndFees(t *testing.T) {
+	base := []string{"--rpc", "http://x", "--contract", "0x5FbDB2315678afecb367f032d93F642f64180aa3"}
+	load := func(extra ...string) (*Config, error) {
+		return Load(append(append([]string{}, base...), extra...), envOf(nil), io.Discard)
+	}
+	c, err := load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Signer != SignerLocal || c.MaxFeeCap.String() != "500000000000" || c.MaxTipCap.String() != "50000000000" {
+		t.Fatalf("defaults: signer %q fee %s tip %s", c.Signer, c.MaxFeeCap, c.MaxTipCap)
+	}
+	c, err = load("--signer", "aws-kms", "--kms-key-id", "alias/verilog-anchorer", "--max-fee-gwei", "0.5", "--max-priority-fee-gwei", "0.001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.KMSKeyID != "alias/verilog-anchorer" || c.MaxFeeCap.String() != "500000000" || c.MaxTipCap.String() != "1000000" {
+		t.Fatalf("config %+v", c)
+	}
+	c, err = Load(base, envOf(map[string]string{"VERILOG_SIGNER": "aws-kms", "VERILOG_KMS_KEY_ID": "arn:aws:kms:us-east-1:111122223333:key/x"}), io.Discard)
+	if err != nil || c.Signer != SignerAWSKMS {
+		t.Fatalf("env: %+v %v", c, err)
+	}
+	for _, extra := range [][]string{
+		{"--signer", "aws-kms"},
+		{"--signer", "vault"},
+		{"--kms-key-id", "alias/x"},
+		{"--signer", "aws-kms", "--kms-key-id", "alias/x", "--private-key-file", "k"},
+		{"--max-fee-gwei", "0"},
+		{"--max-fee-gwei", "-1"},
+		{"--max-fee-gwei", "abc"},
+		{"--max-fee-gwei", "0.0000000001"},
+		{"--max-fee-gwei", "10", "--max-priority-fee-gwei", "20"},
+	} {
+		if _, err := load(extra...); err == nil {
+			t.Errorf("accepted %v", extra)
+		}
 	}
 }

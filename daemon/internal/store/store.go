@@ -178,6 +178,10 @@ func marshalIndent(v any) ([]byte, error) {
 	return []byte(sb.String()), nil
 }
 
+// WriteFileAtomic writes data to path (mode 0600) through a synced
+// temporary file and a rename, then syncs the directory.
+func WriteFileAtomic(path string, data []byte) error { return writeAtomic(path, data) }
+
 func writeAtomic(path string, data []byte) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".tmp-*")

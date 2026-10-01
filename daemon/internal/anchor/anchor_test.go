@@ -18,6 +18,8 @@ import (
 
 	"github.com/ronitspatil/verilog/daemon/internal/merkle"
 	"github.com/ronitspatil/verilog/daemon/internal/registry"
+	"github.com/ronitspatil/verilog/daemon/internal/signer"
+	"github.com/ronitspatil/verilog/daemon/internal/signer/kmsfake"
 )
 
 // ------------------------------------------------------------------ worker
@@ -105,11 +107,22 @@ type simEnv struct {
 	contract common.Address
 	reg      *registry.VeriLogRegistry
 	stop     func()
+
+	mining   chan struct{} // closed once automatic mining runs
+	startMin func()
 }
 
+// newSimEnv deploys the registry with a fresh anchorer key and mines a block
+// every 50ms.
 func newSimEnv(t *testing.T) *simEnv {
-	t.Helper()
 	key, _ := crypto.GenerateKey()
+	return newSimEnvWith(t, key, true)
+}
+
+// newSimEnvWith deploys the registry with key as the anchorer. Without
+// automine, blocks are mined only after env.startMining().
+func newSimEnvWith(t *testing.T, key *ecdsa.PrivateKey, automine bool) *simEnv {
+	t.Helper()
 	from := crypto.PubkeyToAddress(key.PublicKey)
 	sim := simulated.NewBackend(types.GenesisAlloc{from: {Balance: new(big.Int).Lsh(big.NewInt(1), 100)}})
 	client := sim.Client()
@@ -125,9 +138,15 @@ func newSimEnv(t *testing.T) *simEnv {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
+	mining := make(chan struct{})
 	wg.Add(1)
 	go func() { // mine a block every 50ms
 		defer wg.Done()
+		select {
+		case <-ctx.Done():
+			return
+		case <-mining:
+		}
 		tk := time.NewTicker(50 * time.Millisecond)
 		defer tk.Stop()
 		for {
@@ -140,7 +159,12 @@ func newSimEnv(t *testing.T) *simEnv {
 		}
 	}()
 	env := &simEnv{sim: sim, client: client, addr: from, contract: addr, reg: reg,
-		key: key}
+		key: key, mining: mining}
+	var once sync.Once
+	env.startMin = func() { once.Do(func() { close(mining) }) }
+	if automine {
+		env.startMin()
+	}
 	env.stop = func() { cancel(); wg.Wait(); sim.Close() }
 	t.Cleanup(env.stop)
 	return env
@@ -148,8 +172,31 @@ func newSimEnv(t *testing.T) *simEnv {
 
 func TestEthChainAnchorsAndVerifiesOnChain(t *testing.T) {
 	env := newSimEnv(t)
+	anchorAndVerify(t, env, signer.NewLocal(env.key))
+}
+
+// The production path: the anchoring key lives in (fake) KMS, which returns
+// DER SPKI and DER signatures, high-s included.
+func TestEthChainAnchorsWithKMSSigner(t *testing.T) {
+	fake := kmsfake.New("alias/verilog-anchorer")
+	env := newSimEnvWith(t, fake.Key, true)
+	kmsSigner, err := signer.NewKMS(context.Background(), fake, "alias/verilog-anchorer", signer.KMSOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kmsSigner.Address() != env.addr {
+		t.Fatalf("KMS address %s, want %s", kmsSigner.Address(), env.addr)
+	}
+	anchorAndVerify(t, env, kmsSigner)
+	if fake.HighSReturned == 0 {
+		t.Fatal("no high-s signature was exercised")
+	}
+}
+
+func anchorAndVerify(t *testing.T, env *simEnv, sgn signer.Signer) {
+	t.Helper()
 	ctx := context.Background()
-	chain, err := NewEthChain(ctx, env.client, env.contract, env.key, 30*time.Second, nil)
+	chain, err := NewEthChain(ctx, env.client, env.contract, sgn, Options{ConfirmTimeout: 30 * time.Second}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,7 +259,7 @@ func TestEthChainRejectsSignerWithoutRole(t *testing.T) {
 	env := newSimEnv(t)
 	ctx := context.Background()
 	other, _ := crypto.GenerateKey()
-	chain, err := NewEthChain(ctx, env.client, env.contract, other, 5*time.Second, nil)
+	chain, err := NewEthChain(ctx, env.client, env.contract, signer.NewLocal(other), Options{ConfirmTimeout: 5 * time.Second}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,7 +270,7 @@ func TestEthChainRejectsSignerWithoutRole(t *testing.T) {
 
 func TestEthChainRequiresContract(t *testing.T) {
 	env := newSimEnv(t)
-	if _, err := NewEthChain(context.Background(), env.client, common.HexToAddress("0x1234"), env.key, time.Second, nil); err == nil {
+	if _, err := NewEthChain(context.Background(), env.client, common.HexToAddress("0x1234"), signer.NewLocal(env.key), Options{ConfirmTimeout: time.Second}, nil); err == nil {
 		t.Fatal("expected error for address without code")
 	}
 }

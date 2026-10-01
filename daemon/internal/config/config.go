@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -24,15 +26,28 @@ const (
 	EnvKeyFile    = "VERILOG_PRIVATE_KEY_FILE"
 )
 
+// Signer backends.
+const (
+	SignerLocal  = "local"   // key file or VERILOG_PRIVATE_KEY (development)
+	SignerAWSKMS = "aws-kms" // key held in AWS KMS (production)
+)
+
 // Config is the daemon configuration.
 type Config struct {
-	Listen          string
-	TLSCert         string
-	TLSKey          string
-	DataDir         string
-	RPCURL          string
-	Contract        common.Address
-	PrivateKeyFile  string
+	Listen         string
+	TLSCert        string
+	TLSKey         string
+	DataDir        string
+	RPCURL         string
+	Contract       common.Address
+	PrivateKeyFile string
+	// InsecureKeyFilePerms accepts a key file readable by group or others.
+	InsecureKeyFilePerms bool
+	Signer               string // SignerLocal or SignerAWSKMS
+	KMSKeyID             string // key ARN, key id or alias/<name>
+	// MaxFeeCap and MaxTipCap (wei) cap maxFeePerGas and maxPriorityFeePerGas.
+	MaxFeeCap       *big.Int
+	MaxTipCap       *big.Int
 	EpochInterval   time.Duration
 	EpochMaxLogs    int
 	ConfirmTimeout  time.Duration
@@ -66,6 +81,8 @@ func Load(args []string, getenv func(string) string, stderr io.Writer) (*Config,
 		confirm    = env("VERILOG_CONFIRM_TIMEOUT", "2m")
 		segBytes   = env("VERILOG_WAL_SEGMENT_BYTES", strconv.Itoa(64<<20))
 		maxPayload = env("VERILOG_MAX_PAYLOAD_BYTES", strconv.Itoa(1<<20))
+		maxFee     = env("VERILOG_MAX_FEE_GWEI", "500")
+		maxTip     = env("VERILOG_MAX_PRIORITY_FEE_GWEI", "50")
 	)
 	fs.StringVar(&c.Listen, "listen", env("VERILOG_LISTEN", "127.0.0.1:50051"), "gRPC listen address (env VERILOG_LISTEN)")
 	fs.StringVar(&c.TLSCert, "tls-cert", env("VERILOG_TLS_CERT", ""), "PEM certificate for gRPC TLS (env VERILOG_TLS_CERT); plaintext if unset")
@@ -73,7 +90,12 @@ func Load(args []string, getenv func(string) string, stderr io.Writer) (*Config,
 	fs.StringVar(&c.DataDir, "data-dir", env("VERILOG_DATA_DIR", "./verilog-data"), "directory for the WAL, checkpoint and evidence bundles (env VERILOG_DATA_DIR)")
 	fs.StringVar(&c.RPCURL, "rpc", env("VERILOG_RPC_URL", ""), "EVM JSON-RPC endpoint (env VERILOG_RPC_URL)")
 	fs.StringVar(&contract, "contract", env("VERILOG_CONTRACT", ""), "VeriLogRegistry address (env VERILOG_CONTRACT)")
-	fs.StringVar(&c.PrivateKeyFile, "private-key-file", env(EnvKeyFile, ""), "file holding the hex signing key (env "+EnvKeyFile+"); otherwise "+EnvPrivateKey+" is used")
+	fs.StringVar(&c.Signer, "signer", env("VERILOG_SIGNER", SignerLocal), "anchoring key backend: local or aws-kms (env VERILOG_SIGNER)")
+	fs.StringVar(&c.KMSKeyID, "kms-key-id", env("VERILOG_KMS_KEY_ID", ""), "AWS KMS key ARN, id or alias/<name> for --signer aws-kms (env VERILOG_KMS_KEY_ID); region and credentials come from the AWS SDK default chain")
+	fs.StringVar(&c.PrivateKeyFile, "private-key-file", env(EnvKeyFile, ""), "--signer local: file holding the hex signing key, mode 0600 (env "+EnvKeyFile+"); otherwise "+EnvPrivateKey+" is used")
+	fs.BoolVar(&c.InsecureKeyFilePerms, "insecure-key-file-perms", false, "development only: accept a key file readable by group or others")
+	fs.StringVar(&maxFee, "max-fee-gwei", maxFee, "ceiling on maxFeePerGas in gwei; retries stop bumping fees here (env VERILOG_MAX_FEE_GWEI)")
+	fs.StringVar(&maxTip, "max-priority-fee-gwei", maxTip, "ceiling on maxPriorityFeePerGas in gwei (env VERILOG_MAX_PRIORITY_FEE_GWEI)")
 	fs.StringVar(&interval, "epoch-interval", interval, "seal each agent's open epoch this often (env VERILOG_EPOCH_INTERVAL)")
 	fs.StringVar(&maxLogs, "epoch-max-logs", maxLogs, "seal an agent's epoch once it holds this many events (env VERILOG_EPOCH_MAX_LOGS)")
 	fs.StringVar(&confirm, "confirm-timeout", confirm, "max wait for a transaction receipt before retrying (env VERILOG_CONFIRM_TIMEOUT)")
@@ -127,12 +149,54 @@ func Load(args []string, getenv func(string) string, stderr io.Writer) (*Config,
 	if c.CommitBatch <= 0 || c.StreamWindow <= 0 {
 		return nil, errors.New("--commit-batch and --stream-window must be positive")
 	}
+	if c.MaxFeeCap, err = parseGwei(maxFee); err != nil {
+		return nil, fmt.Errorf("invalid --max-fee-gwei %q: %w", maxFee, err)
+	}
+	if c.MaxTipCap, err = parseGwei(maxTip); err != nil {
+		return nil, fmt.Errorf("invalid --max-priority-fee-gwei %q: %w", maxTip, err)
+	}
+	if c.MaxTipCap.Cmp(c.MaxFeeCap) > 0 {
+		return nil, errors.New("--max-priority-fee-gwei must not exceed --max-fee-gwei")
+	}
+	switch c.Signer {
+	case SignerLocal:
+		if c.KMSKeyID != "" {
+			return nil, errors.New("--kms-key-id requires --signer aws-kms")
+		}
+	case SignerAWSKMS:
+		if c.KMSKeyID == "" {
+			return nil, errors.New("--signer aws-kms requires --kms-key-id (or VERILOG_KMS_KEY_ID)")
+		}
+		if c.PrivateKeyFile != "" {
+			return nil, errors.New("--private-key-file cannot be used with --signer aws-kms")
+		}
+	default:
+		return nil, fmt.Errorf("invalid --signer %q (local or aws-kms)", c.Signer)
+	}
 	return &c, nil
 }
 
-// LoadKey reads the signing key from PrivateKeyFile, else from the
-// VERILOG_PRIVATE_KEY environment variable. Errors never contain key material.
+// parseGwei converts a positive decimal gwei amount to wei.
+func parseGwei(s string) (*big.Int, error) {
+	r, ok := new(big.Rat).SetString(s)
+	if !ok || r.Sign() <= 0 {
+		return nil, errors.New("must be a positive number of gwei")
+	}
+	r.Mul(r, new(big.Rat).SetInt64(1e9))
+	if !r.IsInt() {
+		return nil, errors.New("more precision than 1 wei")
+	}
+	return new(big.Int).Set(r.Num()), nil
+}
+
+// LoadKey reads the local signing key from PrivateKeyFile, else from the
+// VERILOG_PRIVATE_KEY environment variable. A key file readable by group or
+// others is refused unless InsecureKeyFilePerms is set. Errors never contain
+// key material.
 func (c *Config) LoadKey(getenv func(string) string, logger *slog.Logger) (*ecdsa.PrivateKey, error) {
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
 	var raw string
 	switch {
 	case c.PrivateKeyFile != "":
@@ -140,8 +204,13 @@ func (c *Config) LoadKey(getenv func(string) string, logger *slog.Logger) (*ecds
 		if err != nil {
 			return nil, fmt.Errorf("private key file: %w", err)
 		}
-		if st.Mode().Perm()&0o077 != 0 && logger != nil {
-			logger.Warn("private key file is readable by group or others; chmod 600 recommended", "file", c.PrivateKeyFile)
+		if perm := st.Mode().Perm(); perm&0o077 != 0 && runtime.GOOS != "windows" {
+			if !c.InsecureKeyFilePerms {
+				return nil, fmt.Errorf("private key file %s has mode %#o and is readable by group or others; run chmod 600 on it "+
+					"(or pass --insecure-key-file-perms for development only)", c.PrivateKeyFile, perm)
+			}
+			logger.Warn("private key file is readable by group or others; accepted because of --insecure-key-file-perms",
+				"file", c.PrivateKeyFile, "mode", fmt.Sprintf("%#o", perm))
 		}
 		b, err := os.ReadFile(c.PrivateKeyFile)
 		if err != nil {
@@ -150,6 +219,8 @@ func (c *Config) LoadKey(getenv func(string) string, logger *slog.Logger) (*ecds
 		raw = string(b)
 	case getenv(EnvPrivateKey) != "":
 		raw = getenv(EnvPrivateKey)
+		logger.Warn("anchoring key read from the " + EnvPrivateKey + " environment variable; " +
+			"prefer --private-key-file (mode 0600) or, in production, --signer aws-kms")
 	default:
 		return nil, fmt.Errorf("no signing key: set %s or --private-key-file", EnvPrivateKey)
 	}

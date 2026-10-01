@@ -49,6 +49,10 @@ GitHub Actions (`.github/workflows/ci.yml`) runs on every pull request and
 on pushes to `main`, as parallel jobs:
 
 - **go**: `gofmt -l`, `go build`, `go vet`, `go test -race -count=1`, `govulncheck`.
+  `scripts/govulncheck.sh` fails on any called vulnerability not in
+  `.github/govulncheck-allow.txt` (allowed ones print as warnings). The one
+  exception, GO-2026-6443 (gRPC, no released fix), is removed by deleting its
+  line once google.golang.org/grpc >= v1.85.0 lands.
 - **contracts**: `forge build`, `forge test`.
 - **python**: venv from the lock (`--require-hashes`), `pytest`, `pip-audit` on the lock.
 - **reproducible**: `make tools proto bindings vectors`, then `git diff --exit-code`,

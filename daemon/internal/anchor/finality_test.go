@@ -445,6 +445,18 @@ func TestReorgKeepsNonceOrderWhilePipelining(t *testing.T) {
 	if st, _ := final(t, c, testReq); st != Pending { // resends the first anchor
 		t.Fatalf("%v", st)
 	}
+	// Wait until the pool holds the resent first anchor before mining.
+	first := c.mined[0].tx.Hash()
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		if _, isPending, err := env.client.TransactionByHash(context.Background(), first); err == nil && isPending {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the first anchor was not sent again")
+		}
+		time.Sleep(50 * time.Millisecond)
+		final(t, c, testReq)
+	}
 	c.opts.ConfirmTimeout = 30 * time.Second
 	res2 := anchorMined(t, env, c, req2)
 	env.sim.Commit()

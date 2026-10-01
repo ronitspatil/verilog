@@ -144,6 +144,23 @@ def test_reconnects_and_resends_unacked(fake_daemon):
     assert stats.reconnects >= 1 and stats.resent >= 1 and stats.acked == 50
 
 
+@pytest.mark.parametrize("fake_daemon", [{"backpressure_for": 1.5}], indirect=True)
+def test_backpressure_is_retried_past_the_key_wait_window(fake_daemon):
+    """M6: a backpressure rejection (retry_after_ms) is re-sent for as long as
+    it takes, even past key_wait_timeout, so nothing is lost or gapped."""
+    client = VeriLogClient(fake_daemon.target, insecure=True, key_wait_timeout=0.2)
+    for i in range(5):
+        client.submit("a", "r", "t", {"i": i})
+    client.submit("a", "r", "run_end", {"status": "ok"})
+    assert client.flush(timeout=20)
+    client.close()
+    stats = client.stats()
+    assert stats.acked == 6 and stats.rejected == 0 and stats.chain_gaps == 0
+    assert stats.backpressured >= 1
+    assert [e.step_number for e in fake_daemon.accepted] == list(range(1, 7))
+    check_chains(fake_daemon.accepted, PUB)
+
+
 @pytest.mark.parametrize("fake_daemon", [{"reject_types": {"bad"}}], indirect=True)
 def test_rejections_are_counted_not_raised(fake_daemon):
     client = VeriLogClient(fake_daemon.target, insecure=True)

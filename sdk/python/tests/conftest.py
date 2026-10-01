@@ -67,6 +67,9 @@ class FakeDaemon(verilog_pb2_grpc.VeriLogServicer):
     ``unregistered_for``: answer every event with a retryable "key not
     registered" rejection for this many seconds after the first event (a key
     registered moments ago, not yet visible to the daemon).
+    ``backpressure_for``: like ``unregistered_for``, but a backpressure
+    rejection (retryable with ``retry_after_ms``), as verilogd sends when an
+    agent is over its quota or the anchor queue is full.
     ``max_payload``: reject larger payload_json like verilogd's --max-payload-bytes.
     ``bad_digests``: on each of the first this many streams, answer the first
     accepted event with a wrong ``content_digest`` (an impersonated or buggy
@@ -75,7 +78,7 @@ class FakeDaemon(verilog_pb2_grpc.VeriLogServicer):
     """
 
     def __init__(self, fail_after=None, reject_types=(), gate=None, unregistered_for=None, max_payload=None,
-                 bad_digests=0):
+                 bad_digests=0, backpressure_for=None):
         self.events = []
         self.accepted = []
         self.streams = 0
@@ -83,6 +86,7 @@ class FakeDaemon(verilog_pb2_grpc.VeriLogServicer):
         self.reject_types = set(reject_types)
         self.gate = gate
         self.unregistered_for = unregistered_for
+        self.backpressure_for = backpressure_for
         self.max_payload = max_payload
         self.first_seen = None
         self.bad_digests = bad_digests
@@ -106,7 +110,11 @@ class FakeDaemon(verilog_pb2_grpc.VeriLogServicer):
                 if self.first_seen is None:
                     self.first_seen = time.monotonic()
                 hidden = self.unregistered_for is not None and time.monotonic() - self.first_seen < self.unregistered_for
-            if hidden:
+                full = self.backpressure_for is not None and time.monotonic() - self.first_seen < self.backpressure_for
+            if full:
+                yield verilog_pb2.Ack(sequence=ev.sequence, accepted=False, retryable=True, retry_after_ms=100,
+                                      error="backpressure (agent_unanchored_events): over quota")
+            elif hidden:
                 yield verilog_pb2.Ack(sequence=ev.sequence, accepted=False, retryable=True,
                                       error="key_id 0x.. is not registered for agent")
             elif self.max_payload is not None and len(ev.payload_json.encode()) > self.max_payload:

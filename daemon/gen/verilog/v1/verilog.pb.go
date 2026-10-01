@@ -175,7 +175,14 @@ type Ack struct {
 	// later, for example because the agent key is not yet visible on chain.
 	// The client should retry it (with backoff, for a bounded time) instead of
 	// leaving a gap in the run's hash chain.
-	Retryable     bool `protobuf:"varint,7,opt,name=retryable,proto3" json:"retryable,omitempty"`
+	Retryable bool `protobuf:"varint,7,opt,name=retryable,proto3" json:"retryable,omitempty"`
+	// Set (with retryable) when the daemon refuses the event for now to
+	// protect its resources: a resource quota, the anchor queue or free disk
+	// space. Nothing was written. The client should keep the event and send
+	// the identical event again after about this many milliseconds, for as
+	// long as it takes (unlike other retryable rejections, which are given up
+	// after a bounded time).
+	RetryAfterMs  uint32 `protobuf:"varint,8,opt,name=retry_after_ms,json=retryAfterMs,proto3" json:"retry_after_ms,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -257,6 +264,13 @@ func (x *Ack) GetRetryable() bool {
 		return x.Retryable
 	}
 	return false
+}
+
+func (x *Ack) GetRetryAfterMs() uint32 {
+	if x != nil {
+		return x.RetryAfterMs
+	}
+	return 0
 }
 
 type GetProofRequest struct {
@@ -502,7 +516,7 @@ const file_verilog_v1_verilog_proto_rawDesc = "" +
 	"\tprev_hash\x18\a \x01(\fR\bprevHash\x12\x15\n" +
 	"\x06key_id\x18\b \x01(\fR\x05keyId\x12\x1c\n" +
 	"\tsignature\x18\t \x01(\fR\tsignature\x12\x1a\n" +
-	"\bsequence\x18\x0f \x01(\x04R\bsequence\"\xca\x01\n" +
+	"\bsequence\x18\x0f \x01(\x04R\bsequence\"\xf0\x01\n" +
 	"\x03Ack\x12\x1a\n" +
 	"\bsequence\x18\x01 \x01(\x04R\bsequence\x12\x1a\n" +
 	"\baccepted\x18\x02 \x01(\bR\baccepted\x12\x14\n" +
@@ -510,7 +524,8 @@ const file_verilog_v1_verilog_proto_rawDesc = "" +
 	"\x0econtent_digest\x18\x04 \x01(\fR\rcontentDigest\x12\x12\n" +
 	"\x04leaf\x18\x05 \x01(\fR\x04leaf\x12\x1c\n" +
 	"\tduplicate\x18\x06 \x01(\bR\tduplicate\x12\x1c\n" +
-	"\tretryable\x18\a \x01(\bR\tretryable\"\x9d\x01\n" +
+	"\tretryable\x18\a \x01(\bR\tretryable\x12$\n" +
+	"\x0eretry_after_ms\x18\b \x01(\rR\fretryAfterMs\"\x9d\x01\n" +
 	"\x0fGetProofRequest\x12\x19\n" +
 	"\bagent_id\x18\x01 \x01(\tR\aagentId\x12\x19\n" +
 	"\bepoch_id\x18\x02 \x01(\x04R\aepochId\x12\x1f\n" +

@@ -71,6 +71,13 @@ message Ack {
   // The client should retry it (with backoff, for a bounded time) instead of
   // leaving a gap in the run's hash chain.
   bool retryable = 7;
+  // Set (with retryable) when the daemon refuses the event for now to
+  // protect its resources: a resource quota, the anchor queue or free disk
+  // space. Nothing was written. The client should keep the event and send
+  // the identical event again after about this many milliseconds, for as
+  // long as it takes (unlike other retryable rejections, which are given up
+  // after a bounded time).
+  uint32 retry_after_ms = 8;
 }
 
 message GetProofRequest {

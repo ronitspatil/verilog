@@ -30,6 +30,12 @@ Nothing that is chained may later go missing, since a gap fails the run:
 * Key not yet visible. A rejection the daemon marks retryable (the agent key
   is not registered yet, typically just after registration) is retried with
   backoff for up to ``key_wait_timeout`` seconds before it is given up.
+* Daemon backpressure. A retryable rejection with ``retry_after_ms`` set
+  means the daemon is protecting its resources (a per-agent quota, its anchor
+  queue, free disk) and wrote nothing. The event is sent again after that
+  delay (with backoff) for as long as it takes and is never given up
+  (``stats().backpressured``); new events wait in the local queue meanwhile,
+  subject to ``overflow_policy``.
 * Any other rejection of a chained event leaves a gap in its run: it is
   logged at ERROR and counted in ``stats().chain_gaps``.
 * Events submitted after their run's ``run_end`` cannot join the run (the
@@ -186,7 +192,8 @@ class ClientStats:
     serialization_errors: int = 0
     drop_reports: int = 0  # sdk_dropped events emitted
     chain_gaps: int = 0  # chained events finally rejected: each leaves a gap in its run
-    retried: int = 0  # retryable rejections re-sent later (key not yet visible)
+    retried: int = 0  # retryable rejections re-sent later (key not yet visible, or backpressure)
+    backpressured: int = 0  # rejections for daemon backpressure (retry_after_ms); always re-sent
     truncated: int = 0  # oversized payloads replaced by a signed hash-and-size stand-in
     late_events: int = 0  # events after their run's run_end, chained as their own late run
     evicted_runs: int = 0  # open runs closed with run_end "evicted" (max_open_runs)
@@ -722,12 +729,16 @@ class VeriLogClient:
                 self._retry_attempt = 0
                 if ack.duplicate:
                     self._stats.duplicates += 1
-            elif item is not None and ack.retryable and self._retry_window_open(item):
+            elif item is not None and ack.retryable and (ack.retry_after_ms > 0 or self._retry_window_open(item)):
                 # Re-send the identical signed event later; hold back everything
-                # else meanwhile so the run's order is kept.
+                # else meanwhile so the run's order is kept. Backpressure
+                # (retry_after_ms) is retried without a time limit.
                 self._retry[item.seq] = item
                 self._stats.retried += 1
                 delay = min(5.0, 0.25 * (2 ** min(self._retry_attempt, 5)))
+                if ack.retry_after_ms > 0:
+                    self._stats.backpressured += 1
+                    delay = min(30.0, max(delay, ack.retry_after_ms / 1000.0))
                 self._retry_attempt += 1
                 self._retry_at = max(self._retry_at, time.monotonic() + delay)
                 log.warning("verilog_sdk: daemon rejected event %d (%s), retrying in %.2fs: %s",

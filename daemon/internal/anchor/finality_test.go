@@ -278,28 +278,22 @@ func reorgOut(t *testing.T, env *simEnv, n uint64) common.Hash {
 	}
 	time.Sleep(200 * time.Millisecond) // let the pool re-inject, then drop them
 	env.sim.Rollback()
-	return blk.Hash()
-}
-
-// waitPending polls final (which resends reorged-out anchors) until the next
-// nonce is pending. The simulated pool handles a reorg asynchronously, so on a
-// slow machine it can refuse or drop the first resend.
-func waitPending(t *testing.T, env *simEnv, c *EthChain, req Request) {
-	t.Helper()
+	// The pool handles the new head asynchronously and, on a slow machine,
+	// after the rollback: it then still has the old head's nonce, or re-injects
+	// the dropped transaction. Drop again until it matches the chain.
 	ctx := context.Background()
 	for deadline := time.Now().Add(10 * time.Second); ; {
 		pending, _ := env.client.PendingNonceAt(ctx, env.addr)
-		if mined, _ := env.client.NonceAt(ctx, env.addr, nil); pending > mined {
-			return
+		if mined, _ := env.client.NonceAt(ctx, env.addr, nil); pending == mined {
+			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("the reorged-out anchor was not sent again")
+			t.Fatal("the pool did not settle after the reorg")
 		}
-		time.Sleep(100 * time.Millisecond)
-		if st, _ := final(t, c, req); st != Pending {
-			t.Fatalf("final while resending: %v", st)
-		}
+		time.Sleep(50 * time.Millisecond)
+		env.sim.Rollback()
 	}
+	return blk.Hash()
 }
 
 func latestEpochOf(t *testing.T, env *simEnv, agent [32]byte) uint64 {
@@ -451,7 +445,6 @@ func TestReorgKeepsNonceOrderWhilePipelining(t *testing.T) {
 	if st, _ := final(t, c, testReq); st != Pending { // resends the first anchor
 		t.Fatalf("%v", st)
 	}
-	waitPending(t, env, c, testReq)
 	c.opts.ConfirmTimeout = 30 * time.Second
 	res2 := anchorMined(t, env, c, req2)
 	env.sim.Commit()

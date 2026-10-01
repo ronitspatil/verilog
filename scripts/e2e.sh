@@ -69,6 +69,11 @@ ANVIL_PID=$!
 for _ in $(seq 1 50); do cast chain-id --rpc-url "$RPC" >/dev/null 2>&1 && break; sleep 0.2; done
 cast chain-id --rpc-url "$RPC" >/dev/null || fail "anvil did not start"
 
+CHAIN_ID="$(cast chain-id --rpc-url "$RPC")"
+# Anvil has no real finality: the daemon and the verifier treat a block as
+# final once 2 blocks are built on it, and the script mines them.
+FINALITY="depth:2"
+mine() { cast rpc anvil_mine "${1:-1}" --rpc-url "$RPC" >/dev/null; }
 ANCHORER="$(cast wallet address --private-key "$ANCHOR_KEY")"
 log "deploying VeriLogRegistry (admin: dev key admin, anchorer: $ANCHORER)"
 (cd "$ROOT/contracts" && VERILOG_ANCHORER="$ANCHORER" forge script script/Deploy.s.sol --rpc-url "$RPC" \
@@ -145,6 +150,7 @@ start_daemon() {
   VERILOG_PRIVATE_KEY="$ANCHOR_KEY" "$WORK/bin/verilogd" \
     --listen "$TARGET" --rpc "$RPC" --contract "$CONTRACT" --data-dir "$DATA" "${DAEMON_TLS[@]}" \
     --epoch-interval 2s --epoch-max-logs 1000 --confirm-timeout 30s --retry-initial 200ms \
+    --finality "$FINALITY" --finality-poll 200ms \
     >>"$WORK/daemon.log" 2>&1 &
   DAEMON_PID=$!
   local n; n="$(grep -c "verilogd listening" "$WORK/daemon.log" || true)"
@@ -167,8 +173,12 @@ latest_epoch() { cast call "$CONTRACT" 'latestEpoch(bytes32)(uint256)' "$AGENT_K
 anchored_count() { # events in the daemon's bundles
   "$PYTHON" -c 'import glob,json,sys; print(sum(json.load(open(f))["log_count"] for f in glob.glob(sys.argv[1]+"/epoch-*.json")))' "$EVIDENCE" 2>/dev/null || echo 0
 }
-wait_anchored() { # <total events>: wait until the daemon's bundles hold them all
-  for _ in $(seq 1 300); do [ "$(anchored_count)" -ge "$1" ] && return 0; sleep 0.2; done
+wait_anchored() { # <total events>: wait until the daemon's bundles hold them all (final anchors)
+  for i in $(seq 1 300); do
+    [ "$(anchored_count)" -ge "$1" ] && return 0
+    (( i % 5 == 0 )) && mine 1 # anvil has no finality: build the blocks depth:2 waits for
+    sleep 0.2
+  done
   fail "only $(anchored_count) of $1 events anchored in time"
 }
 
@@ -180,11 +190,15 @@ all_evidence() { # <dir>: a fresh copy of the complete evidence
   rm -rf "$1" && mkdir -p "$1" && cp "$EVIDENCE"/epoch-*.json "$1"/ && { cp "$ATTACK"/epoch-*.json "$1"/ 2>/dev/null || true; }
 }
 
-# expect_verify <expected-exit> <expected-stdout> args...
+# expect_verify <expected-exit> <expected-stdout> args...: verify pinned to
+# the chain id and the final block under $FINALITY (args may override both).
+# It first mines enough blocks for everything sent so far to be final, unless
+# NOMINE=1.
 expect_verify() {
   local want_code="$1" want_out="$2"; shift 2
+  [ "${NOMINE:-0}" = 1 ] || mine 2
   set +e
-  local out; out="$("$VERIFY" "$@" 2>"$WORK/verify.err")"
+  local out; out="$("$VERIFY" --chain-id "$CHAIN_ID" --finality "$FINALITY" "$@" 2>"$WORK/verify.err")"
   local code=$?
   set -e
   echo "exit=$code stdout='$out'"
@@ -404,13 +418,13 @@ for _ in $(seq 1 100); do [ "$(grep -c "anchor: transaction sent" "$WORK/daemon.
 [ "$(grep -c "anchor: transaction sent" "$WORK/daemon.log" || true)" -gt "$SENT" ] || fail "no anchor transaction was sent"
 [ -f "$DATA/anchor-pending.json" ] || fail "the pending transaction was not persisted before broadcast"
 kill -KILL "$DAEMON_PID"; wait "$DAEMON_PID" 2>/dev/null || true; DAEMON_PID=""
-echo "killed with transaction $(jq -r .tx_hash "$DATA/anchor-pending.json") (nonce $(jq -r .nonce "$DATA/anchor-pending.json")) unmined"
+echo "killed with transaction $(jq -r .pending.tx_hash "$DATA/anchor-pending.json") (nonce $(jq -r .pending.nonce "$DATA/anchor-pending.json")) unmined"
 SENT="$(grep -c "anchor: transaction sent" "$WORK/daemon.log" || true)"
 start_daemon
 grep -q "anchor: resuming pending transaction" "$WORK/daemon.log" || fail "the restarted daemon did not resume the pending transaction"
 for _ in $(seq 1 100); do [ "$(grep -c "anchor: transaction sent" "$WORK/daemon.log" || true)" -gt "$SENT" ] && break; sleep 0.1; done
 tail -n +"$(( $(grep -n "anchor: resuming pending transaction" "$WORK/daemon.log" | tail -n 1 | cut -d: -f1) ))" "$WORK/daemon.log" \
-  | grep -q "anchor: transaction sent.* nonce=$(jq -r .nonce "$DATA/anchor-pending.json") replaces=1" \
+  | grep -q "anchor: transaction sent.* nonce=$(jq -r .pending.nonce "$DATA/anchor-pending.json") replaces=1" \
   || fail "the restarted daemon did not replace the pending transaction with the same nonce"
 cast rpc evm_setAutomine true --rpc-url "$RPC" >/dev/null
 cast rpc evm_mine --rpc-url "$RPC" >/dev/null
@@ -425,6 +439,51 @@ done
   || fail "the anchorer sent $(( NONCE_AFTER - NONCE_BEFORE )) transactions for $(( EPOCHS_AFTER - EPOCHS_BEFORE )) epochs"
 [ ! -f "$DATA/anchor-pending.json" ] || fail "pending record left behind after confirmation"
 echo "epochs $(( EPOCHS_BEFORE + 1 ))..$EPOCHS_AFTER anchored once each, $(( NONCE_AFTER - NONCE_BEFORE )) anchorer transactions"
+
+# ------------------------------------------------- reorg between receipt and finality
+log "reorg after the receipt, before finality (anvil snapshot/revert): the daemon sends the anchor again, compacts nothing early"
+EPOCHS_BEFORE="$(latest_epoch)"
+NONCE_BEFORE="$(cast nonce "$ANCHORER" --rpc-url "$RPC")"
+BEFORE="$(anchored_count)"
+BUNDLES_BEFORE="$(ls "$EVIDENCE" | wc -l | tr -d ' ')"
+MINED="$(grep -c "anchor: transaction mined, awaiting finality" "$WORK/daemon.log" || true)"
+SNAP="$(cast rpc evm_snapshot --rpc-url "$RPC" | tr -d '"')"
+REORG_ACKED="$("$PYTHON" "$ROOT/scripts/e2e_agent.py" --target "$TARGET" "${AGENT_TLS[@]}" --agent-id "$AGENT_ID" --runs 1 2>"$WORK/agent4.log")" \
+  || { tail -n 20 "$WORK/agent4.log"; fail "agent run before the reorg failed"; }
+for _ in $(seq 1 100); do [ "$(grep -c "anchor: transaction mined, awaiting finality" "$WORK/daemon.log" || true)" -gt "$MINED" ] && break; sleep 0.1; done
+[ "$(grep -c "anchor: transaction mined, awaiting finality" "$WORK/daemon.log" || true)" -gt "$MINED" ] || fail "no anchor transaction was mined"
+REORGED_BLOCK_HASH="$(grep "anchor: transaction mined, awaiting finality" "$WORK/daemon.log" | tail -n 1 | grep -Eo 'block_hash=0x[0-9a-f]+' | cut -d= -f2)"
+[ "$(ls "$EVIDENCE" | wc -l | tr -d ' ')" = "$BUNDLES_BEFORE" ] || fail "an evidence bundle was written before the anchor was final"
+jq -e '.mined | length > 0' "$DATA/anchor-pending.json" >/dev/null || fail "the mined anchor awaiting finality was not persisted"
+cast rpc evm_revert "$SNAP" --rpc-url "$RPC" >/dev/null || fail "evm_revert failed"
+echo "reverted the chain: block $REORGED_BLOCK_HASH and its anchor are gone (latest epoch $(latest_epoch))"
+for _ in $(seq 1 100); do grep -q "anchor: reorg removed the anchor transaction" "$WORK/daemon.log" && break; sleep 0.1; done
+grep "anchor: reorg removed the anchor transaction" "$WORK/daemon.log" | grep -q "block_hash=$REORGED_BLOCK_HASH" \
+  || fail "the daemon did not report the reorg (WARN with the block hash)"
+wait_anchored $(( BEFORE + REORG_ACKED ))
+sleep 1
+EPOCHS_AFTER="$(latest_epoch)"
+NONCE_AFTER="$(cast nonce "$ANCHORER" --rpc-url "$RPC")"
+[ $(( NONCE_AFTER - NONCE_BEFORE )) = $(( EPOCHS_AFTER - EPOCHS_BEFORE )) ] && [ "$EPOCHS_AFTER" -gt "$EPOCHS_BEFORE" ] \
+  || fail "after the reorg: $(( NONCE_AFTER - NONCE_BEFORE )) anchorer transactions for $(( EPOCHS_AFTER - EPOCHS_BEFORE )) epochs"
+REORG_BUNDLE="$EVIDENCE/epoch-$EPOCHS_AFTER.json"
+B_NUM="$(jq -r .block_number "$REORG_BUNDLE")"; B_HASH="$(jq -r .block_hash "$REORG_BUNDLE")"
+[ "$(cast block "$B_NUM" -f hash --rpc-url "$RPC")" = "$B_HASH" ] || fail "the bundle's block hash is not canonical"
+[ "$B_HASH" != "$REORGED_BLOCK_HASH" ] || fail "the bundle records the reorged-out block"
+[ "$(jq -r .finality "$REORG_BUNDLE")" = "$FINALITY" ] || fail "the bundle does not record the finality mode"
+echo "re-anchored in block $B_NUM ($B_HASH), final under $(jq -r .finality "$REORG_BUNDLE") at block $(jq -r .final_block_number "$REORG_BUNDLE")"
+REORG_RUN="$("$PYTHON" -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["events"][-1]["canonical_event"])["run_id"])' "$REORG_BUNDLE")"
+log "the run anchored across the reorg verifies (expect SUCCESS)"
+expect_verify 0 "$SUCCESS" --run-id "$REORG_RUN" --bundles "$EVIDENCE" --agent-id "$AGENT_ID" --rpc "$RPC" --contract "$CONTRACT"
+expect_stderr "verdict at block .* finality $FINALITY"
+"$VERIFY" export --bundle "$REORG_BUNDLE" --index 0 --out "$WORK/ev-reorg" 2>/dev/null
+expect_verify 0 "$SUCCESS" --event "$WORK/ev-reorg/event.json" --proof "$WORK/ev-reorg/proof.json" --epoch "$EPOCHS_AFTER" \
+  --agent-id "$AGENT_ID" --rpc "$RPC" --contract "$CONTRACT"
+
+log "verifier pinned to another chain id (expect exit 2, no verdict)"
+expect_verify 2 "" --event "$WORK/ev-reorg/event.json" --proof "$WORK/ev-reorg/proof.json" --epoch "$EPOCHS_AFTER" \
+  --agent-id "$AGENT_ID" --rpc "$RPC" --contract "$CONTRACT" --chain-id 1
+expect_stderr "serves chain id $CHAIN_ID, not --chain-id 1"
 grep -q "VERILOG_PRIVATE_KEY environment variable" "$WORK/daemon.log" || fail "no warning for the anchoring key from the environment"
 stop_daemon
 
@@ -451,6 +510,11 @@ mkdir -p "$WORK/forged"
 "$PYTHON" "$FORGE" resign "$WORK/ev/event.json" "$WORK/forged/event.json" --seed "$(seed_of "$WORK/attacker.key")" \
   --payload '{"text":"approve the wire transfer"}' >/dev/null
 EPOCH="$(attacker_anchor --event "$WORK/forged/event.json")"
+log "...before 2 blocks are built on it, its epoch is not final: not anchored yet (expect exit 2, no verdict)"
+NOMINE=1 expect_verify 2 "" --event "$WORK/forged/event.json" --proof "$WORK/forged/proof.json" \
+  --epoch "$EPOCH" --agent-id "$AGENT_ID" --rpc "$RPC" --contract "$CONTRACT"
+expect_stderr "not anchored yet"
+log "...once final (expect FAILURE)"
 expect_verify 1 "$FAILURE" --event "$WORK/forged/event.json" --proof "$WORK/forged/proof.json" \
   --epoch "$EPOCH" --agent-id "$AGENT_ID" --rpc "$RPC" --contract "$CONTRACT"
 expect_stderr "is not registered on chain"
@@ -546,4 +610,4 @@ expect_stderr "does not match the on-chain anchors"
 log "an untouched run still verifies against the complete evidence, attacks included (expect SUCCESS)"
 expect_verify 0 "$SUCCESS" --run-id "$BIG_RUN" --bundles "$WORK/all" --agent-id "$AGENT_ID" --rpc "$RPC" --contract "$CONTRACT"
 
-printf '\nE2E PASSED: %s + %s + %s signed events anchored by the daemon; weak key refused at registration; single-event and run mode SUCCESS, FAILURE (tamper, re-spelled file, withheld, decoy, missing epoch, forged, revoked key, reordered, curated re-anchor), SUCCESS-INCOMPLETE, oversized payload, replay after revocation, key rotation, kill -9 between send and receipt, mTLS authorization and operational exits verified.\n' "$ACKED" "$ACKED2" "$OLD_ACKED"
+printf '\nE2E PASSED: %s + %s + %s signed events anchored by the daemon; weak key refused at registration; single-event and run mode SUCCESS, FAILURE (tamper, re-spelled file, withheld, decoy, missing epoch, forged, revoked key, reordered, curated re-anchor), SUCCESS-INCOMPLETE, oversized payload, replay after revocation, key rotation, kill -9 between send and receipt, reorg between receipt and finality, finality and chain-id pinning, mTLS authorization and operational exits verified.\n' "$ACKED" "$ACKED2" "$OLD_ACKED"

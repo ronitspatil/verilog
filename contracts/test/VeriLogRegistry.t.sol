@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import {Test, stdJson} from "forge-std/Test.sol";
 import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
 import {VeriLogRegistry} from "../src/VeriLogRegistry.sol";
+import {Deploy} from "../script/Deploy.s.sol";
 
 contract VeriLogRegistryTest is Test {
     using stdJson for string;
@@ -12,6 +13,9 @@ contract VeriLogRegistryTest is Test {
         bytes32 indexed agentId, uint256 indexed epochId, bytes32 merkleRoot, uint32 logCount, uint64 timestamp
     );
 
+    event AgentKeyRegistered(bytes32 indexed agentId, bytes32 indexed keyId, bytes32 pubkey, uint64 validFrom);
+    event AgentKeyRevoked(bytes32 indexed agentId, bytes32 indexed keyId, uint64 revokedAt);
+
     VeriLogRegistry internal registry;
     address internal admin = makeAddr("admin");
     address internal anchorer = makeAddr("anchorer");
@@ -19,6 +23,7 @@ contract VeriLogRegistryTest is Test {
 
     bytes32 internal constant AGENT = keccak256("agent-alpha");
     bytes32 internal constant ROOT = keccak256("root");
+    bytes32 internal constant PUBKEY = keccak256("an ed25519 public key");
 
     function setUp() public {
         registry = new VeriLogRegistry(admin, anchorer);
@@ -28,8 +33,16 @@ contract VeriLogRegistryTest is Test {
 
     function test_ConstructorGrantsRoles() public view {
         assertTrue(registry.hasRole(registry.DEFAULT_ADMIN_ROLE(), admin));
+        assertTrue(registry.hasRole(registry.KEY_ADMIN_ROLE(), admin));
         assertTrue(registry.hasRole(registry.ANCHORER_ROLE(), anchorer));
         assertFalse(registry.hasRole(registry.ANCHORER_ROLE(), admin));
+        assertFalse(registry.hasRole(registry.KEY_ADMIN_ROLE(), anchorer));
+        assertFalse(registry.hasRole(registry.DEFAULT_ADMIN_ROLE(), anchorer));
+    }
+
+    function test_ConstructorRejectsAdminAsAnchorer() public {
+        vm.expectRevert(abi.encodeWithSelector(VeriLogRegistry.AnchorerCannotAdminister.selector, admin));
+        new VeriLogRegistry(admin, admin);
     }
 
     function test_ConstructorRejectsZeroAddress() public {
@@ -76,6 +89,187 @@ contract VeriLogRegistryTest is Test {
         );
         vm.prank(anchorer);
         registry.grantRole(role, stranger);
+    }
+
+    // -------------------------------------------------------------- agent keys
+
+    function test_KeyAdminRegistersKey() public {
+        vm.warp(1_800_000_000);
+        bytes32 keyId = keccak256(abi.encodePacked(PUBKEY));
+        vm.expectEmit(true, true, false, true, address(registry));
+        emit AgentKeyRegistered(AGENT, keyId, PUBKEY, 1_800_000_000);
+        vm.prank(admin);
+        assertEq(registry.registerAgentKey(AGENT, PUBKEY), keyId);
+        (bytes32 pub, uint64 validFrom, uint64 revokedAt) = registry.agentKeys(AGENT, keyId);
+        assertEq(pub, PUBKEY);
+        assertEq(validFrom, 1_800_000_000);
+        assertEq(revokedAt, 0);
+        // Keys are per agent.
+        (pub,,) = registry.agentKeys(keccak256("agent-beta"), keyId);
+        assertEq(pub, bytes32(0));
+    }
+
+    function test_KeyAdminRevokesKey() public {
+        vm.warp(1_800_000_000);
+        vm.prank(admin);
+        bytes32 keyId = registry.registerAgentKey(AGENT, PUBKEY);
+        vm.warp(1_800_000_500);
+        vm.expectEmit(true, true, false, true, address(registry));
+        emit AgentKeyRevoked(AGENT, keyId, 1_800_000_500);
+        vm.prank(admin);
+        registry.revokeAgentKey(AGENT, keyId);
+        (bytes32 pub, uint64 validFrom, uint64 revokedAt) = registry.agentKeys(AGENT, keyId);
+        assertEq(pub, PUBKEY);
+        assertEq(validFrom, 1_800_000_000);
+        assertEq(revokedAt, 1_800_000_500);
+    }
+
+    function test_AnchorerCannotRegisterOrRevokeKeys() public {
+        bytes32 role = registry.KEY_ADMIN_ROLE();
+        vm.expectRevert(
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, anchorer, role)
+        );
+        vm.prank(anchorer);
+        registry.registerAgentKey(AGENT, PUBKEY);
+
+        vm.prank(admin);
+        bytes32 keyId = registry.registerAgentKey(AGENT, PUBKEY);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, anchorer, role)
+        );
+        vm.prank(anchorer);
+        registry.revokeAgentKey(AGENT, keyId);
+    }
+
+    function test_StrangerCannotRegisterKeys() public {
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector, stranger, registry.KEY_ADMIN_ROLE()
+            )
+        );
+        vm.prank(stranger);
+        registry.registerAgentKey(AGENT, PUBKEY);
+    }
+
+    function test_AnchorerCanNeverHoldAdminRoles() public {
+        bytes32 keyAdmin = registry.KEY_ADMIN_ROLE();
+        bytes32 defaultAdmin = registry.DEFAULT_ADMIN_ROLE();
+        bytes32 anchorerRole = registry.ANCHORER_ROLE();
+        vm.startPrank(admin);
+        vm.expectRevert(abi.encodeWithSelector(VeriLogRegistry.AnchorerCannotAdminister.selector, anchorer));
+        registry.grantRole(keyAdmin, anchorer);
+        vm.expectRevert(abi.encodeWithSelector(VeriLogRegistry.AnchorerCannotAdminister.selector, anchorer));
+        registry.grantRole(defaultAdmin, anchorer);
+        // ...and the reverse: a key admin cannot be made an anchorer.
+        vm.expectRevert(abi.encodeWithSelector(VeriLogRegistry.AnchorerCannotAdminister.selector, admin));
+        registry.grantRole(anchorerRole, admin);
+        vm.stopPrank();
+        assertFalse(registry.hasRole(keyAdmin, anchorer));
+    }
+
+    function test_KeyAdminRoleCanBeHandedOff() public {
+        // The production hand-off: grant both admin roles to the multisig,
+        // then the deployer renounces its own.
+        address multisig = makeAddr("safe");
+        bytes32 keyAdmin = registry.KEY_ADMIN_ROLE();
+        bytes32 defaultAdmin = registry.DEFAULT_ADMIN_ROLE();
+        vm.startPrank(admin);
+        registry.grantRole(keyAdmin, multisig);
+        registry.grantRole(defaultAdmin, multisig);
+        registry.renounceRole(keyAdmin, admin);
+        registry.renounceRole(defaultAdmin, admin);
+        vm.stopPrank();
+
+        vm.expectRevert(
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, admin, keyAdmin)
+        );
+        vm.prank(admin);
+        registry.registerAgentKey(AGENT, PUBKEY);
+        vm.prank(multisig);
+        registry.registerAgentKey(AGENT, PUBKEY);
+    }
+
+    function test_RegisterKeyErrors() public {
+        vm.startPrank(admin);
+        vm.expectRevert(VeriLogRegistry.ZeroAgentId.selector);
+        registry.registerAgentKey(bytes32(0), PUBKEY);
+        vm.expectRevert(VeriLogRegistry.ZeroPubkey.selector);
+        registry.registerAgentKey(AGENT, bytes32(0));
+        bytes32 keyId = registry.registerAgentKey(AGENT, PUBKEY);
+        vm.expectRevert(abi.encodeWithSelector(VeriLogRegistry.KeyExists.selector, AGENT, keyId));
+        registry.registerAgentKey(AGENT, PUBKEY);
+        // A revoked key cannot be registered again.
+        registry.revokeAgentKey(AGENT, keyId);
+        vm.expectRevert(abi.encodeWithSelector(VeriLogRegistry.KeyExists.selector, AGENT, keyId));
+        registry.registerAgentKey(AGENT, PUBKEY);
+        vm.stopPrank();
+    }
+
+    function test_RevokeKeyErrors() public {
+        bytes32 unknown = keccak256("nope");
+        vm.startPrank(admin);
+        vm.expectRevert(abi.encodeWithSelector(VeriLogRegistry.UnknownKey.selector, AGENT, unknown));
+        registry.revokeAgentKey(AGENT, unknown);
+        bytes32 keyId = registry.registerAgentKey(AGENT, PUBKEY);
+        registry.revokeAgentKey(AGENT, keyId);
+        vm.expectRevert(abi.encodeWithSelector(VeriLogRegistry.KeyAlreadyRevoked.selector, AGENT, keyId));
+        registry.revokeAgentKey(AGENT, keyId);
+        vm.stopPrank();
+    }
+
+    function test_AgentKeyStructUsesTwoSlots() public {
+        vm.warp(1_800_000_000);
+        vm.prank(admin);
+        bytes32 keyId = registry.registerAgentKey(AGENT, PUBKEY);
+        // agentKeys is storage slot 3 (after _roles, agentAnchors and latestEpoch).
+        bytes32 outer = keccak256(abi.encode(AGENT, uint256(3)));
+        bytes32 base = keccak256(abi.encode(keyId, outer));
+        assertEq(vm.load(address(registry), base), PUBKEY);
+        assertEq(uint64(uint256(vm.load(address(registry), bytes32(uint256(base) + 1)))), 1_800_000_000);
+    }
+
+    function testFuzz_KeyIdIsKeccakOfPubkey(bytes32 agent, bytes32 pubkey, uint64 ts) public {
+        vm.assume(agent != bytes32(0) && pubkey != bytes32(0) && ts != 0);
+        vm.warp(ts);
+        vm.prank(admin);
+        bytes32 keyId = registry.registerAgentKey(agent, pubkey);
+        assertEq(keyId, keccak256(abi.encodePacked(pubkey)));
+        (bytes32 stored, uint64 validFrom, uint64 revokedAt) = registry.agentKeys(agent, keyId);
+        assertEq(stored, pubkey);
+        assertEq(validFrom, ts);
+        assertEq(revokedAt, 0);
+        // A different key id under the same agent is unknown.
+        bytes32 other = keccak256(abi.encodePacked(keyId));
+        (stored,,) = registry.agentKeys(agent, other);
+        assertEq(stored, bytes32(0));
+    }
+
+    /// The key_id in the Go-generated signed vectors is keccak256 of the public key,
+    /// which is exactly what registerAgentKey returns.
+    function test_GoSignedVectorsKeyId() public {
+        string memory json = vm.readFile(string.concat(vm.projectRoot(), "/../testdata/signed_vectors.json"));
+        bytes32 pubkey = json.readBytes32(".public_key");
+        bytes32 keyId = json.readBytes32(".key_id");
+        vm.prank(admin);
+        assertEq(registry.registerAgentKey(keccak256(bytes(json.readString(".run[0].agent_id"))), pubkey), keyId);
+        assertEq(json.readBytes32(".run[0].key_id"), keyId);
+    }
+
+    // ------------------------------------------------------------------ deploy script
+
+    function test_DeployScriptKeepsAnchorerOutOfKeyAdmin() public {
+        Deploy script = new Deploy();
+        vm.setEnv("VERILOG_ADMIN", vm.toString(admin));
+        vm.setEnv("VERILOG_ANCHORER", vm.toString(anchorer));
+        VeriLogRegistry deployed = script.run();
+        assertTrue(deployed.hasRole(deployed.KEY_ADMIN_ROLE(), admin));
+        assertTrue(deployed.hasRole(deployed.ANCHORER_ROLE(), anchorer));
+        assertFalse(deployed.hasRole(deployed.KEY_ADMIN_ROLE(), anchorer));
+        assertFalse(deployed.hasRole(deployed.DEFAULT_ADMIN_ROLE(), anchorer));
+
+        vm.setEnv("VERILOG_ANCHORER", vm.toString(admin));
+        vm.expectRevert(bytes("VERILOG_ANCHORER must differ from the admin (the anchorer never holds KEY_ADMIN_ROLE)"));
+        script.run();
     }
 
     // ---------------------------------------------------------------- anchoring

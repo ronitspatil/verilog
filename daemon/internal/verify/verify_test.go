@@ -38,7 +38,8 @@ func setup(t *testing.T) *fixture {
 	client := sim.Client()
 	chainID, _ := client.ChainID(context.Background())
 	opts, _ := bind.NewKeyedTransactorWithChainID(key, chainID)
-	addr, _, reg, err := registry.DeployVeriLogRegistry(opts, client, from, from)
+	admin := common.HexToAddress("0x000000000000000000000000000000000000ad01")
+	addr, _, reg, err := registry.DeployVeriLogRegistry(opts, client, admin, from)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -32,7 +32,8 @@
 // epochs) is a FAILURE, never exit 2.
 //
 //	verilog-verify export --bundle FILE (--index I | --digest 0x...) --out DIR
-//	verilog-verify export --daemon HOST:PORT --agent-id ID --epoch N (--index I | --digest 0x...) --out DIR
+//	verilog-verify export --daemon HOST:PORT --agent-id ID --epoch N (--index I | --digest 0x...) --out DIR \
+//	    --daemon-ca ca.pem --daemon-cert client.pem --daemon-key client-key.pem
 //
 // Before registering an agent key, the key admin checks it:
 //
@@ -45,6 +46,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -335,7 +338,10 @@ func runExport(args []string, stderr io.Writer) error {
 	fs.SetOutput(stderr)
 	bundlePath := fs.String("bundle", "", "evidence bundle file (data-dir/evidence/<agentKey>/epoch-N.json)")
 	daemon := fs.String("daemon", "", "verilogd gRPC address, to fetch the proof with GetProof instead of reading a bundle")
-	daemonCA := fs.String("daemon-ca", "", "PEM CA certificate to connect to --daemon over TLS (plaintext if unset)")
+	daemonCA := fs.String("daemon-ca", "", "PEM CA certificate of the daemon's server certificate (system roots if unset)")
+	daemonCert := fs.String("daemon-cert", "", "PEM client certificate for --daemon (mTLS): an auditor's, or the agent's own")
+	daemonKey := fs.String("daemon-key", "", "PEM private key of --daemon-cert")
+	daemonInsecure := fs.Bool("daemon-insecure", false, "DEV ONLY: connect to --daemon over plaintext")
 	agentID := fs.String("agent-id", "", "agent id (with --daemon)")
 	epoch := fs.Uint64("epoch", 0, "epoch id (with --daemon)")
 	index := fs.Int("index", -1, "leaf index of the event")
@@ -383,13 +389,9 @@ func runExport(args []string, stderr io.Writer) error {
 			}
 			req.Selector = &verilogv1.GetProofRequest_ContentDigest{ContentDigest: d[:]}
 		}
-		creds := insecure.NewCredentials()
-		if *daemonCA != "" {
-			tlsCreds, err := credentials.NewClientTLSFromFile(*daemonCA, "")
-			if err != nil {
-				return fmt.Errorf("--daemon-ca: %w", err)
-			}
-			creds = tlsCreds
+		creds, err := daemonCreds(*daemonCA, *daemonCert, *daemonKey, *daemonInsecure, stderr)
+		if err != nil {
+			return err
 		}
 		conn, err := grpc.NewClient(*daemon, grpc.WithTransportCredentials(creds))
 		if err != nil {
@@ -434,6 +436,40 @@ func runExport(args []string, stderr io.Writer) error {
 	fmt.Fprintf(stderr, "wrote %s and %s\nverify with: verilog-verify --event %s --proof %s %s --rpc <RPC_URL>\n",
 		eventOut, proofOut, eventOut, proofOut, meta)
 	return nil
+}
+
+// daemonCreds returns the transport credentials for export --daemon: mutual
+// TLS (TLS 1.3) by default, plaintext only when asked for explicitly.
+func daemonCreds(caFile, certFile, keyFile string, plaintext bool, stderr io.Writer) (credentials.TransportCredentials, error) {
+	if plaintext {
+		if caFile != "" || certFile != "" || keyFile != "" {
+			return nil, errors.New("--daemon-insecure cannot be combined with --daemon-ca, --daemon-cert or --daemon-key")
+		}
+		fmt.Fprintln(stderr, "warning: --daemon-insecure: connecting over plaintext (development only)")
+		return insecure.NewCredentials(), nil
+	}
+	cfg := &tls.Config{MinVersion: tls.VersionTLS13}
+	if caFile != "" {
+		pem, err := os.ReadFile(caFile)
+		if err != nil {
+			return nil, fmt.Errorf("--daemon-ca: %w", err)
+		}
+		cfg.RootCAs = x509.NewCertPool()
+		if !cfg.RootCAs.AppendCertsFromPEM(pem) {
+			return nil, errors.New("--daemon-ca: no PEM certificates found")
+		}
+	}
+	if (certFile == "") != (keyFile == "") {
+		return nil, errors.New("--daemon-cert and --daemon-key must be set together")
+	}
+	if certFile != "" {
+		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+		if err != nil {
+			return nil, fmt.Errorf("--daemon-cert: %w", err)
+		}
+		cfg.Certificates = []tls.Certificate{cert}
+	}
+	return credentials.NewTLS(cfg), nil
 }
 
 func equalHex(a, b string) bool {

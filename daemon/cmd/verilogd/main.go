@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -16,10 +15,8 @@ import (
 
 	"github.com/ethereum/go-ethereum/ethclient"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
-	"google.golang.org/grpc/keepalive"
 
 	verilogv1 "github.com/ronitspatil/verilog/daemon/gen/verilog/v1"
 	"github.com/ronitspatil/verilog/daemon/internal/anchor"
@@ -142,29 +139,25 @@ func run() (err error) {
 	go func() { defer close(workerDone); worker.Run(engCtx) }()
 
 	// gRPC.
-	lis, err := net.Listen("tcp", cfg.Listen)
+	// Transport security (mTLS) and limits: transport.go.
+	opts, policy, err := transportOptions(cfg.Transport, logger)
 	if err != nil {
 		return err
 	}
-	opts := []grpc.ServerOption{
-		// Far above the payload cap, so an oversized payload is answered with
-		// a per-event rejection instead of failing the whole stream.
-		grpc.MaxRecvMsgSize(ingest.MaxRecvMsgSize(cfg.MaxPayloadBytes)),
-		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{MinTime: 10 * time.Second, PermitWithoutStream: true}),
-		grpc.KeepaliveParams(keepalive.ServerParameters{Time: 30 * time.Second, Timeout: 10 * time.Second}),
+	lis, err := listen(cfg.Listen, cfg.Transport)
+	if err != nil {
+		return err
 	}
-	if cfg.TLSCert != "" {
-		creds, err := credentials.NewServerTLSFromFile(cfg.TLSCert, cfg.TLSKey)
-		if err != nil {
-			return fmt.Errorf("loading TLS certificate: %w", err)
-		}
-		opts = append(opts, grpc.Creds(creds))
-	}
+	// Far above the payload cap, so an oversized payload is answered with
+	// a per-event rejection instead of failing the whole stream.
+	opts = append(opts, grpc.MaxRecvMsgSize(ingest.MaxRecvMsgSize(cfg.MaxPayloadBytes)))
 	srv := grpc.NewServer(opts...)
 	verilogv1.RegisterVeriLogServer(srv, ingest.NewServer(eng, st, ingest.Options{
 		MaxPayloadBytes: cfg.MaxPayloadBytes,
 		Window:          cfg.StreamWindow,
 		Keys:            agentKeys,
+		Authz:           policy,
+		IdleTimeout:     cfg.Transport.StreamIdleTimeout,
 	}, logger))
 	hs := health.NewServer()
 	healthpb.RegisterHealthServer(srv, hs)
@@ -172,7 +165,7 @@ func run() (err error) {
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(lis) }()
-	logger.Info("verilogd listening", "addr", lis.Addr().String(), "tls", cfg.TLSCert != "", "data_dir", cfg.DataDir,
+	logger.Info("verilogd listening", "addr", lis.Addr().String(), "mtls", cfg.Transport.MTLS(), "data_dir", cfg.DataDir,
 		"epoch_interval", cfg.EpochInterval, "epoch_max_logs", cfg.EpochMaxLogs)
 
 	statsTick := time.NewTicker(time.Minute)

@@ -22,7 +22,7 @@ func TestLoadFlagsAndEnv(t *testing.T) {
 		"VERILOG_CONTRACT":       "0x5FbDB2315678afecb367f032d93F642f64180aa3",
 		"VERILOG_EPOCH_INTERVAL": "5s",
 	})
-	c, err := Load([]string{"--rpc", "http://flag", "--epoch-max-logs", "50"}, env, io.Discard)
+	c, err := Load([]string{"--rpc", "http://flag", "--epoch-max-logs", "50", "--insecure-plaintext"}, env, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,7 +35,7 @@ func TestLoadFlagsAndEnv(t *testing.T) {
 }
 
 func TestLoadRejects(t *testing.T) {
-	base := []string{"--rpc", "http://x", "--contract", "0x5FbDB2315678afecb367f032d93F642f64180aa3"}
+	base := []string{"--rpc", "http://x", "--contract", "0x5FbDB2315678afecb367f032d93F642f64180aa3", "--insecure-plaintext"}
 	for _, extra := range [][]string{
 		{"--epoch-interval", "0s"},
 		{"--epoch-max-logs", "0"},

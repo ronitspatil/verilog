@@ -152,6 +152,11 @@ it is broadcast, so the same holds across restarts and crashes.
 Before sending, it also checks whether the agent's latest on-chain epoch
 already holds this root (a crash after confirmation but before the
 checkpoint) and, if so, recovers that epoch instead of anchoring again.
+A mined anchor then waits for finality (`--finality`); only a final anchor,
+re-read at the final block, gets its bundle, checkpoint and WAL compaction.
+The next epoch is sent meanwhile, with a nonce above every anchor awaiting
+finality, and a reorged-out anchor is sent again with its own nonce (see
+[operations](operations.md#finality-and-reorgs)).
 
 ## Contract
 

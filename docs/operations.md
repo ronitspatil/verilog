@@ -121,6 +121,9 @@ Flags win over environment variables.
 | `--epoch-interval` | `VERILOG_EPOCH_INTERVAL` | `30s` | seal every open epoch this often |
 | `--epoch-max-logs` | `VERILOG_EPOCH_MAX_LOGS` | `1000` | seal an agent's epoch at this size |
 | `--confirm-timeout` | `VERILOG_CONFIRM_TIMEOUT` | `2m` | receipt wait before retrying |
+| `--finality` | `VERILOG_FINALITY` | `finalized` | when an anchor is final: `finalized`, `safe` or `depth:N` ([Finality](#finality-and-reorgs)) |
+| `--finality-poll` | `VERILOG_FINALITY_POLL` | `5s` | how often the oldest anchor awaiting finality is checked |
+| `--finality-timeout` | `VERILOG_FINALITY_TIMEOUT` | `30m` | log ERROR (and again each period) when an anchor is not final this long after it was mined |
 | `--retry-initial`, `--retry-max` | | `1s`, `60s` | anchoring backoff bounds |
 | `--wal-segment-bytes` | `VERILOG_WAL_SEGMENT_BYTES` | 64 MiB | WAL rotation size |
 | `--commit-batch` | | `4096` | max events per fsync |
@@ -243,13 +246,61 @@ defaults are effectively no ceiling, so lower them.
 
 Before broadcasting, the daemon writes the transaction (hash of every
 version, nonce, fees, signed bytes, agent and root) atomically to
-`<data-dir>/anchor-pending.json`, and removes it once the receipt is
-processed. After a crash or restart it re-checks that record before sending
-anything: if a version was mined it resumes from that receipt; if not, it
-replaces the transaction with the same nonce, so the root is anchored at most
-once. A record made for another chain, contract or signer address is renamed
+`<data-dir>/anchor-pending.json`. Once mined, the transaction moves to the
+record's `mined` list (with its block number and hash) until the anchor is
+final and its bundle is written; the file is removed when both are empty.
+After a crash or restart the daemon re-checks that record before sending
+anything: a mined anchor is resumed and still waits for finality; if no
+version was mined it replaces the transaction with the same nonce, so the
+root is anchored at most once. A record made for another chain, contract or signer address is renamed
 to `anchor-pending.json.stale` with a warning; an unreadable record stops the
 daemon until you inspect it.
+
+### Finality and reorgs
+
+A mined anchor is not yet final: a reorg can remove it. The daemon therefore
+keeps an epoch's events in the WAL until its anchor is **final**. Only then does
+it re-read `agentAnchors(agent, epoch)` at the final block, check the root and
+count, write the evidence bundle (with `block_number`, `block_hash`,
+`finality` and `final_block_number`/`final_block_hash`), advance the
+checkpoint and compact the WAL.
+
+| `--finality` | Final when | Notes |
+|---|---|---|
+| `finalized` (default) | the block is at or below the RPC's `finalized` tag | strongest; the daemon refuses to start if the endpoint does not serve the tag |
+| `safe` | at or below the `safe` tag | faster, weaker |
+| `depth:N` | N blocks are built on it | for chains without the tags, and for anvil (`depth:2` in the e2e); `depth:0` is development only |
+
+Recommended settings:
+
+- **Ethereum L1**: `finalized` (about 13 minutes, two epochs).
+- **OP Stack (Optimism, Base)**: `finalized` means the L2 block's batch is in
+  a finalized L1 block (tens of minutes); `safe` means the batch is posted to
+  L1 but that L1 block is not final yet (minutes), so it survives a sequencer
+  reorg but not a deep L1 reorg. Use `finalized` for evidence; `safe` only if
+  you accept that window.
+- **Arbitrum**: `finalized` follows the L1 finality of the batch (tens of
+  minutes); `safe` follows the batch's L1 inclusion, without L1 finality. The
+  same trade-off applies.
+
+Sending does not wait for finality: the next epoch's transaction goes out as
+soon as the previous one is mined, so a slow finality rule delays the bundles
+and WAL compaction, not anchoring, sealing or ingest. Nonce order stays safe:
+a new transaction never takes a nonce at or below an anchor awaiting
+finality, and every transaction is recorded before broadcast.
+
+**Reorgs.** When the anchorer key's nonce on the canonical chain drops below
+a mined anchor's nonce, the anchor was reorged out. The daemon logs
+`anchor: reorg removed the anchor transaction; sending it again` at WARN with
+the old block number and hash and the block now at that height, and sends the
+same signed transaction again (after a few checks, a same-nonce replacement
+with higher fees). A transaction re-mined in another block is logged as
+`reorg moved the anchor transaction to another block`. If the anchor's nonce
+was taken by another transaction in a final block (another user of the key),
+or the anchor read at the final block does not match the receipt, it logs
+ERROR and anchors the epoch again. None of this loses events, since nothing
+is compacted before finality. An anchor not final after
+`--finality-timeout` is logged at ERROR and keeps waiting.
 
 ## Transport security (mTLS)
 
@@ -429,12 +480,32 @@ bin/verilog-verify export --bundle /var/lib/verilog/evidence/<agentKey>/epoch-3.
 
 # Single-event mode.
 bin/verilog-verify --event case-42/event.json --proof case-42/proof.json \
-    --epoch 3 --agent-id support-bot --rpc "$RPC" --contract 0xRegistry
+    --epoch 3 --agent-id support-bot --rpc "$RPC" --contract 0xRegistry --chain-id 1
 
 # Run mode: a whole run (its run_id is in every event) from a copy of all the agent's evidence bundles.
 bin/verilog-verify --run-id 01a0f526-62a8-7390-aefb-ba42851014ac --bundles ./evidence/<agentKey> \
-    --agent-id support-bot --rpc "$RPC" --contract 0xRegistry
+    --agent-id support-bot --rpc "$RPC" --contract 0xRegistry --chain-id 1
 ```
+
+Every verification is pinned to one chain and one block:
+
+- `--chain-id N` (or `VERILOG_CHAIN_ID`) is **required**. If the endpoint's
+  `eth_chainId` differs, the verifier exits 2 without a verdict. (A verdict
+  read from the wrong chain, such as a testnet deployment at the same address,
+  would look exactly like a real one, so there is no default.)
+- `--finality finalized|safe|latest|depth:N` (default `finalized`) picks the
+  block every read uses: `agentAnchors`, `latestEpoch`, `agentKeys` and
+  `verifyAnchoredLeaf`. Its number and hash are printed on stderr
+  (`chain: id …, verdict at block …`). If that block is reorganized during
+  the run, the verifier exits 2.
+- Single-event mode: an epoch anchored at the head but not at the final block
+  is **not anchored yet** (exit 2, retry later). An epoch anchored nowhere is
+  still a FAILURE.
+- Run mode: the verdict covers the final epochs `1..latestEpoch` at the final
+  block. Bundles of later, not yet final epochs are set aside with a warning,
+  unless one matches its anchor at the head and holds events of the run: then
+  the run is not anchored yet (exit 2), because those events could still change
+  the verdict once final.
 
 **Single-event mode** succeeds when:
 

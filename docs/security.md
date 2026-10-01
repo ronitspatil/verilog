@@ -25,6 +25,7 @@ key file the key itself must be treated as stolen.
 | Get a small-order public key registered, which verifies any signature | **Closed**: refused by the registry, `keycheck`, the daemon and the verifier |
 | Network attacker: read events in transit, forge acks, or connect to the daemon | **Closed** by mutual TLS (TLS 1.3, client certificates required); the SDK also rejects acks whose digest is not the event's |
 | A client reads another agent's events with `GetProof`, submits events for another agent, or floods key lookups and connections (finding M5) | **Closed**: callers are authorized by certificate identity before any work (agents: their own `agent_id`; auditors: read only); bounded key cache with per-agent limits on unknown keys, connection and stream limits |
+| A reorg, or one RPC endpoint serving a short-lived fork, removes an anchor after the daemon compacted its WAL; the verifier trusts non-final or wrong-chain state (finding M7) | **Closed**: the daemon compacts and writes the bundle only once the anchor is final (`--finality`) and re-read at the final block, and sends reorged-out anchors again; the verifier requires `--chain-id` and pins every read to the final block |
 | Truncate a run's tail | **Detected** as "no terminal event", but it cannot be told apart from an agent crash |
 | Suppress a whole run, never anchor it, or delay it | **Not closed**: needs an external witness |
 | Compromised agent host or stolen signing key; payload truthfulness; trusted time | **Not closed**: non-repudiation binds to the key holder, and anchor time is only an upper bound |
@@ -110,10 +111,15 @@ State these explicitly in an audit.
   certificate revocation list: keep client certificates short-lived and
   rotate CAs with overlap ([operations](operations.md#transport-security-mtls)).
   `--insecure-plaintext` turns all of this off and is for development only.
-- **Finality.** An epoch counts as anchored after one successful receipt, with
-  no extra confirmation depth, so a deep reorg could drop an anchor the daemon
-  has already checkpointed. Use a chain with fast finality, or verify after
-  finality.
+- **Finality is only as good as the rule and the RPC.** An anchor counts once
+  it is final under `--finality` (default `finalized`). A reorg deeper than
+  `depth:N`, or a chain's own finality failing, is not covered, and the daemon
+  and verifier each trust a single RPC endpoint for the final block and the
+  chain id: a lying endpoint can still delay anchoring or make the verifier
+  answer from its fork. Point the verifier at an endpoint you trust, or
+  compare several; a multi-RPC quorum is a possible follow-up. Until an
+  anchor is final its events stay in the WAL (nothing is lost), and a slow
+  one is logged at ERROR after `--finality-timeout`.
 - **fsync semantics.** Durability is whatever the OS's `fsync` provides. On
   macOS that does not flush the drive's write cache (`F_FULLFSYNC` is not
   used); on Linux it does.
@@ -132,8 +138,9 @@ State these explicitly in an audit.
   Nothing is lost, but events stay unanchored, and so not yet
   tamper-evident, until fees fall or the ceiling is raised.
 - **One daemon per data directory and signer.** The daemon locks its data
-  directory, and the in-flight anchor transaction is recorded there so a
-  restart never anchors a root twice. Two daemons using the same signer key
+  directory, and the in-flight anchor transaction and every anchor awaiting finality are
+  recorded there, so a restart never anchors a root twice and still confirms
+  finality before compacting. Two daemons using the same signer key
   with different data directories would still race on nonces, and deleting
   `anchor-pending.json` while a transaction is in flight gives up that
   protection.

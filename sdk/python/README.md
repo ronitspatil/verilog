@@ -8,7 +8,10 @@ the agent.
 from verilog_sdk import VeriLogLangGraphCallback
 
 # The agent's signing key comes from VERILOG_SIGNING_KEY_FILE (or VERILOG_SIGNING_KEY).
-handler = VeriLogLangGraphCallback(agent_id="support-bot", target="127.0.0.1:50051")
+# verilogd requires mutual TLS: the agent's client certificate has the URI SAN
+# verilog://agent/support-bot. Plaintext needs insecure=True (development only).
+handler = VeriLogLangGraphCallback(agent_id="support-bot", target="daemon.internal:50051",
+                                   tls_ca="server-ca.pem", tls_cert="support-bot.pem", tls_key="support-bot-key.pem")
 graph.invoke(inputs, config={"callbacks": [handler]})
 handler.close()  # end open runs, flush and stop the background sender
 ```
@@ -84,7 +87,8 @@ Use `VeriLogClient` directly for non-LangChain agents:
 ```python
 from verilog_sdk import VeriLogClient
 
-with VeriLogClient("127.0.0.1:50051") as client:
+with VeriLogClient("daemon.internal:50051", tls_ca="server-ca.pem",
+                   tls_cert="agent-1.pem", tls_key="agent-1-key.pem") as client:
     client.submit("agent-1", run_id="run-42", event_type="tool_call", payload={"tool": "search"})
     client.submit("agent-1", run_id="run-42", event_type="run_end", payload={"status": "ok"})
 ```

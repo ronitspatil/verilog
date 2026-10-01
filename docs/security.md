@@ -23,6 +23,8 @@ key file the key itself must be treated as stolen.
 | Replay an agent's events after its key is revoked | **Closed**: the daemon leaves them out at seal time, and a replayed copy anchored anyway only warns |
 | Register its own key to sign forgeries | **Closed**: only `KEY_ADMIN_ROLE` registers keys, and the anchorer can never hold it |
 | Get a small-order public key registered, which verifies any signature | **Closed**: refused by the registry, `keycheck`, the daemon and the verifier |
+| Network attacker: read events in transit, forge acks, or connect to the daemon | **Closed** by mutual TLS (TLS 1.3, client certificates required); the SDK also rejects acks whose digest is not the event's |
+| A client reads another agent's events with `GetProof`, submits events for another agent, or floods key lookups and connections (finding M5) | **Closed**: callers are authorized by certificate identity before any work (agents: their own `agent_id`; auditors: read only); bounded key cache with per-agent limits on unknown keys, connection and stream limits |
 | Truncate a run's tail | **Detected** as "no terminal event", but it cannot be told apart from an agent crash |
 | Suppress a whole run, never anchor it, or delay it | **Not closed**: needs an external witness |
 | Compromised agent host or stolen signing key; payload truthfulness; trusted time | **Not closed**: non-repudiation binds to the key holder, and anchor time is only an upper bound |
@@ -102,10 +104,12 @@ State these explicitly in an audit.
   de-duplicated within an open epoch; a retransmission that arrives after its
   epoch was sealed is committed again (same digest, new leaf). Run mode
   counts it once, at its earliest anchored copy that verifies.
-- **No transport authentication.** Any client that can reach the port can
-  submit events, but only events signed with a registered key are accepted.
-  Bind to localhost or a private network and use `--tls-cert/--tls-key`.
-  Mutual TLS is not implemented.
+- **Transport identity is per agent, not per run.** A client certificate for
+  `verilog://agent/<id>` authorizes every event of that agent; whoever holds
+  it (and the agent's signing key) can submit as that agent. There is no
+  certificate revocation list: keep client certificates short-lived and
+  rotate CAs with overlap ([operations](operations.md#transport-security-mtls)).
+  `--insecure-plaintext` turns all of this off and is for development only.
 - **Finality.** An epoch counts as anchored after one successful receipt, with
   no extra confirmation depth, so a deep reorg could drop an anchor the daemon
   has already checkpointed. Use a chain with fast finality, or verify after

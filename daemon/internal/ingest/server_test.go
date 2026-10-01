@@ -51,6 +51,7 @@ type envOptions struct {
 	server []grpc.ServerOption              // e.g. grpc.Creds for mTLS
 	client credentials.TransportCredentials // creds of env.client (insecure if nil)
 	opts   Options                          // Authz and IdleTimeout are used
+	limits engine.Limits
 }
 
 // fakeKeys is an in-memory key registry: keyID -> key, for every agent.
@@ -90,7 +91,7 @@ func newEnvWith(t *testing.T, o envOptions) *env {
 	}
 	st, _ := store.Open(dir)
 	sink := &jobSink{}
-	eng, err := engine.New(engine.Config{EpochInterval: time.Hour, EpochMaxLogs: 1 << 20}, w, st, sink, nil)
+	eng, err := engine.New(engine.Config{EpochInterval: time.Hour, EpochMaxLogs: 1 << 20, Limits: o.limits}, w, st, sink, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

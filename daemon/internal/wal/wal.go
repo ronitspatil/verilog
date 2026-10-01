@@ -317,6 +317,9 @@ func (l *Log) Append(recs []Record) ([]Loc, error) {
 	n, err := l.f.Write(l.buf.Bytes())
 	l.size += int64(n)
 	active.size = l.size
+	if l.buf.Cap() > 4<<20 {
+		l.buf = bytes.Buffer{} // do not keep a large batch's buffer
+	}
 	if err != nil {
 		l.failed = fmt.Errorf("wal: write failed, log is read-only until restart: %w", err)
 		return nil, l.failed

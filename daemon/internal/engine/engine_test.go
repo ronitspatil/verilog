@@ -51,6 +51,13 @@ type harness struct {
 
 func start(t *testing.T, dir string, cfg Config) *harness {
 	t.Helper()
+	return startWith(t, dir, cfg, nil)
+}
+
+// startWith starts an engine whose sealed epochs go to enq (the harness's
+// job sink if nil).
+func startWith(t *testing.T, dir string, cfg Config, enq Enqueuer) *harness {
+	t.Helper()
 	w, err := wal.Open(dir+"/wal", 1<<20, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -60,7 +67,10 @@ func start(t *testing.T, dir string, cfg Config) *harness {
 		t.Fatal(err)
 	}
 	sink := &jobSink{}
-	eng, err := New(cfg, w, st, sink, nil)
+	if enq == nil {
+		enq = sink
+	}
+	eng, err := New(cfg, w, st, enq, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -32,7 +32,7 @@ def _events(daemon):
 
 
 def test_records_real_langchain_run(fake_daemon):
-    handler = VeriLogLangGraphCallback("agent-lc", target=fake_daemon.target)
+    handler = VeriLogLangGraphCallback("agent-lc", target=fake_daemon.target, insecure=True)
     out = build_chain().invoke({"question": "where?"}, config={"callbacks": [handler]})
     assert out == "sunny in Paris"
     assert handler.flush(timeout=10)
@@ -65,7 +65,7 @@ def test_records_real_langchain_run(fake_daemon):
 
 
 def test_step_numbers_restart_per_root_run(fake_daemon):
-    handler = VeriLogLangGraphCallback("agent-lc", target=fake_daemon.target)
+    handler = VeriLogLangGraphCallback("agent-lc", target=fake_daemon.target, insecure=True)
     chain = build_chain()
     chain.invoke({"question": "a"}, config={"callbacks": [handler]})
     first_run = len(fake_daemon.events) if handler.flush(10) else None
@@ -81,7 +81,7 @@ def test_step_numbers_restart_per_root_run(fake_daemon):
 
 
 def test_errors_are_recorded(fake_daemon):
-    handler = VeriLogLangGraphCallback("agent-lc", target=fake_daemon.target)
+    handler = VeriLogLangGraphCallback("agent-lc", target=fake_daemon.target, insecure=True)
 
     def boom(_):
         raise RuntimeError("tool exploded")
@@ -98,7 +98,7 @@ def test_errors_are_recorded(fake_daemon):
 
 
 def test_handler_is_cheap_with_daemon_down():
-    handler = VeriLogLangGraphCallback("agent-x", target=unused_target(), queue_size=50)
+    handler = VeriLogLangGraphCallback("agent-x", target=unused_target(), insecure=True, queue_size=50)
     run_id = uuid.uuid4()
     start = time.perf_counter()
     for i in range(2_000):
@@ -110,7 +110,7 @@ def test_handler_is_cheap_with_daemon_down():
 
 
 def test_shared_client_and_bad_inputs_never_raise(fake_daemon):
-    client = VeriLogClient(fake_daemon.target)
+    client = VeriLogClient(fake_daemon.target, insecure=True)
     handler = VeriLogLangGraphCallback("agent-y", client=client)
     # Odd, non-JSON inputs are converted, not raised.
     handler.on_chain_start({"id": ["x", "MyChain"]}, {"obj": object(), "nan": float("nan"), "b": b"xx"},
@@ -124,7 +124,7 @@ def test_shared_client_and_bad_inputs_never_raise(fake_daemon):
 
 
 def test_async_handler_with_ainvoke(fake_daemon):
-    handler = AsyncVeriLogLangGraphCallback("agent-async", target=fake_daemon.target)
+    handler = AsyncVeriLogLangGraphCallback("agent-async", target=fake_daemon.target, insecure=True)
 
     async def main():
         return await build_chain().ainvoke({"question": "q"}, config={"callbacks": [handler]})
@@ -137,7 +137,7 @@ def test_async_handler_with_ainvoke(fake_daemon):
 
 
 def test_sync_handler_with_ainvoke(fake_daemon):
-    handler = VeriLogLangGraphCallback("agent-mixed", target=fake_daemon.target)
+    handler = VeriLogLangGraphCallback("agent-mixed", target=fake_daemon.target, insecure=True)
 
     async def main():
         return await build_chain().ainvoke({"question": "q"}, config={"callbacks": [handler]})
@@ -151,7 +151,7 @@ def test_sync_handler_with_ainvoke(fake_daemon):
 
 
 def test_close_ends_open_runs(fake_daemon):
-    handler = VeriLogLangGraphCallback("agent-open", target=fake_daemon.target)
+    handler = VeriLogLangGraphCallback("agent-open", target=fake_daemon.target, insecure=True)
     root = uuid.uuid4()
     handler.on_chain_start({"name": "outer"}, {"x": 1}, run_id=root)
     handler.on_tool_start({"name": "t"}, "in", run_id=uuid.uuid4(), parent_run_id=root)

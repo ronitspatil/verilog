@@ -8,8 +8,6 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/ethereum/go-ethereum/accounts/abi/bind"
-
 	"github.com/ronitspatil/verilog/daemon/internal/canonical"
 	"github.com/ronitspatil/verilog/daemon/internal/merkle"
 )
@@ -98,7 +96,7 @@ func (v *Verifier) Run(ctx context.Context, in RunInput) (*RunReport, error) {
 	}
 	warn := func(format string, a ...any) { rep.Warnings = append(rep.Warnings, fmt.Sprintf(format, a...)) }
 
-	latestBig, err := v.reg.LatestEpoch(&bind.CallOpts{Context: ctx}, agentKey)
+	latestBig, err := v.reg.LatestEpoch(v.call(ctx, v.at), agentKey)
 	if err != nil {
 		return nil, opErr("RPC error reading latestEpoch: %v", err)
 	}
@@ -107,6 +105,15 @@ func (v *Verifier) Run(ctx context.Context, in RunInput) (*RunReport, error) {
 	}
 	latest := latestBig.Uint64()
 	rep.AgentEpochs = latest
+	// The verdict is reached on the final epochs 1..latest only. Epochs
+	// anchored after the final block may still be reorged away: one that
+	// holds events of the run makes the run "not anchored yet" (no verdict);
+	// others are set aside with a warning.
+	finalEvidence, err := v.setAsideNotFinal(ctx, agentKey, in.RunID, latest, in.Epochs, warn)
+	if err != nil {
+		return nil, err
+	}
+	in.Epochs = finalEvidence
 	if latest == 0 {
 		return fail("no epoch is anchored on chain for agent key %s, so run %q was never anchored", agentKey.Hex(), in.RunID)
 	}
@@ -377,4 +384,55 @@ func ranges(ns []uint64) string {
 		i = j + 1
 	}
 	return strings.Join(parts, ", ")
+}
+
+// setAsideNotFinal removes from evidence the bundles of epochs anchored at
+// the head but not at the final block (latestFinal). If one of them matches
+// its head anchor and holds events of the run, the run cannot be judged yet:
+// an *OperationalError. Without a pinned final block nothing is set aside.
+func (v *Verifier) setAsideNotFinal(ctx context.Context, agentKey canonical.Digest, runID string, latestFinal uint64,
+	evidence []EpochEvidence, warn func(string, ...any)) ([]EpochEvidence, error) {
+	if v.at == nil {
+		return evidence, nil
+	}
+	headBig, err := v.reg.LatestEpoch(v.call(ctx, nil), agentKey)
+	if err != nil {
+		return nil, opErr("RPC error reading latestEpoch: %v", err)
+	}
+	if !headBig.IsUint64() || headBig.Uint64() <= latestFinal {
+		return evidence, nil
+	}
+	headLatest := headBig.Uint64()
+	var kept []EpochEvidence
+	var pending []uint64
+	for _, e := range evidence {
+		if (e.AgentKey != nil && *e.AgentKey != agentKey) || e.EpochID <= latestFinal || e.EpochID > headLatest {
+			kept = append(kept, e)
+			continue
+		}
+		anc, err := v.headAnchor(ctx, agentKey, e.EpochID)
+		if err != nil {
+			return nil, err
+		}
+		if matchAnchor(e.Events, anc) == "" && holdsRun(e.Events, runID, agentKey) {
+			pending = append(pending, e.EpochID)
+			continue
+		}
+		warn("ignored %s: epoch %d is not final at block %s", e.Source, e.EpochID, v.at)
+	}
+	if len(pending) > 0 {
+		sort.Slice(pending, func(i, j int) bool { return pending[i] < pending[j] })
+		return nil, opErr("epoch(s) %s hold events of run %q but are not final at block %s (final epochs: 1-%d): "+
+			"the run is not anchored yet; retry once they are final (see --finality)", ranges(pending), runID, v.at, latestFinal)
+	}
+	return kept, nil
+}
+
+func holdsRun(events [][]byte, runID string, agentKey canonical.Digest) bool {
+	for _, raw := range events {
+		if ev, err := canonical.ParseEvent(raw); err == nil && ev.RunID == runID && canonical.AgentKey(ev.AgentID) == agentKey {
+			return true
+		}
+	}
+	return false
 }

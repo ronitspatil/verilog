@@ -63,23 +63,43 @@ var testReq = Request{
 	Count:    3,
 }
 
-func readRecord(t *testing.T, path string) pendingRecord {
+func readFile(t *testing.T, path string) pendingFile {
 	t.Helper()
 	b, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("pending record: %v", err)
 	}
-	var r pendingRecord
-	if err := json.Unmarshal(b, &r); err != nil {
+	var f pendingFile
+	if err := json.Unmarshal(b, &f); err != nil {
 		t.Fatal(err)
 	}
-	return r
+	if f.Version != pendingVersion {
+		t.Fatalf("record version %d", f.Version)
+	}
+	return f
+}
+
+// readRecord returns the in-flight transaction of the pending record.
+func readRecord(t *testing.T, path string) txRecord {
+	t.Helper()
+	f := readFile(t, path)
+	if f.Pending == nil {
+		t.Fatalf("no in-flight transaction in %+v", f)
+	}
+	return *f.Pending
 }
 
 // checkAnchoredOnce asserts the agent has exactly one epoch and the
 // anchorer used exactly one nonce after the deployment.
-func checkAnchoredOnce(t *testing.T, env *simEnv, pendingFile string) {
+func checkAnchoredOnce(t *testing.T, env *simEnv, c *EthChain, pendingFile string) {
 	t.Helper()
+	// The mined anchor is recorded (awaiting finality) until released.
+	if f := readFile(t, pendingFile); f.Pending != nil || len(f.Mined) != 1 || f.Mined[0].Root != testReq.Root || f.Mined[0].EpochID != 1 {
+		t.Fatalf("record after mining: %+v", f)
+	}
+	if err := c.Release(testReq); err != nil {
+		t.Fatal(err)
+	}
 	time.Sleep(300 * time.Millisecond) // let any second transaction be mined
 	ctx := context.Background()
 	latest, err := env.reg.LatestEpoch(&bind.CallOpts{Context: ctx}, testReq.AgentKey)
@@ -91,7 +111,7 @@ func checkAnchoredOnce(t *testing.T, env *simEnv, pendingFile string) {
 		t.Fatalf("anchorer nonce = %d (%v), want 2", nonce, err)
 	}
 	if _, err := os.Stat(pendingFile); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("pending record not removed after confirmation: %v", err)
+		t.Fatalf("pending record not removed after release: %v", err)
 	}
 }
 
@@ -134,7 +154,7 @@ func TestRestartBetweenSendAndReceiptReplacesWithSameNonce(t *testing.T) {
 	if !strings.Contains(logs.String(), "resuming pending transaction") || !strings.Contains(logs.String(), "replaces=1") {
 		t.Fatalf("logs:\n%s", logs)
 	}
-	checkAnchoredOnce(t, env, file)
+	checkAnchoredOnce(t, env, second, file)
 	if _, err := env.client.TransactionReceipt(ctx, rec.TxHash); !errors.Is(err, ethereum.NotFound) {
 		t.Fatalf("the replaced transaction was mined too: %v", err)
 	}
@@ -166,7 +186,7 @@ func TestRestartAfterMinedResumesFromReceipt(t *testing.T) {
 	if err != nil || res.EpochID != 1 || res.TxHash != rec.TxHash.Hex() {
 		t.Fatalf("result %+v %v, want epoch 1 from %s", res, err, rec.TxHash)
 	}
-	checkAnchoredOnce(t, env, file)
+	checkAnchoredOnce(t, env, second, file)
 }
 
 // The daemon dies after persisting the transaction but before the node got
@@ -189,7 +209,7 @@ func TestRestartAfterPersistBeforeBroadcast(t *testing.T) {
 	if res, err := second.Anchor(ctx, testReq); err != nil || res.EpochID != 1 {
 		t.Fatalf("result %+v %v", res, err)
 	}
-	checkAnchoredOnce(t, env, file)
+	checkAnchoredOnce(t, env, second, file)
 }
 
 func TestPendingRecordForAnotherSignerIsSetAside(t *testing.T) {
@@ -257,7 +277,7 @@ func TestFeeCeiling(t *testing.T) {
 	if err != nil || res.EpochID != 1 {
 		t.Fatalf("result %+v %v", res, err)
 	}
-	checkAnchoredOnce(t, env, file)
+	checkAnchoredOnce(t, env, c, file)
 }
 
 func TestApplyCeiling(t *testing.T) {

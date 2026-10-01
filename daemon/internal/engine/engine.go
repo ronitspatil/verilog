@@ -11,8 +11,10 @@
 //	   re-check the agent keys on chain and leave out events whose key's
 //	   revocation is already in effect (they could never verify),
 //	   build the root, commit a "sealed" WAL record, enqueue an anchor job.
-//	anchor worker ── anchors sealed epochs one at a time, then finalize():
-//	   write the evidence bundle, advance the checkpoint, compact the WAL.
+//	anchor worker ── anchors sealed epochs one at a time and, once an anchor
+//	   is final (--finality), calls finalize(): write the evidence bundle,
+//	   advance the checkpoint, compact the WAL. Nothing is compacted before
+//	   the anchor is final, so a reorg can never lose events.
 //
 // Durability: an event is acknowledged only after its WAL record is fsynced.
 // On restart, Recover replays the WAL: sealed-but-unanchored epochs are
@@ -688,22 +690,27 @@ func (e *Engine) enqueueAnchor(b *sealedEpoch) {
 	})
 }
 
-// finalize persists the evidence bundle and advances the checkpoint.
+// finalize persists the evidence bundle and advances the checkpoint. The
+// anchor worker calls it only once the anchor is final.
 func (e *Engine) finalize(b *sealedEpoch, res anchor.Result) error {
 	bundle := &store.Bundle{
-		Version:     store.BundleVersion,
-		HashScheme:  store.HashScheme,
-		AgentID:     b.agentID,
-		AgentKey:    b.agentKey.Hex(),
-		EpochID:     res.EpochID,
-		MerkleRoot:  canonical.Digest(b.tree.Root()).Hex(),
-		LogCount:    len(b.entries),
-		ChainID:     e.cfg.ChainID,
-		Contract:    e.cfg.Contract,
-		TxHash:      res.TxHash,
-		BlockNumber: res.BlockNumber,
-		AnchoredAt:  time.Now().UTC(),
-		Events:      make([]store.EventProof, len(b.entries)),
+		Version:          store.BundleVersion,
+		HashScheme:       store.HashScheme,
+		AgentID:          b.agentID,
+		AgentKey:         b.agentKey.Hex(),
+		EpochID:          res.EpochID,
+		MerkleRoot:       canonical.Digest(b.tree.Root()).Hex(),
+		LogCount:         len(b.entries),
+		ChainID:          e.cfg.ChainID,
+		Contract:         e.cfg.Contract,
+		TxHash:           res.TxHash,
+		BlockNumber:      res.BlockNumber,
+		BlockHash:        res.BlockHash,
+		Finality:         res.Finality,
+		FinalBlockNumber: res.FinalBlockNumber,
+		FinalBlockHash:   res.FinalBlockHash,
+		AnchoredAt:       time.Now().UTC(),
+		Events:           make([]store.EventProof, len(b.entries)),
 	}
 	for i, en := range b.entries {
 		proof, err := b.tree.Proof(i)
@@ -748,6 +755,7 @@ func (e *Engine) finalize(b *sealedEpoch, res anchor.Result) error {
 
 	e.anchored.Add(1)
 	e.log.Info("engine: epoch anchored", "agent", b.agentID, "epoch", res.EpochID, "events", len(b.entries), "tx", res.TxHash, "block", res.BlockNumber,
+		"block_hash", res.BlockHash, "finality", res.Finality, "final_block", res.FinalBlockNumber,
 		"bundle", e.store.BundlePath(bundle.AgentKey, bundle.EpochID))
 
 	if n, err := e.wal.Compact(e.anchoredSeq); err != nil {

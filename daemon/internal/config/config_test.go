@@ -32,6 +32,23 @@ func TestLoadFlagsAndEnv(t *testing.T) {
 	if c.Contract.Hex() != "0x5FbDB2315678afecb367f032d93F642f64180aa3" {
 		t.Fatalf("contract %s", c.Contract.Hex())
 	}
+	if c.Finality.String() != "finalized" || c.FinalityPoll != 5*time.Second || c.FinalityTimeout != 30*time.Minute {
+		t.Fatalf("finality defaults %v %v %v", c.Finality, c.FinalityPoll, c.FinalityTimeout)
+	}
+}
+
+func TestLoadFinality(t *testing.T) {
+	base := []string{"--rpc", "http://x", "--contract", "0x5FbDB2315678afecb367f032d93F642f64180aa3", "--insecure-plaintext"}
+	for flag, want := range map[string]string{"finalized": "finalized", "safe": "safe", "depth:12": "depth:12", "depth:0": "depth:0"} {
+		c, err := Load(append(append([]string{}, base...), "--finality", flag), envOf(nil), io.Discard)
+		if err != nil || c.Finality.String() != want {
+			t.Errorf("--finality %s: %v %v", flag, c, err)
+		}
+	}
+	c, err := Load(base, envOf(map[string]string{"VERILOG_FINALITY": "depth:2", "VERILOG_FINALITY_POLL": "250ms"}), io.Discard)
+	if err != nil || c.Finality.String() != "depth:2" || c.FinalityPoll != 250*time.Millisecond {
+		t.Fatalf("env: %+v %v", c, err)
+	}
 }
 
 func TestLoadRejects(t *testing.T) {
@@ -43,6 +60,12 @@ func TestLoadRejects(t *testing.T) {
 		{"--contract", "nope"},
 		{"stray"},
 		{"--tls-cert", "cert.pem"},
+		{"--finality", "latest"},
+		{"--finality", "depth:"},
+		{"--finality", "depth:-1"},
+		{"--finality", "final"},
+		{"--finality-poll", "0s"},
+		{"--finality-timeout", "soon"},
 	} {
 		if _, err := Load(append(append([]string{}, base...), extra...), envOf(nil), io.Discard); err == nil {
 			t.Errorf("accepted %v", extra)

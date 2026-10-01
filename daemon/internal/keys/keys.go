@@ -9,6 +9,7 @@ package keys
 import (
 	"context"
 	"crypto/ed25519"
+	"math/big"
 	"sync"
 	"time"
 
@@ -74,7 +75,24 @@ func NewChainSource(addr common.Address, backend bind.ContractCaller) (*ChainSou
 
 // AgentKey implements Source.
 func (c *ChainSource) AgentKey(ctx context.Context, agentKey, keyID canonical.Digest) (Key, error) {
-	out, err := c.reg.AgentKeys(&bind.CallOpts{Context: ctx}, agentKey, keyID)
+	return c.agentKeyAt(ctx, nil, agentKey, keyID)
+}
+
+// At returns a Source that reads the keys as of block (nil: the head). The
+// verifier pins it to the final block.
+func (c *ChainSource) At(block *big.Int) Source { return pinnedSource{c: c, block: block} }
+
+type pinnedSource struct {
+	c     *ChainSource
+	block *big.Int
+}
+
+func (p pinnedSource) AgentKey(ctx context.Context, agentKey, keyID canonical.Digest) (Key, error) {
+	return p.c.agentKeyAt(ctx, p.block, agentKey, keyID)
+}
+
+func (c *ChainSource) agentKeyAt(ctx context.Context, block *big.Int, agentKey, keyID canonical.Digest) (Key, error) {
+	out, err := c.reg.AgentKeys(&bind.CallOpts{Context: ctx, BlockNumber: block}, agentKey, keyID)
 	if err != nil {
 		return Key{}, err
 	}

@@ -101,17 +101,17 @@ Every client authenticates with a certificate whose URI SAN names it
 # 5. Verify one event...
 bin/verilog-verify export --bundle /var/lib/verilog/evidence/<agentKey>/epoch-3.json --index 17 --out ./case-42
 bin/verilog-verify --event case-42/event.json --proof case-42/proof.json \
-    --epoch 3 --agent-id support-bot --rpc "$RPC" --contract 0xRegistry
+    --epoch 3 --agent-id support-bot --rpc "$RPC" --contract 0xRegistry --chain-id 1
 
 # ...or a whole run from a copy of all the agent's evidence bundles.
 bin/verilog-verify --run-id <run_id> --bundles ./evidence/<agentKey> \
-    --agent-id support-bot --rpc "$RPC" --contract 0xRegistry
+    --agent-id support-bot --rpc "$RPC" --contract 0xRegistry --chain-id 1
 ```
 
 `verilog-verify` prints one verdict line and exits `0` (verified), `1`
 (tampered, including any defect in the evidence), `3` (run mode with
 `--allow-incomplete`: verified but no `run_end`) or `2` (no verdict: bad
-arguments, unreadable files or RPC failure). See
+arguments, unreadable files, RPC failure, wrong chain id, or evidence not final yet). See
 [docs/operations.md](docs/operations.md#verifying-logs).
 
 ## Deployment requirement

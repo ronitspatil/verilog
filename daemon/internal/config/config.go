@@ -18,6 +18,8 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
+
+	"github.com/ronitspatil/verilog/daemon/internal/finality"
 )
 
 // Environment variable names.
@@ -45,11 +47,17 @@ type Config struct {
 	Signer               string // SignerLocal or SignerAWSKMS
 	KMSKeyID             string // key ARN, key id or alias/<name>
 	// MaxFeeCap and MaxTipCap (wei) cap maxFeePerGas and maxPriorityFeePerGas.
-	MaxFeeCap       *big.Int
-	MaxTipCap       *big.Int
-	EpochInterval   time.Duration
-	EpochMaxLogs    int
-	ConfirmTimeout  time.Duration
+	MaxFeeCap      *big.Int
+	MaxTipCap      *big.Int
+	EpochInterval  time.Duration
+	EpochMaxLogs   int
+	ConfirmTimeout time.Duration
+	// Finality decides when an anchor is final (WAL compaction and the
+	// evidence bundle wait for it); FinalityPoll is how often it is checked
+	// and FinalityTimeout when a slow one is logged at ERROR.
+	Finality        finality.Mode
+	FinalityPoll    time.Duration
+	FinalityTimeout time.Duration
 	RetryInitial    time.Duration
 	RetryMax        time.Duration
 	WALSegmentBytes int64
@@ -78,6 +86,9 @@ func Load(args []string, getenv func(string) string, stderr io.Writer) (*Config,
 		interval   = env("VERILOG_EPOCH_INTERVAL", "30s")
 		maxLogs    = env("VERILOG_EPOCH_MAX_LOGS", "1000")
 		confirm    = env("VERILOG_CONFIRM_TIMEOUT", "2m")
+		final      = env("VERILOG_FINALITY", "finalized")
+		finalPoll  = env("VERILOG_FINALITY_POLL", "5s")
+		finalWait  = env("VERILOG_FINALITY_TIMEOUT", "30m")
 		segBytes   = env("VERILOG_WAL_SEGMENT_BYTES", strconv.Itoa(64<<20))
 		maxPayload = env("VERILOG_MAX_PAYLOAD_BYTES", strconv.Itoa(1<<20))
 		maxFee     = env("VERILOG_MAX_FEE_GWEI", "500")
@@ -97,6 +108,9 @@ func Load(args []string, getenv func(string) string, stderr io.Writer) (*Config,
 	fs.StringVar(&interval, "epoch-interval", interval, "seal each agent's open epoch this often (env VERILOG_EPOCH_INTERVAL)")
 	fs.StringVar(&maxLogs, "epoch-max-logs", maxLogs, "seal an agent's epoch once it holds this many events (env VERILOG_EPOCH_MAX_LOGS)")
 	fs.StringVar(&confirm, "confirm-timeout", confirm, "max wait for a transaction receipt before retrying (env VERILOG_CONFIRM_TIMEOUT)")
+	fs.StringVar(&final, "finality", final, "when an anchor is final: finalized, safe or depth:N; the WAL is compacted and the evidence bundle written only then (env VERILOG_FINALITY)")
+	fs.StringVar(&finalPoll, "finality-poll", finalPoll, "how often an anchor awaiting finality is checked (env VERILOG_FINALITY_POLL)")
+	fs.StringVar(&finalWait, "finality-timeout", finalWait, "log at ERROR when an anchor is not final this long after it was mined; it is never dropped (env VERILOG_FINALITY_TIMEOUT)")
 	fs.DurationVar(&c.RetryInitial, "retry-initial", 1*time.Second, "initial anchoring retry delay")
 	fs.DurationVar(&c.RetryMax, "retry-max", 60*time.Second, "maximum anchoring retry delay")
 	fs.StringVar(&segBytes, "wal-segment-bytes", segBytes, "rotate WAL segments at this size (env VERILOG_WAL_SEGMENT_BYTES)")
@@ -121,6 +135,15 @@ func Load(args []string, getenv func(string) string, stderr io.Writer) (*Config,
 	}
 	if c.ConfirmTimeout, err = time.ParseDuration(confirm); err != nil || c.ConfirmTimeout <= 0 {
 		return nil, fmt.Errorf("invalid confirm timeout %q", confirm)
+	}
+	if c.Finality, err = finality.Parse(final); err != nil || c.Finality.Kind == finality.Latest {
+		return nil, fmt.Errorf("invalid --finality %q (finalized, safe or depth:N)", final)
+	}
+	if c.FinalityPoll, err = time.ParseDuration(finalPoll); err != nil || c.FinalityPoll <= 0 {
+		return nil, fmt.Errorf("invalid finality poll %q", finalPoll)
+	}
+	if c.FinalityTimeout, err = time.ParseDuration(finalWait); err != nil || c.FinalityTimeout <= 0 {
+		return nil, fmt.Errorf("invalid finality timeout %q", finalWait)
 	}
 	if c.WALSegmentBytes, err = strconv.ParseInt(segBytes, 10, 64); err != nil || c.WALSegmentBytes < 1<<10 {
 		return nil, fmt.Errorf("invalid WAL segment size %q (>= 1024)", segBytes)

@@ -119,9 +119,14 @@ type Verifier struct {
 	reg          *registry.VeriLogRegistry
 	keys         keys.Source
 	onChainCheck bool
+	// at pins every read to this block (the final block); nil reads the
+	// head. With a pin, anchors that exist at the head but not at the pin
+	// are "not final yet", which is no verdict rather than a FAILURE.
+	at *big.Int
 
-	anchors map[[40]byte]anchorInfo
-	keyMemo map[[64]byte]keys.Key
+	anchors     map[[40]byte]anchorInfo
+	headAnchors map[[40]byte]anchorInfo
+	keyMemo     map[[64]byte]keys.Key
 }
 
 type anchorInfo struct {
@@ -131,18 +136,27 @@ type anchorInfo struct {
 	found     bool // false: the epoch is not anchored for the agent
 }
 
-// New binds the registry at contract. It returns an *OperationalError if
-// the contract cannot be reached or has no code.
+// New binds the registry at contract and reads the chain head. It returns
+// an *OperationalError if the contract cannot be reached or has no code.
 func New(ctx context.Context, backend bind.ContractBackend, contract common.Address, onChainCheck bool) (*Verifier, error) {
+	return NewAt(ctx, backend, contract, onChainCheck, nil)
+}
+
+// NewAt is New with every read pinned to block at (the final block under
+// the chosen finality); nil reads the head.
+func NewAt(ctx context.Context, backend bind.ContractBackend, contract common.Address, onChainCheck bool, at *big.Int) (*Verifier, error) {
 	reg, err := registry.NewVeriLogRegistry(contract, backend)
 	if err != nil {
 		return nil, opErr("binding contract: %v", err)
 	}
-	code, err := backend.CodeAt(ctx, contract, nil)
+	code, err := backend.CodeAt(ctx, contract, at)
 	if err != nil {
 		return nil, opErr("RPC error reading contract code: %v", err)
 	}
 	if len(code) == 0 {
+		if at != nil {
+			return nil, opErr("no contract deployed at %s as of block %s", contract, at)
+		}
 		return nil, opErr("no contract deployed at %s", contract)
 	}
 	src, err := keys.NewChainSource(contract, backend)
@@ -150,8 +164,8 @@ func New(ctx context.Context, backend bind.ContractBackend, contract common.Addr
 		return nil, opErr("binding contract: %v", err)
 	}
 	return &Verifier{
-		backend: backend, reg: reg, keys: src, onChainCheck: onChainCheck,
-		anchors: map[[40]byte]anchorInfo{}, keyMemo: map[[64]byte]keys.Key{},
+		backend: backend, reg: reg, keys: src.At(at), onChainCheck: onChainCheck, at: at,
+		anchors: map[[40]byte]anchorInfo{}, headAnchors: map[[40]byte]anchorInfo{}, keyMemo: map[[64]byte]keys.Key{},
 	}, nil
 }
 
@@ -168,19 +182,39 @@ func Verify(ctx context.Context, backend bind.ContractBackend, in Input) (*Repor
 // anchor reads an epoch's anchor. An epoch that is not anchored is not an
 // error (found is false): it is a claim of the evidence that the chain refutes.
 func (v *Verifier) anchor(ctx context.Context, agentKey canonical.Digest, epoch uint64) (anchorInfo, error) {
+	return v.anchorAt(ctx, agentKey, epoch, v.at, v.anchors)
+}
+
+// headAnchor reads an epoch's anchor at the chain head.
+func (v *Verifier) headAnchor(ctx context.Context, agentKey canonical.Digest, epoch uint64) (anchorInfo, error) {
+	return v.anchorAt(ctx, agentKey, epoch, nil, v.headAnchors)
+}
+
+func (v *Verifier) anchorAt(ctx context.Context, agentKey canonical.Digest, epoch uint64, block *big.Int, memo map[[40]byte]anchorInfo) (anchorInfo, error) {
 	var id [40]byte
 	copy(id[:32], agentKey[:])
 	big.NewInt(0).SetUint64(epoch).FillBytes(id[32:])
-	if a, ok := v.anchors[id]; ok {
+	if a, ok := memo[id]; ok {
 		return a, nil
 	}
-	out, err := v.reg.AgentAnchors(&bind.CallOpts{Context: ctx}, agentKey, new(big.Int).SetUint64(epoch))
+	out, err := v.reg.AgentAnchors(v.call(ctx, block), agentKey, new(big.Int).SetUint64(epoch))
 	if err != nil {
 		return anchorInfo{}, opErr("RPC error reading agentAnchors: %v", err)
 	}
 	a := anchorInfo{root: out.MerkleRoot, timestamp: out.Timestamp, count: out.LogCount, found: out.MerkleRoot != ([32]byte{})}
-	v.anchors[id] = a
+	memo[id] = a
 	return a, nil
+}
+
+func (v *Verifier) call(ctx context.Context, block *big.Int) *bind.CallOpts {
+	return &bind.CallOpts{Context: ctx, BlockNumber: block}
+}
+
+// notFinalError is the "not anchored yet" answer: the epoch is anchored at
+// the head but not at the final block.
+func (v *Verifier) notFinalError(epoch uint64, agentKey canonical.Digest) error {
+	return opErr("epoch %d of agent key %s is anchored but not final at block %s: not anchored yet; "+
+		"retry once it is final (see --finality)", epoch, agentKey.Hex(), v.at)
 }
 
 func (v *Verifier) agentKey(ctx context.Context, agentKey, keyID canonical.Digest) (keys.Key, error) {
@@ -221,6 +255,15 @@ func (v *Verifier) Event(ctx context.Context, eventJSON []byte, proof []merkle.H
 	// The evidence claims the event is anchored in this epoch: if the chain
 	// has no such epoch, the claim is false.
 	if !anc.found {
+		if v.at != nil {
+			head, err := v.headAnchor(ctx, agentKey, epochID)
+			if err != nil {
+				return nil, err
+			}
+			if head.found {
+				return nil, v.notFinalError(epochID, agentKey)
+			}
+		}
 		return fail(fmt.Sprintf("epoch %d is not anchored for agent key %s", epochID, agentKey.Hex()))
 	}
 	rep.AnchoredAt = time.Unix(int64(anc.timestamp), 0).UTC()
@@ -251,7 +294,7 @@ func (v *Verifier) Event(ctx context.Context, eventJSON []byte, proof []merkle.H
 	if v.onChainCheck {
 		p := make([][32]byte, len(proof))
 		copy(p, proof)
-		ok, err := v.reg.VerifyAnchoredLeaf(&bind.CallOpts{Context: ctx}, agentKey, new(big.Int).SetUint64(epochID), rep.Leaf, p)
+		ok, err := v.reg.VerifyAnchoredLeaf(v.call(ctx, v.at), agentKey, new(big.Int).SetUint64(epochID), rep.Leaf, p)
 		if err != nil {
 			return nil, opErr("RPC error calling verifyAnchoredLeaf: %v", err)
 		}

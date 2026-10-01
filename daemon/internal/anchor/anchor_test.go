@@ -29,7 +29,16 @@ type flakyChain struct {
 	failures map[[32]byte]int
 	calls    []Request
 	epoch    uint64
+	results  map[Request]Result
 }
+
+func (f *flakyChain) Final(_ context.Context, req Request) (Status, Result, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return Final, f.results[req], nil
+}
+
+func (f *flakyChain) Release(Request) error { return nil }
 
 func (f *flakyChain) Anchor(_ context.Context, req Request) (Result, error) {
 	f.mu.Lock()
@@ -40,12 +49,16 @@ func (f *flakyChain) Anchor(_ context.Context, req Request) (Result, error) {
 		return Result{}, errors.New("rpc unavailable")
 	}
 	f.epoch++
-	return Result{EpochID: f.epoch}, nil
+	if f.results == nil {
+		f.results = map[Request]Result{}
+	}
+	f.results[req] = Result{EpochID: f.epoch}
+	return f.results[req], nil
 }
 
 func TestWorkerRetriesAndPreservesOrder(t *testing.T) {
 	chain := &flakyChain{failures: map[[32]byte]int{{1}: 2}}
-	w := NewWorker(chain, Backoff{Initial: time.Millisecond, Max: 4 * time.Millisecond}, nil)
+	w := NewWorker(chain, WorkerOptions{Backoff: Backoff{Initial: time.Millisecond, Max: 4 * time.Millisecond}}, nil)
 	var mu sync.Mutex
 	var done []uint64
 	finalizeFailures := 1
@@ -87,7 +100,7 @@ func TestWorkerRetriesAndPreservesOrder(t *testing.T) {
 
 func TestWorkerKeepsJobsOnShutdown(t *testing.T) {
 	chain := &flakyChain{failures: map[[32]byte]int{{1}: 1 << 30}}
-	w := NewWorker(chain, Backoff{Initial: time.Millisecond, Max: time.Millisecond}, nil)
+	w := NewWorker(chain, WorkerOptions{Backoff: Backoff{Initial: time.Millisecond, Max: time.Millisecond}}, nil)
 	w.Enqueue(Job{Request: Request{Root: [32]byte{1}}, Done: func(context.Context, Result) error { return nil }})
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()

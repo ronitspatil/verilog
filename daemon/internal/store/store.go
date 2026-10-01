@@ -54,19 +54,26 @@ const BundleVersion = 2
 
 // Bundle is the evidence for one anchored epoch.
 type Bundle struct {
-	Version     int          `json:"version"`
-	HashScheme  string       `json:"hash_scheme"`
-	AgentID     string       `json:"agent_id"`
-	AgentKey    string       `json:"agent_key"`
-	EpochID     uint64       `json:"epoch_id"`
-	MerkleRoot  string       `json:"merkle_root"`
-	LogCount    int          `json:"log_count"`
-	ChainID     string       `json:"chain_id"`
-	Contract    string       `json:"contract"`
-	TxHash      string       `json:"tx_hash"`
-	BlockNumber uint64       `json:"block_number"`
-	AnchoredAt  time.Time    `json:"anchored_at"`
-	Events      []EventProof `json:"events"`
+	Version     int    `json:"version"`
+	HashScheme  string `json:"hash_scheme"`
+	AgentID     string `json:"agent_id"`
+	AgentKey    string `json:"agent_key"`
+	EpochID     uint64 `json:"epoch_id"`
+	MerkleRoot  string `json:"merkle_root"`
+	LogCount    int    `json:"log_count"`
+	ChainID     string `json:"chain_id"`
+	Contract    string `json:"contract"`
+	TxHash      string `json:"tx_hash"`
+	BlockNumber uint64 `json:"block_number"`
+	BlockHash   string `json:"block_hash,omitempty"`
+	// Finality is the daemon's finality mode when it judged the anchor final
+	// ("finalized", "safe" or "depth:N"); the anchor was re-read at block
+	// FinalBlockNumber (hash FinalBlockHash) before this bundle was written.
+	Finality         string       `json:"finality,omitempty"`
+	FinalBlockNumber uint64       `json:"final_block_number,omitempty"`
+	FinalBlockHash   string       `json:"final_block_hash,omitempty"`
+	AnchoredAt       time.Time    `json:"anchored_at"`
+	Events           []EventProof `json:"events"`
 }
 
 // Store reads and writes the checkpoint and evidence bundles.

@@ -2,6 +2,7 @@ package verify
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"math/big"
 	"strings"
@@ -18,6 +19,8 @@ import (
 	"github.com/ronitspatil/verilog/daemon/internal/merkle"
 	"github.com/ronitspatil/verilog/daemon/internal/registry"
 )
+
+var agentKey = ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
 
 type fixture struct {
 	client   simulated.Client
@@ -44,11 +47,15 @@ func setup(t *testing.T) *fixture {
 	f := &fixture{client: client, contract: addr}
 	var leaves []merkle.Hash
 	for i := uint64(1); i <= 3; i++ {
-		canon, err := canonical.Event{
-			AgentID: "agent-v", StepNumber: i, EventType: "llm_end",
+		ev := canonical.Event{
+			AgentID: "agent-v", RunID: "run-v", StepNumber: i, EventType: "llm_end",
 			PayloadJSON:  []byte(`{"text":"hello world"}`),
 			TimestampUTC: time.Unix(1_800_000_000, int64(i)).UTC(),
-		}.Canonical()
+		}
+		if err := ev.Sign(agentKey); err != nil {
+			t.Fatal(err)
+		}
+		canon, err := ev.Canonical()
 		if err != nil {
 			t.Fatal(err)
 		}

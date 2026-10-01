@@ -11,13 +11,16 @@ package vectors
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -81,42 +84,64 @@ func buildMerkleVectors(t *testing.T) merkleFile {
 	return f
 }
 
+// TestSeedHex is the Ed25519 seed every signed vector uses. It is public
+// test material; never register it on a real network.
+const TestSeedHex = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
+
+func testKey(t *testing.T) ed25519.PrivateKey {
+	seed, err := hex.DecodeString(TestSeedHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ed25519.NewKeyFromSeed(seed)
+}
+
 type canonicalCase struct {
 	Name             string `json:"name"`
 	AgentID          string `json:"agent_id"`
+	RunID            string `json:"run_id"`
 	StepNumber       uint64 `json:"step_number"`
+	PrevHash         string `json:"prev_hash"`
 	EventType        string `json:"event_type"`
 	PayloadJSON      string `json:"payload_json"`
 	TimestampUTC     string `json:"timestamp_utc"`
+	KeyID            string `json:"key_id"`
 	CanonicalPayload string `json:"canonical_payload"`
+	SigningBytes     string `json:"signing_bytes"`
+	Sig              string `json:"sig"`
 	CanonicalEvent   string `json:"canonical_event"`
 	ContentDigest    string `json:"content_digest"`
 	Leaf             string `json:"leaf"`
 	AgentKey         string `json:"agent_key"`
 }
 
-func buildCanonicalVectors(t *testing.T) []canonicalCase {
+type vectorInput struct{ name, agent, typ, payload string }
+
+// signChain signs the inputs as one run: step i+1, each prev_hash the digest
+// of the previous event, the first one zero.
+func signChain(t *testing.T, runID string, inputs []vectorInput) []canonicalCase {
+	priv := testKey(t)
 	ts := time.Date(2026, 9, 30, 12, 0, 0, 123456789, time.UTC)
-	inputs := []struct{ name, agent, typ, payload string }{
-		{"simple", "agent-alpha", "llm_start", `{"prompts":["What is 2+2?"],"model":"gpt"}`},
-		{"nested_unsorted_whitespace", "agent-alpha", "tool_start", "{ \"tool\" : \"search\" ,\n \"input\" : { \"q\" : \"weather\", \"k\" : 3 } }"},
-		{"unicode_and_escapes", "agent-β", "llm_end", `{"text":"café € 😀 <b>&</b>\n\t\"q\"","ctl":"\u0001"}`},
-		{"numbers", "agent-alpha", "chain_end", `{"big":123456789012345678901234567890,"neg0":-0,"float":1.50,"exp":1e21,"small":1e-7,"int_as_float":2.0}`},
-		{"empty_object_payload", "agent-alpha", "chain_start", `{}`},
-		{"array_payload", "agent-alpha", "custom", `[3,1,{"b":null,"a":true},"x"]`},
-		{"string_payload", "agent-alpha", "custom", `"just a string"`},
-		{"utf16_key_order", "agent-alpha", "custom", `{"€":1,"\r":2,"דּ":3,"1":4,"😀":5,"\u0080":6,"ö":7}`},
-	}
+	var prev canonical.Digest
 	var out []canonicalCase
 	for i, in := range inputs {
 		ev := canonical.Event{
 			AgentID:      in.agent,
+			RunID:        runID,
 			StepNumber:   uint64(i + 1),
+			PrevHash:     prev,
 			EventType:    in.typ,
 			PayloadJSON:  []byte(in.payload),
 			TimestampUTC: ts.Add(time.Duration(i) * time.Millisecond),
 		}
+		if err := ev.Sign(priv); err != nil {
+			t.Fatal(err)
+		}
 		payload, err := canonical.CanonicalizeJSON(ev.PayloadJSON)
+		if err != nil {
+			t.Fatal(err)
+		}
+		msg, err := ev.SigningBytes()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -128,20 +153,50 @@ func buildCanonicalVectors(t *testing.T) []canonicalCase {
 		out = append(out, canonicalCase{
 			Name:             in.name,
 			AgentID:          ev.AgentID,
+			RunID:            ev.RunID,
 			StepNumber:       ev.StepNumber,
+			PrevHash:         ev.PrevHash.Hex(),
 			EventType:        ev.EventType,
 			PayloadJSON:      in.payload,
 			TimestampUTC:     ev.TimestampUTC.Format(canonical.TimestampLayout),
+			KeyID:            ev.KeyID.Hex(),
 			CanonicalPayload: string(payload),
+			SigningBytes:     string(msg),
+			Sig:              "0x" + hex.EncodeToString(ev.Sig),
 			CanonicalEvent:   string(canon),
 			ContentDigest:    digest.Hex(),
 			Leaf:             canonical.Digest(merkle.LeafFromDigest(digest)).Hex(),
 			AgentKey:         canonical.AgentKey(ev.AgentID).Hex(),
 		})
+		prev = digest
 	}
 	return out
 }
 
+func buildCanonicalVectors(t *testing.T) []canonicalCase {
+	return signChain(t, "vector-run-canonical", []vectorInput{
+		{"simple", "agent-alpha", "llm_start", `{"prompts":["What is 2+2?"],"model":"gpt"}`},
+		{"nested_unsorted_whitespace", "agent-alpha", "tool_start", "{ \"tool\" : \"search\" ,\n \"input\" : { \"q\" : \"weather\", \"k\" : 3 } }"},
+		{"unicode_and_escapes", "agent-β", "llm_end", `{"text":"café € 😀 <b>&</b>\n\t\"q\"","ctl":"\u0001"}`},
+		{"numbers", "agent-alpha", "chain_end", `{"big":123456789012345678901234567890,"neg0":-0,"float":1.50,"exp":1e21,"small":1e-7,"int_as_float":2.0}`},
+		{"empty_object_payload", "agent-alpha", "chain_start", `{}`},
+		{"array_payload", "agent-alpha", "custom", `[3,1,{"b":null,"a":true},"x"]`},
+		{"string_payload", "agent-alpha", "custom", `"just a string"`},
+		{"utf16_key_order", "agent-alpha", "custom", `{"€":1,"\r":2,"דּ":3,"1":4,"😀":5,"\u0080":6,"ö":7}`},
+	})
+}
+
+// buildSignedRun is one complete run as the SDK emits it: callback events,
+// an sdk_dropped report and the terminal run_end.
+func buildSignedRun(t *testing.T) []canonicalCase {
+	return signChain(t, "5f0c6e1e-7a43-4c8e-9a51-0d3b8f2c1a77", []vectorInput{
+		{"genesis", "agent-alpha", "chain_start", `{"name":"RunnableSequence","inputs":{"question":"where?"}}`},
+		{"llm", "agent-alpha", "llm_end", `{"generations":[[{"text":"Paris","score":0.25}]],"latency_s":1.5e-3}`},
+		{"dropped", "agent-alpha", canonical.EventSDKDropped, `{"count":2}`},
+		{"chain_end", "agent-alpha", "chain_end", `{"outputs":"sunny in Paris"}`},
+		{"run_end", "agent-alpha", canonical.EventRunEnd, `{"steps":4,"status":"ok"}`},
+	})
+}
 func marshal(t *testing.T, v any) []byte {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
@@ -191,8 +246,8 @@ func TestMerkleVectors(t *testing.T) {
 	checkGolden(t, "merkle_vectors.json", marshal(t, f))
 }
 
-func TestCanonicalVectors(t *testing.T) {
-	cases := buildCanonicalVectors(t)
+func checkCases(t *testing.T, cases []canonicalCase) {
+	pub := testKey(t).Public().(ed25519.PublicKey)
 	for _, c := range cases {
 		ev, err := canonical.ParseEvent([]byte(c.CanonicalEvent))
 		if err != nil {
@@ -202,9 +257,36 @@ func TestCanonicalVectors(t *testing.T) {
 		if string(again) != c.CanonicalEvent {
 			t.Fatalf("%s: canonical form not stable", c.Name)
 		}
+		if err := ev.VerifySig(pub); err != nil {
+			t.Fatalf("%s: signature does not verify: %v", c.Name, err)
+		}
 	}
+}
+
+func TestCanonicalVectors(t *testing.T) {
+	cases := buildCanonicalVectors(t)
+	checkCases(t, cases)
 	checkGolden(t, "canonical_vectors.json", marshal(t, map[string]any{
-		"comment": fmt.Sprintf("Generated by daemon/internal/vectors. Timestamps use layout %s.", canonical.TimestampLayout),
-		"cases":   cases,
+		"comment": fmt.Sprintf("Generated by daemon/internal/vectors. Canonical event v2: the cases form one signed run. Timestamps use layout %s.",
+			canonical.TimestampLayout),
+		"seed":  "0x" + TestSeedHex,
+		"cases": cases,
+	}))
+}
+
+func TestSignedVectors(t *testing.T) {
+	priv := testKey(t)
+	pub := priv.Public().(ed25519.PublicKey)
+	run := buildSignedRun(t)
+	checkCases(t, run)
+	checkGolden(t, "signed_vectors.json", marshal(t, map[string]any{
+		"comment": "Generated by daemon/internal/vectors. One complete signed run (hash chain). " +
+			"signing_bytes = \"" + strings.TrimSuffix(canonical.SigningDomain, "\n") + "\\n\" || canonical(event without sig); " +
+			"sig = ed25519(seed, signing_bytes); key_id = keccak256(public_key); content_digest = sha256(canonical_event).",
+		"signing_domain": canonical.SigningDomain,
+		"seed":           "0x" + TestSeedHex,
+		"public_key":     "0x" + hex.EncodeToString(pub),
+		"key_id":         canonical.KeyID(pub).Hex(),
+		"run":            run,
 	}))
 }

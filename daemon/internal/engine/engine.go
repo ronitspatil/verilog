@@ -598,7 +598,7 @@ func (e *Engine) enqueueAnchor(b *sealedEpoch) {
 // finalize persists the evidence bundle and advances the checkpoint.
 func (e *Engine) finalize(b *sealedEpoch, res anchor.Result) error {
 	bundle := &store.Bundle{
-		Version:     1,
+		Version:     store.BundleVersion,
 		HashScheme:  store.HashScheme,
 		AgentID:     b.agentID,
 		AgentKey:    b.agentKey.Hex(),

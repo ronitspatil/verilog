@@ -12,6 +12,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 
@@ -144,12 +145,10 @@ func (s *Server) prepare(ctx context.Context, msg *verilogv1.LogEvent) inflight 
 		item.ack = reject(item.seq, "timestamp_utc is invalid: "+err.Error())
 		return item
 	}
-	ev := canonical.Event{
-		AgentID:      msg.GetAgentId(),
-		StepNumber:   msg.GetStepNumber(),
-		EventType:    msg.GetEventType(),
-		PayloadJSON:  []byte(msg.GetPayloadJson()),
-		TimestampUTC: msg.GetTimestampUtc().AsTime(),
+	ev, err := eventFromProto(msg)
+	if err != nil {
+		item.ack = reject(item.seq, err.Error())
+		return item
 	}
 	prep, err := engine.Prepare(ev)
 	if err != nil {
@@ -166,6 +165,32 @@ func (s *Server) prepare(ctx context.Context, msg *verilogv1.LogEvent) inflight 
 	}
 	item.result, item.prep = ch, prep
 	return item
+}
+
+// eventFromProto maps a LogEvent onto the canonical event, checking the
+// lengths of the fixed-size binary fields.
+func eventFromProto(msg *verilogv1.LogEvent) (canonical.Event, error) {
+	ev := canonical.Event{
+		AgentID:      msg.GetAgentId(),
+		RunID:        msg.GetRunId(),
+		StepNumber:   msg.GetStepNumber(),
+		EventType:    msg.GetEventType(),
+		PayloadJSON:  []byte(msg.GetPayloadJson()),
+		TimestampUTC: msg.GetTimestampUtc().AsTime(),
+		Sig:          msg.GetSignature(),
+	}
+	if len(msg.GetPrevHash()) != len(ev.PrevHash) {
+		return ev, fmt.Errorf("%w: prev_hash must be %d bytes", canonical.ErrInvalidEvent, len(ev.PrevHash))
+	}
+	copy(ev.PrevHash[:], msg.GetPrevHash())
+	if len(msg.GetKeyId()) != len(ev.KeyID) {
+		return ev, fmt.Errorf("%w: key_id must be %d bytes", canonical.ErrInvalidEvent, len(ev.KeyID))
+	}
+	copy(ev.KeyID[:], msg.GetKeyId())
+	if len(ev.Sig) == 0 {
+		return ev, fmt.Errorf("%w: event is not signed", canonical.ErrInvalidEvent)
+	}
+	return ev, nil
 }
 
 func (s *Server) resultAck(item inflight, res engine.Result) *verilogv1.Ack {

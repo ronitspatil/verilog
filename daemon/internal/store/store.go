@@ -21,7 +21,8 @@ import (
 )
 
 // HashScheme documents, inside every bundle, how its hashes are derived.
-const HashScheme = "contentDigest=sha256(canonical_event); leaf=keccak256(contentDigest); " +
+const HashScheme = "canonical_event=v2 (9 fields incl. Ed25519 sig over \"VeriLog/event/v1\\n\"||canonical without sig); " +
+	"contentDigest=sha256(canonical_event); leaf=keccak256(contentDigest); " +
 	"node=keccak256(min(a,b)||max(a,b)); odd node promoted; agentKey=keccak256(utf8(agent_id))"
 
 // AgentProgress is the anchoring progress of one agent.
@@ -47,6 +48,9 @@ type EventProof struct {
 	// CanonicalEvent holds the exact canonical event bytes that were hashed.
 	CanonicalEvent string `json:"canonical_event"`
 }
+
+// BundleVersion is the evidence bundle format version (2: signed events).
+const BundleVersion = 2
 
 // Bundle is the evidence for one anchored epoch.
 type Bundle struct {

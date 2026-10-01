@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"context"
+	"crypto/ed25519"
 	"fmt"
 	"net"
 	"sync"
@@ -74,22 +75,46 @@ func newEnv(t *testing.T) *env {
 	return &env{client: verilogv1.NewVeriLogClient(conn), eng: eng, sink: sink}
 }
 
-func logEvent(agent string, seq uint64) *verilogv1.LogEvent {
-	return &verilogv1.LogEvent{
-		AgentId:      agent,
+var testKey = ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
+
+// logEvent returns a LogEvent signed with priv (testKey when nil).
+func logEventWith(priv ed25519.PrivateKey, agent string, seq uint64) *verilogv1.LogEvent {
+	if priv == nil {
+		priv = testKey
+	}
+	ev := canonical.Event{
+		AgentID:      agent,
+		RunID:        "run-" + agent,
 		StepNumber:   seq,
 		EventType:    "tool_end",
-		PayloadJson:  fmt.Sprintf(`{"output": "result %d", "ok": true}`, seq),
-		TimestampUtc: timestamppb.New(time.Unix(1_800_000_000, int64(seq)).UTC()),
+		PayloadJSON:  []byte(fmt.Sprintf(`{"output": "result %d", "ok": true}`, seq)),
+		TimestampUTC: time.Unix(1_800_000_000, int64(seq)).UTC(),
+	}
+	if err := ev.Sign(priv); err != nil {
+		panic(err)
+	}
+	return &verilogv1.LogEvent{
+		AgentId:      ev.AgentID,
+		RunId:        ev.RunID,
+		StepNumber:   ev.StepNumber,
+		PrevHash:     ev.PrevHash[:],
+		EventType:    ev.EventType,
+		PayloadJson:  string(ev.PayloadJSON),
+		TimestampUtc: timestamppb.New(ev.TimestampUTC),
+		KeyId:        ev.KeyID[:],
+		Signature:    ev.Sig,
 		Sequence:     seq,
 	}
 }
 
+func logEvent(agent string, seq uint64) *verilogv1.LogEvent { return logEventWith(nil, agent, seq) }
+
 func expectedDigest(t *testing.T, m *verilogv1.LogEvent) canonical.Digest {
-	canon, err := canonical.Event{
-		AgentID: m.AgentId, StepNumber: m.StepNumber, EventType: m.EventType,
-		PayloadJSON: []byte(m.PayloadJson), TimestampUTC: m.TimestampUtc.AsTime(),
-	}.Canonical()
+	ev, err := eventFromProto(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canon, err := ev.Canonical()
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -22,19 +22,33 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
-// LogEvent is one step of an agent's execution trace.
+// LogEvent is one step of an agent's execution trace, signed by the agent.
 //
-// Fields 1-5 are the hashed content. The daemon canonicalizes them (RFC 8785
-// style JSON) and computes content_digest = SHA-256(canonical bytes).
+// Fields 1-9 are the hashed content (canonical event v2). The daemon rebuilds
+// the canonical JSON from them, verifies the Ed25519 signature against the key
+// registered on chain for (agent, key_id), and computes
+// content_digest = SHA-256(canonical bytes, including the signature).
 type LogEvent struct {
-	state      protoimpl.MessageState `protogen:"open.v1"`
-	AgentId    string                 `protobuf:"bytes,1,opt,name=agent_id,json=agentId,proto3" json:"agent_id,omitempty"`
-	StepNumber uint64                 `protobuf:"varint,2,opt,name=step_number,json=stepNumber,proto3" json:"step_number,omitempty"`
-	EventType  string                 `protobuf:"bytes,3,opt,name=event_type,json=eventType,proto3" json:"event_type,omitempty"`
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	AgentId string                 `protobuf:"bytes,1,opt,name=agent_id,json=agentId,proto3" json:"agent_id,omitempty"`
+	// Position in the run's hash chain, starting at 1.
+	StepNumber uint64 `protobuf:"varint,2,opt,name=step_number,json=stepNumber,proto3" json:"step_number,omitempty"`
+	EventType  string `protobuf:"bytes,3,opt,name=event_type,json=eventType,proto3" json:"event_type,omitempty"`
 	// UTF-8 JSON document. Re-canonicalized by the daemon, so key order and
 	// whitespace do not matter, but the value must be valid JSON.
 	PayloadJson  string                 `protobuf:"bytes,4,opt,name=payload_json,json=payloadJson,proto3" json:"payload_json,omitempty"`
 	TimestampUtc *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=timestamp_utc,json=timestampUtc,proto3" json:"timestamp_utc,omitempty"`
+	// Root run this event belongs to; each run is its own hash chain.
+	RunId string `protobuf:"bytes,6,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`
+	// content_digest of the previous event of the run (32 bytes); 32 zero bytes
+	// for the first event.
+	PrevHash []byte `protobuf:"bytes,7,opt,name=prev_hash,json=prevHash,proto3" json:"prev_hash,omitempty"`
+	// keccak256 of the agent's Ed25519 public key (32 bytes). The key itself is
+	// looked up on chain (VeriLogRegistry.agentKeys).
+	KeyId []byte `protobuf:"bytes,8,opt,name=key_id,json=keyId,proto3" json:"key_id,omitempty"`
+	// Ed25519 signature (64 bytes) over "VeriLog/event/v1\n" followed by the
+	// canonical event JSON without the "sig" member.
+	Signature []byte `protobuf:"bytes,9,opt,name=signature,proto3" json:"signature,omitempty"`
 	// Client-assigned stream sequence number, echoed in the Ack. Not hashed.
 	Sequence      uint64 `protobuf:"varint,15,opt,name=sequence,proto3" json:"sequence,omitempty"`
 	unknownFields protoimpl.UnknownFields
@@ -102,6 +116,34 @@ func (x *LogEvent) GetPayloadJson() string {
 func (x *LogEvent) GetTimestampUtc() *timestamppb.Timestamp {
 	if x != nil {
 		return x.TimestampUtc
+	}
+	return nil
+}
+
+func (x *LogEvent) GetRunId() string {
+	if x != nil {
+		return x.RunId
+	}
+	return ""
+}
+
+func (x *LogEvent) GetPrevHash() []byte {
+	if x != nil {
+		return x.PrevHash
+	}
+	return nil
+}
+
+func (x *LogEvent) GetKeyId() []byte {
+	if x != nil {
+		return x.KeyId
+	}
+	return nil
+}
+
+func (x *LogEvent) GetSignature() []byte {
+	if x != nil {
+		return x.Signature
 	}
 	return nil
 }
@@ -433,7 +475,7 @@ var File_verilog_v1_verilog_proto protoreflect.FileDescriptor
 const file_verilog_v1_verilog_proto_rawDesc = "" +
 	"\n" +
 	"\x18verilog/v1/verilog.proto\x12\n" +
-	"verilog.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"\xe5\x01\n" +
+	"verilog.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"\xce\x02\n" +
 	"\bLogEvent\x12\x19\n" +
 	"\bagent_id\x18\x01 \x01(\tR\aagentId\x12\x1f\n" +
 	"\vstep_number\x18\x02 \x01(\x04R\n" +
@@ -441,7 +483,11 @@ const file_verilog_v1_verilog_proto_rawDesc = "" +
 	"\n" +
 	"event_type\x18\x03 \x01(\tR\teventType\x12!\n" +
 	"\fpayload_json\x18\x04 \x01(\tR\vpayloadJson\x12?\n" +
-	"\rtimestamp_utc\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\ftimestampUtc\x12\x1a\n" +
+	"\rtimestamp_utc\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\ftimestampUtc\x12\x15\n" +
+	"\x06run_id\x18\x06 \x01(\tR\x05runId\x12\x1b\n" +
+	"\tprev_hash\x18\a \x01(\fR\bprevHash\x12\x15\n" +
+	"\x06key_id\x18\b \x01(\fR\x05keyId\x12\x1c\n" +
+	"\tsignature\x18\t \x01(\fR\tsignature\x12\x1a\n" +
 	"\bsequence\x18\x0f \x01(\x04R\bsequence\"\xac\x01\n" +
 	"\x03Ack\x12\x1a\n" +
 	"\bsequence\x18\x01 \x01(\x04R\bsequence\x12\x1a\n" +

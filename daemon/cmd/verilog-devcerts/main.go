@@ -6,7 +6,7 @@
 //
 //	verilog-devcerts --out DIR [--host localhost --host 127.0.0.1] [--agent ID]... [--auditor NAME]...
 //
-// Files: ca.pem (and ca-key.pem), server.pem/server-key.pem,
+// Each run makes a new CA, whose key is discarded. Files: ca.pem, server.pem/server-key.pem,
 // agent-<ID>.pem/agent-<ID>-key.pem, auditor-<NAME>.pem/auditor-<NAME>-key.pem.
 package main
 
@@ -57,7 +57,8 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := write(*out, "ca", ca); err != nil {
+	// The CA key is not written: every run makes a new CA.
+	if err := os.WriteFile(filepath.Join(*out, "ca.pem"), ca.CertPEM, 0o644); err != nil {
 		return err
 	}
 	srv, err := ca.Server(hosts...)
@@ -85,7 +86,7 @@ func run(args []string) error {
 		}
 	}
 	readme := "DEVELOPMENT-ONLY certificates written by verilog-devcerts (make certs).\n" +
-		"The CA key is in this directory: anyone holding it can mint identities.\n" +
+		"Each run makes a new CA (its key is not kept); re-run to add identities.\n" +
 		"Never use these outside local development. See docs/operations.md.\n"
 	if err := os.WriteFile(filepath.Join(*out, "README"), []byte(readme), 0o644); err != nil {
 		return err

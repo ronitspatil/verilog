@@ -48,7 +48,8 @@ def test_drop_oldest_keeps_newest():
     with client._cond:
         queued = [it.step_number for it in client._queue]
     client.close(timeout=0.1)
-    assert queued[-3:] == [7, 8, 9][-len(queued[-3:]):]
+    # Whatever is still queued is the newest events, in order.
+    assert queued and queued == list(range(10 - len(queued), 10))
     assert client.stats().dropped >= 6
 
 

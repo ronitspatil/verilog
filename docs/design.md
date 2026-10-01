@@ -45,6 +45,11 @@ agentId       = keccak256(utf8(agent_id))                            # bytes32 k
   fractional digits. The daemon rebuilds the signed bytes from the fields it
   receives, so any drift between the Python and Go canonicalization shows up
   as a rejected event, never a silent mismatch.
+- **Proof of possession.** Before registration, a new key signs
+  `"VeriLog/pop/v1\n" || keccak256(utf8(agent_id)) || pubkey` (fixed length,
+  its own domain tag). `keygen` prints it and `verilog-verify keycheck`
+  checks it together with the key's safety (on the curve, canonical, prime
+  order). `testdata/signed_vectors.json` carries a golden `pop`.
 - **Leaves and internal nodes are domain separated** by preimage length (32
   vs 64 bytes), OpenZeppelin's recommended defence against second-preimage
   attacks.
@@ -76,6 +81,23 @@ and all I/O run on the SDK's background thread.
   the oldest event; `block` waits briefly, then drops the new one. Either way
   the loss is recorded in the run as a signed `sdk_dropped` event.
 - SDK errors are logged on the `verilog_sdk` logger and never raised.
+- **Oversized payloads.** If a payload's canonical JSON exceeds
+  `max_payload_bytes` (default 1 MiB, the daemon's default limit), it is
+  replaced before chaining by `{"bytes": n, "sha256": "0x…", "truncated": true}`:
+  the size and SHA-256 of the original canonical JSON (UTF-8). The stand-in is
+  signed and chained like any payload; `on_oversize` can keep the original.
+- **Rejections.** A rejection with `Ack.retryable` set (the agent key is not
+  yet visible on chain) is re-sent, byte for byte, with backoff for up to
+  `key_wait_timeout`, holding later events back to keep the order. Any other
+  rejection of a chained event leaves a gap: it is logged at ERROR and counted
+  in `stats().chain_gaps`.
+- **Late and open runs.** An event submitted after its run's `run_end`
+  becomes its own run `<run_id>#late-<n>`, closed by `run_end`
+  `{"status": "late", "late_for_run": <run_id>}`. Ended runs beyond the last
+  10,000 are remembered in a Bloom filter so a late event never restarts a
+  run at step 1. At most `max_open_runs` runs stay open; the least recently
+  used is closed with `run_end` status `"evicted"`. Timestamps outside
+  1970..9999 are reported as a dropped event.
 - The stream reconnects with exponential backoff and re-sends unacknowledged
   events byte for byte (signing is deterministic and done once). The daemon
   de-duplicates identical events within an open epoch and acks them with
@@ -84,13 +106,26 @@ and all I/O run on the SDK's background thread.
 ## Daemon
 
 **Signature enforcement at ingest.** The daemon looks up `(agentId, key_id)`
-in the registry and rejects events that are unsigned, use an unregistered or
-revoked key, or whose signature does not verify. Lookups are cached:
+in the registry and rejects events that are unsigned, use an unregistered,
+unsafe or revoked key (a recorded revocation counts even before it takes
+effect), or whose signature does not verify. "Not registered" rejections set
+`Ack.retryable`. Payloads over `--max-payload-bytes` get a per-event
+rejection; the gRPC receive limit (4× the cap plus 1 MiB) is far enough above
+it that an oversized message never fails the whole stream. Lookups are cached:
 registered keys are re-read every minute so revocations show up, unknown keys
 after 5 s. If the registry cannot be read the stream fails with `UNAVAILABLE`,
 so the SDK re-sends instead of losing a valid event. This keeps garbage out of
 the log, but an auditor does not rely on it (the daemon is the party under
 suspicion): the verifier repeats every check against the chain.
+
+**Seal-time key check.** When an epoch is sealed the daemon re-reads each
+distinct key of its events, uncached, and compares the revocation time with
+the later of the latest block's timestamp and the local clock. Events whose
+key's revocation is in effect are left out of the epoch, logged at ERROR and
+counted in `revoked_excluded`. The `sealed` WAL record lists their sequence
+numbers in `skip` (a seal that leaves out every event has `count` 0 and no
+root), so recovery rebuilds exactly the same epoch. If the lookup fails the
+events are anchored anyway; the verifier still judges the key.
 
 **Concurrency.** Each stream has a receive loop (validate, canonicalize,
 hash, submit) and an ordered ack loop, so one stream can have
@@ -121,7 +156,12 @@ checkpoint) and, if so, recovers that epoch instead of anchoring again.
 anchorer role together with an admin role) and custom errors.
 
 - `agentKeys[agentId][keyId]` stores `{pubkey, validFrom, revokedAt}` in two
-  slots; `registerAgentKey` returns `keyId = keccak256(pubkey)`.
+  slots; `registerAgentKey` returns `keyId = keccak256(pubkey)` and reverts
+  with `WeakPubkey` for the encodings of small-order points and non-canonical
+  encodings (`isWeakPubkey`).
+- `revokeAgentKey(agentId, keyId, effectiveAt)` stores `effectiveAt` (at
+  least the block timestamp) as `revokedAt` and emits it with the recording
+  time in `AgentKeyRevoked`.
 - Zero agent id, zero root and zero `logCount` are rejected.
 - `Anchor` packs into two slots, and `anchorEpoch` returns the new epoch.
 - `verifyProof` is `pure` (`MerkleProof.verifyCalldata`).
@@ -143,7 +183,7 @@ numbers depend on the disk's fsync latency.
 | `contracts/` | Foundry project: `VeriLogRegistry.sol`, tests, `script/Deploy.s.sol` |
 | `daemon/cmd/verilogd` | the daemon |
 | `daemon/cmd/verilog-verify` | forensic verifier and proof exporter |
-| `daemon/internal/canonical` | canonical event JSON, content digest, agent key (shared by daemon and verifier) |
+| `daemon/internal/canonical` | canonical event JSON, content digest, agent key, strict parsing, public key safety and proof of possession |
 | `daemon/internal/merkle` | thread-safe Merkle tree, proofs, benchmarks |
 | `daemon/internal/engine` | committer, per-agent shards, sealing, WAL replay, evidence finalization |
 | `daemon/internal/wal` | JSONL write-ahead log with group-commit fsync and compaction |

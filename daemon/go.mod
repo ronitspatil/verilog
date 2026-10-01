@@ -3,6 +3,7 @@ module github.com/ronitspatil/verilog/daemon
 go 1.27.1
 
 require (
+	filippo.io/edwards25519 v1.2.0
 	github.com/ethereum/go-ethereum v1.17.7
 	golang.org/x/crypto v0.57.0
 	google.golang.org/grpc v1.84.0

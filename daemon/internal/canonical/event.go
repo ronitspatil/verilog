@@ -169,15 +169,16 @@ func (e *Event) Sign(priv ed25519.PrivateKey) error {
 	return nil
 }
 
-// VerifySig checks that pub matches KeyID and that Sig is a valid Ed25519
-// signature by pub over SigningBytes(). Errors wrap ErrBadSignature or
-// ErrInvalidEvent.
+// VerifySig checks that pub is a safe Ed25519 key (CheckPublicKey), that it
+// matches KeyID, and that Sig is a valid Ed25519 signature by pub over
+// SigningBytes(). Errors wrap ErrBadSignature or ErrInvalidEvent.
 func (e Event) VerifySig(pub ed25519.PublicKey) error {
 	if err := e.Validate(); err != nil {
 		return err
 	}
-	if len(pub) != ed25519.PublicKeySize {
-		return fmt.Errorf("%w: public key must be %d bytes", ErrBadSignature, ed25519.PublicKeySize)
+	if err := CheckPublicKey(pub); err != nil {
+		// With a small-order key, forged signatures verify for any message.
+		return fmt.Errorf("%w: %v", ErrBadSignature, err)
 	}
 	if KeyID(pub) != e.KeyID {
 		return fmt.Errorf("%w: public key does not match key_id %s", ErrBadSignature, e.KeyID.Hex())

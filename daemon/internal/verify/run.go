@@ -1,60 +1,88 @@
 package verify
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
+
+	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 
 	"github.com/ronitspatil/verilog/daemon/internal/canonical"
 	"github.com/ronitspatil/verilog/daemon/internal/merkle"
 )
 
-// Evidence is one event with its inclusion proof in an anchored epoch, as
-// read from an evidence bundle.
-type Evidence struct {
-	EpochID   uint64
-	EventJSON []byte
-	Proof     []merkle.Hash
+// EpochEvidence is the full content of one anchored epoch, as read from an
+// evidence bundle. It is untrusted until its events rebuild the on-chain root.
+type EpochEvidence struct {
+	Source   string            // where it was read from (for messages)
+	AgentKey *canonical.Digest // agent key the bundle claims; nil if absent or unreadable
+	EpochID  uint64
+	Events   [][]byte // the epoch's events in leaf order, as hashed
 }
 
 // RunInput describes a run to verify.
 type RunInput struct {
 	AgentID string // string id, or 0x-prefixed 32-byte hex agent key
 	RunID   string
-	// Evidence may contain events of other runs; they are ignored.
-	Evidence []Evidence
-	// AllowIncomplete accepts a run without a terminal run_end event (with a
-	// warning). Truncation cannot be told apart from an agent crash, so this
-	// is for investigations only.
+	// Epochs must cover every epoch anchored for the agent (1..latestEpoch).
+	// Evidence of other agents and other runs may be included; it is ignored.
+	Epochs []EpochEvidence
+	// AllowIncomplete accepts a run without a terminal run_end event, with
+	// the distinct verdict Incomplete. Truncation cannot be told apart from
+	// an agent crash, so this is for investigations only.
 	AllowIncomplete bool
 }
 
 // RunReport is the outcome of a completed run verification.
 type RunReport struct {
-	Verified   bool
-	Reason     string // why verification failed (empty on success)
-	Warning    string // set when the run is accepted despite a missing run_end
-	AgentKey   canonical.Digest
-	RunID      string
-	Events     int      // distinct events of the run
-	LastStep   uint64   // highest step seen
-	Epochs     []uint64 // epochs the run's events are anchored in, ascending
-	SDKDropped uint64   // events the SDK reported as dropped (sdk_dropped)
-	EndStatus  string   // status in the run_end payload, if present
+	Verified bool
+	// Incomplete is set (with Verified) when the run was accepted without a
+	// run_end because of AllowIncomplete. It is not a full pass.
+	Incomplete  bool
+	Reason      string   // why verification failed (empty on success)
+	Warnings    []string // evidence that was ignored, and why
+	AgentKey    canonical.Digest
+	RunID       string
+	AgentEpochs uint64   // epochs anchored for the agent (all were checked)
+	Events      int      // distinct events of the run
+	LastStep    uint64   // highest step seen
+	Epochs      []uint64 // epochs the run's events are anchored in (earliest valid copy), ascending
+	SDKDropped  uint64   // events the SDK reported as dropped (sdk_dropped)
+	EndStatus   string   // status in the run_end payload, if present
 }
 
+// runEvent is one distinct event (by content digest) of the run.
 type runEvent struct {
 	ev     canonical.Event
+	raw    []byte
 	digest canonical.Digest
-	epoch  uint64
+	copies []uint64 // epochs holding a copy, ascending
+	epoch  uint64   // decisive copy: the earliest anchored copy that verifies
 }
 
-// Run verifies every event of a run (as in single-event mode) and the run's
-// hash chain: it must start at step 1 with a zero prev_hash, have no gaps or
-// forks, each prev_hash must be the previous event's content digest, no event
-// may be anchored in an earlier epoch than its predecessor, and the last
-// event must be run_end.
+// Run verifies one run against the complete evidence of its agent.
+//
+//  1. Completeness: the evidence must hold every epoch 1..latestEpoch of the
+//     agent, and each epoch's event list must rebuild its on-chain root with
+//     a count equal to logCount. The verifier therefore sees every anchored
+//     copy of every event, so a daemon cannot hide an early copy by
+//     presenting only later re-anchored ones.
+//  2. Every event of the run (events of other runs and other agents are
+//     skipped) must be in canonical form, carry a valid signature by a
+//     well-formed key registered for the agent, and have at least one
+//     anchored copy whose epoch was anchored while the key was valid. The
+//     earliest such copy decides the event's epoch; other copies (a replay
+//     anchored after the key was revoked, say) only produce a warning.
+//  3. The hash chain: one event per step from step 1 with a zero prev_hash,
+//     each prev_hash the previous event's content digest, no event in an
+//     earlier epoch than its predecessor, nothing after run_end, and run_end
+//     as the last event.
+//
+// Defects in the evidence are a FAILURE (Verified false); only RPC errors are
+// returned as an *OperationalError.
 func (v *Verifier) Run(ctx context.Context, in RunInput) (*RunReport, error) {
 	if in.RunID == "" {
 		return nil, opErr("run id is empty")
@@ -68,36 +96,135 @@ func (v *Verifier) Run(ctx context.Context, in RunInput) (*RunReport, error) {
 		rep.Verified, rep.Reason = false, fmt.Sprintf(format, a...)
 		return rep, nil
 	}
+	warn := func(format string, a ...any) { rep.Warnings = append(rep.Warnings, fmt.Sprintf(format, a...)) }
 
-	// 1. Every event of the run verifies on its own. Events of other runs,
-	// and documents that do not parse, cannot be attributed to this run and
-	// are skipped; if one of them was this run's, the chain check fails.
-	byDigest := map[canonical.Digest]*runEvent{}
-	for _, e := range in.Evidence {
-		ev, err := canonical.ParseEvent(e.EventJSON)
-		if err != nil || ev.RunID != in.RunID {
+	latestBig, err := v.reg.LatestEpoch(&bind.CallOpts{Context: ctx}, agentKey)
+	if err != nil {
+		return nil, opErr("RPC error reading latestEpoch: %v", err)
+	}
+	if !latestBig.IsUint64() {
+		return fail("latestEpoch is out of range")
+	}
+	latest := latestBig.Uint64()
+	rep.AgentEpochs = latest
+	if latest == 0 {
+		return fail("no epoch is anchored on chain for agent key %s, so run %q was never anchored", agentKey.Hex(), in.RunID)
+	}
+
+	// 1. Complete, root-checked evidence for every epoch.
+	byEpoch := map[uint64][]*EpochEvidence{}
+	for i := range in.Epochs {
+		e := &in.Epochs[i]
+		if e.AgentKey != nil && *e.AgentKey != agentKey {
+			continue // another agent's bundle
+		}
+		if e.EpochID == 0 || e.EpochID > latest {
+			warn("ignored %s: epoch %d is not anchored for this agent (latest epoch is %d)", e.Source, e.EpochID, latest)
 			continue
 		}
-		r, err := v.Event(ctx, e.EventJSON, e.Proof, e.EpochID, in.AgentID)
+		byEpoch[e.EpochID] = append(byEpoch[e.EpochID], e)
+	}
+	content := make([][][]byte, latest+1)
+	var missing []uint64
+	var mismatched []string
+	for ep := uint64(1); ep <= latest; ep++ {
+		cands := byEpoch[ep]
+		if len(cands) == 0 {
+			missing = append(missing, ep)
+			continue
+		}
+		anc, err := v.anchor(ctx, agentKey, ep)
 		if err != nil {
 			return nil, err
 		}
-		if !r.Verified {
-			return fail("step %d (epoch %d): %s", ev.StepNumber, e.EpochID, r.Reason)
+		var firstReason string
+		var ignored []string
+		for _, c := range cands {
+			reason := matchAnchor(c.Events, anc)
+			if reason == "" {
+				if content[ep] == nil {
+					content[ep] = c.Events
+				}
+				continue
+			}
+			if firstReason == "" {
+				firstReason = reason
+			}
+			ignored = append(ignored, fmt.Sprintf("ignored %s for epoch %d: %s", c.Source, ep, reason))
 		}
-		// A retransmission can be anchored twice; it existed by its earliest anchor.
-		if prev, ok := byDigest[r.ContentDigest]; !ok || e.EpochID < prev.epoch {
-			byDigest[r.ContentDigest] = &runEvent{ev: ev, digest: r.ContentDigest, epoch: e.EpochID}
+		if content[ep] == nil {
+			mismatched = append(mismatched, fmt.Sprintf("epoch %d: %s", ep, firstReason))
+			continue
+		}
+		for _, w := range ignored {
+			warn("%s", w)
 		}
 	}
-	if len(byDigest) == 0 {
-		return nil, opErr("no events of run %q for agent key %s in the evidence", in.RunID, agentKey.Hex())
+	if len(missing) > 0 {
+		return fail("evidence is incomplete: no evidence bundle for epoch(s) %s of the %d epochs anchored for this agent "+
+			"(run mode needs every epoch, so that no anchored copy of an event can be hidden)", ranges(missing), latest)
+	}
+	if len(mismatched) > 0 {
+		return fail("evidence does not match the on-chain anchors (events withheld, added, reordered or altered): %s",
+			strings.Join(mismatched, "; "))
 	}
 
-	// 2. One event per step: two validly signed events at the same step are a fork.
+	// 2. Collect the run's events with every anchored copy.
+	byDigest := map[canonical.Digest]*runEvent{}
+	var order []*runEvent
+	unparsed := 0
+	for ep := uint64(1); ep <= latest; ep++ {
+		for _, raw := range content[ep] {
+			ev, err := canonical.ParseEvent(raw)
+			if err != nil {
+				unparsed++
+				continue
+			}
+			if ev.RunID != in.RunID || canonical.AgentKey(ev.AgentID) != agentKey {
+				continue // another run, or an event of another agent inside this agent's epoch
+			}
+			d := canonical.ContentDigest(raw)
+			re := byDigest[d]
+			if re == nil {
+				re = &runEvent{ev: ev, raw: raw, digest: d}
+				byDigest[d] = re
+				order = append(order, re)
+			}
+			if n := len(re.copies); n == 0 || re.copies[n-1] != ep {
+				re.copies = append(re.copies, ep)
+			}
+		}
+	}
+	if unparsed > 0 {
+		warn("%d anchored entries of this agent are not VeriLog events and were skipped", unparsed)
+	}
+	if len(order) == 0 {
+		return fail("no events of run %q in any of the %d epochs anchored for agent key %s", in.RunID, latest, agentKey.Hex())
+	}
+
+	// Decide each event by its earliest valid copy.
+	var invalid []*runEvent
+	reasons := map[*runEvent]string{}
+	for _, re := range order {
+		reason, err := v.decide(ctx, agentKey, re, warn)
+		if err != nil {
+			return nil, err
+		}
+		if reason != "" {
+			invalid = append(invalid, re)
+			reasons[re] = reason
+		}
+	}
+	if len(invalid) > 0 {
+		sort.SliceStable(invalid, func(i, j int) bool { return invalid[i].ev.StepNumber < invalid[j].ev.StepNumber })
+		re := invalid[0]
+		return fail("step %d (epoch %d): %s", re.ev.StepNumber, re.copies[0], reasons[re])
+	}
+
+	// 3. One event per step: two validly signed events at the same step are a fork.
 	bySteps := map[uint64]*runEvent{}
 	epochs := map[uint64]bool{}
-	for _, e := range byDigest {
+	for _, e := range order {
 		if other, ok := bySteps[e.ev.StepNumber]; ok {
 			return fail("fork: two different signed events at step %d (digests %s and %s); the agent key was misused",
 				e.ev.StepNumber, other.digest.Hex(), e.digest.Hex())
@@ -117,7 +244,7 @@ func (v *Verifier) Run(ctx context.Context, in RunInput) (*RunReport, error) {
 	}
 	sort.Slice(rep.Epochs, func(i, j int) bool { return rep.Epochs[i] < rep.Epochs[j] })
 
-	// 3. The chain is contiguous from genesis and epochs never go backwards.
+	// The chain is contiguous from genesis and epochs never go backwards.
 	first := chain[0]
 	if first.ev.StepNumber != 1 {
 		return fail("run does not start at step 1: steps 1-%d are missing", first.ev.StepNumber-1)
@@ -158,7 +285,8 @@ func (v *Verifier) Run(ctx context.Context, in RunInput) (*RunReport, error) {
 		if !in.AllowIncomplete {
 			return fail("%s", msg)
 		}
-		rep.Warning = msg + " (accepted because of --allow-incomplete: a truncated run cannot be told apart from an agent crash)"
+		warn("%s (accepted as INCOMPLETE because of --allow-incomplete: a truncated run cannot be told apart from an agent crash)", msg)
+		rep.Incomplete = true
 	} else {
 		var p struct {
 			Status string `json:"status"`
@@ -169,4 +297,84 @@ func (v *Verifier) Run(ctx context.Context, in RunInput) (*RunReport, error) {
 	}
 	rep.Verified = true
 	return rep, nil
+}
+
+// decide checks one event of the run and sets re.epoch to its earliest
+// anchored copy that verifies. It returns why no copy verifies ("" if one
+// does); copies that do not verify next to one that does are warnings.
+func (v *Verifier) decide(ctx context.Context, agentKey canonical.Digest, re *runEvent, warn func(string, ...any)) (string, error) {
+	canon, err := re.ev.Canonical()
+	if err != nil {
+		return fmt.Sprintf("event cannot be canonicalized: %v", err), nil
+	}
+	if !bytes.Equal(canon, re.raw) {
+		return fmt.Sprintf("anchored event %s is not in canonical form, so it is not what the agent signed", re.digest.Hex()), nil
+	}
+	var firstReason string
+	var rejected []string
+	for _, ep := range re.copies {
+		anc, err := v.anchor(ctx, agentKey, ep)
+		if err != nil {
+			return "", err
+		}
+		reason, _, err := v.checkSource(ctx, agentKey, re.ev, ep, anc.timestamp)
+		if err != nil {
+			return "", err
+		}
+		if reason == "" {
+			if re.epoch == 0 {
+				re.epoch = ep
+			}
+			continue
+		}
+		if firstReason == "" {
+			firstReason = reason
+		}
+		rejected = append(rejected, fmt.Sprintf("epoch %d (%s)", ep, reason))
+	}
+	if re.epoch == 0 {
+		return firstReason, nil
+	}
+	for _, r := range rejected {
+		warn("step %d: a copy anchored in %s was ignored; the event verifies by its copy in epoch %d", re.ev.StepNumber, r, re.epoch)
+	}
+	return "", nil
+}
+
+// matchAnchor reports why events do not rebuild the anchored epoch ("" if
+// they do): the same number of events as logCount, and the same Merkle root.
+func matchAnchor(events [][]byte, anc anchorInfo) string {
+	if len(events) != int(anc.count) {
+		return fmt.Sprintf("it holds %d events, the on-chain anchor counts %d", len(events), anc.count)
+	}
+	leaves := make([]merkle.Hash, len(events))
+	for i, ev := range events {
+		leaves[i] = merkle.LeafFromDigest(canonical.ContentDigest(ev))
+	}
+	tree, err := merkle.Build(leaves)
+	if err != nil {
+		return err.Error()
+	}
+	if root := canonical.Digest(tree.Root()); root != anc.root {
+		return fmt.Sprintf("its events rebuild root %s, the on-chain root is %s", root.Hex(), anc.root.Hex())
+	}
+	return ""
+}
+
+// ranges formats ascending numbers as "1-3, 5".
+func ranges(ns []uint64) string {
+	var parts []string
+	for i := 0; i < len(ns); {
+		j := i
+		for j+1 < len(ns) && ns[j+1] == ns[j]+1 {
+			j++
+		}
+		if i == j {
+			parts = append(parts, fmt.Sprint(ns[i]))
+		} else {
+			parts = append(parts, fmt.Sprintf("%d-%d", ns[i], ns[j]))
+		}
+		i = j + 1
+	}
+	return strings.Join(parts, ", ")
 }

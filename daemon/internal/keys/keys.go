@@ -23,19 +23,32 @@ import (
 type Key struct {
 	Pubkey    ed25519.PublicKey
 	ValidFrom uint64 // block timestamp of registration
-	RevokedAt uint64 // block timestamp of revocation; 0 if not revoked
+	// RevokedAt is the time the revocation takes effect (the effectiveAt
+	// argument of revokeAgentKey, never earlier than the revoking block);
+	// 0 if not revoked. A revocation can be scheduled ahead of time.
+	RevokedAt uint64
 }
 
 // Registered reports whether the key exists on chain.
 func (k Key) Registered() bool { return len(k.Pubkey) == ed25519.PublicKeySize }
 
-// Revoked reports whether the key has been revoked (at any time).
+// Revoked reports whether a revocation has been recorded, whether or not it
+// is in effect yet.
 func (k Key) Revoked() bool { return k.RevokedAt != 0 }
 
+// RevokedBy reports whether the revocation is in effect at time ts.
+func (k Key) RevokedBy(ts uint64) bool { return k.RevokedAt != 0 && ts >= k.RevokedAt }
+
+// WellFormed reports why the registered public key is unsafe to verify with
+// (small or mixed order, non-canonical, not on the curve), or nil. The
+// contract refuses such keys, but keys registered before that check existed
+// are rejected here too.
+func (k Key) WellFormed() error { return canonical.CheckPublicKey(k.Pubkey) }
+
 // ValidAt applies the validity rule to a trusted anchor timestamp:
-// validFrom <= ts && (revokedAt == 0 || ts < revokedAt).
+// a well-formed key with validFrom <= ts && (revokedAt == 0 || ts < revokedAt).
 func (k Key) ValidAt(ts uint64) bool {
-	return k.Registered() && k.ValidFrom <= ts && (k.RevokedAt == 0 || ts < k.RevokedAt)
+	return k.Registered() && k.WellFormed() == nil && k.ValidFrom <= ts && !k.RevokedBy(ts)
 }
 
 // Source returns the on-chain key of (agentKey, keyID); the zero Key when it
@@ -73,7 +86,8 @@ func (c *ChainSource) AgentKey(ctx context.Context, agentKey, keyID canonical.Di
 // Cache memoizes a Source. Registered, unrevoked keys are kept for TTL so a
 // later revocation is picked up; unknown keys are re-queried after NegativeTTL
 // (a new registration is seen quickly, while a flood of events signed with an
-// unknown key does not turn into a flood of RPC calls); revoked keys are final.
+// unknown key does not turn into a flood of RPC calls); revoked keys are final
+// (revokedAt cannot change once set).
 type Cache struct {
 	src         Source
 	ttl         time.Duration
@@ -127,4 +141,26 @@ func (c *Cache) AgentKey(ctx context.Context, agentKey, keyID canonical.Digest) 
 	c.entries[id] = e
 	c.mu.Unlock()
 	return k, nil
+}
+
+// RevocationCheck answers engine.KeyChecker from a Source (it should be
+// uncached, so a revocation is seen as soon as it is on chain) and a clock.
+type RevocationCheck struct {
+	Src Source
+	// Now returns the current time in Unix seconds; the chain's latest block
+	// timestamp is a good choice, since that is what the anchor will carry.
+	Now func(ctx context.Context) (uint64, error)
+}
+
+// RevokedNow implements engine.KeyChecker.
+func (r RevocationCheck) RevokedNow(ctx context.Context, agentKey, keyID canonical.Digest) (bool, error) {
+	k, err := r.Src.AgentKey(ctx, agentKey, keyID)
+	if err != nil || !k.Revoked() {
+		return false, err
+	}
+	now, err := r.Now(ctx)
+	if err != nil {
+		return false, err
+	}
+	return k.RevokedBy(now), nil
 }

@@ -327,6 +327,9 @@ func TestStreamEnforcesSignatures(t *testing.T) {
 	unregistered := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{1}, ed25519.SeedSize))
 	revoked := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{2}, ed25519.SeedSize))
 	e.keys.set(revoked, keys.Key{ValidFrom: 1, RevokedAt: 2})
+	// A revocation recorded for the future already stops intake (drain window).
+	scheduled := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{5}, ed25519.SeedSize))
+	e.keys.set(scheduled, keys.Key{ValidFrom: 1, RevokedAt: 1 << 40})
 
 	good := logEvent("agent-s", 1)
 	unsigned := logEvent("agent-s", 2)
@@ -342,20 +345,33 @@ func TestStreamEnforcesSignatures(t *testing.T) {
 	shortKeyID := logEvent("agent-s", 7)
 	shortKeyID.KeyId = shortKeyID.KeyId[:31]
 	good2 := logEvent("agent-s", 8)
+	scheduledKey := logEventWith(scheduled, "agent-s", 9)
+	// A small-order key registered in an older registry (H1): rejected.
+	weak := logEventWith(nil, "agent-s", 10)
+	var identity [32]byte
+	identity[0] = 1
+	weakID := canonical.KeyID(identity[:])
+	weak.KeyId = weakID[:]
+	e.keys.mu.Lock()
+	e.keys.keys[weakID] = keys.Key{Pubkey: identity[:], ValidFrom: 1}
+	e.keys.mu.Unlock()
 
 	cases := []struct {
-		msg      *verilogv1.LogEvent
-		accepted bool
-		errHas   string
+		msg       *verilogv1.LogEvent
+		accepted  bool
+		errHas    string
+		retryable bool
 	}{
-		{good, true, ""},
-		{unsigned, false, "not signed"},
-		{wrongKey, false, "signature does not verify"},
-		{unknownKey, false, "not registered"},
-		{revokedKey, false, "revoked"},
-		{altered, false, "signature does not verify"},
-		{shortKeyID, false, "key_id must be 32 bytes"},
-		{good2, true, ""},
+		{good, true, "", false},
+		{unsigned, false, "not signed", false},
+		{wrongKey, false, "signature does not verify", false},
+		{unknownKey, false, "not registered", true}, // may just not be visible yet
+		{revokedKey, false, "revoked", false},
+		{altered, false, "signature does not verify", false},
+		{shortKeyID, false, "key_id must be 32 bytes", false},
+		{good2, true, "", false},
+		{scheduledKey, false, "revoked (effective at", false},
+		{weak, false, "small order", false},
 	}
 	stream, err := e.client.IngestStream(context.Background())
 	if err != nil {
@@ -372,7 +388,7 @@ func TestStreamEnforcesSignatures(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if ack.Sequence != c.msg.Sequence || ack.Accepted != c.accepted || !strings.Contains(ack.Error, c.errHas) {
+		if ack.Sequence != c.msg.Sequence || ack.Accepted != c.accepted || !strings.Contains(ack.Error, c.errHas) || ack.Retryable != c.retryable {
 			t.Errorf("event %d: ack %+v, want accepted=%v error containing %q", c.msg.Sequence, ack, c.accepted, c.errHas)
 		}
 	}
@@ -402,5 +418,59 @@ func TestStreamFailsWhenKeyRegistryIsDown(t *testing.T) {
 	_, err = stream.Recv()
 	if status.Code(err) != codes.Unavailable {
 		t.Fatalf("err = %v, want Unavailable", err)
+	}
+}
+
+// PoC 6 (H2, daemon side): with verilogd's receive limit, a payload over the
+// cap is a per-event rejection, and the stream goes on, even when the
+// message is far larger than the cap.
+func TestOversizedPayloadIsRejectedPerEvent(t *testing.T) {
+	const P = 1 << 16
+	dir := t.TempDir()
+	w, recs, _ := wal.Open(dir+"/wal", 1<<26, nil)
+	st, _ := store.Open(dir)
+	eng, _ := engine.New(engine.Config{EpochInterval: time.Hour, EpochMaxLogs: 1 << 20}, w, st, &jobSink{}, nil)
+	eng.Recover(recs)
+	ctx, cancel := context.WithCancel(context.Background())
+	eng.Start(ctx)
+	lis := bufconn.Listen(1 << 20)
+	srv := grpc.NewServer(grpc.MaxRecvMsgSize(MaxRecvMsgSize(P)))
+	reg := &fakeKeys{keys: map[canonical.Digest]keys.Key{}}
+	reg.set(testKey, keys.Key{ValidFrom: 1})
+	verilogv1.RegisterVeriLogServer(srv, NewServer(eng, st, Options{MaxPayloadBytes: P, Window: 64, Keys: reg}, nil))
+	go srv.Serve(lis)
+	conn, _ := grpc.NewClient("passthrough:///bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return lis.Dial() }),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
+	t.Cleanup(func() { conn.Close(); srv.Stop(); cancel(); eng.Close(); w.Close() })
+
+	big := func(n int, seq uint64) *verilogv1.LogEvent {
+		ev := canonical.Event{AgentID: "a", RunID: "r", StepNumber: seq, EventType: "tool_end",
+			PayloadJSON: []byte(`{"output":"` + strings.Repeat("x", n) + `"}`), TimestampUTC: time.Unix(1_800_000_000, 0).UTC()}
+		if err := ev.Sign(testKey); err != nil {
+			t.Fatal(err)
+		}
+		return &verilogv1.LogEvent{AgentId: ev.AgentID, RunId: ev.RunID, StepNumber: seq, EventType: ev.EventType,
+			PayloadJson: string(ev.PayloadJSON), TimestampUtc: timestamppb.New(ev.TimestampUTC),
+			PrevHash: ev.PrevHash[:], KeyId: ev.KeyID[:], Signature: ev.Sig, Sequence: seq}
+	}
+	stream, err := verilogv1.NewVeriLogClient(conn).IngestStream(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, n := range []int{P + 10, 2 * P, 3 * P, 10} {
+		if err := stream.Send(big(n, uint64(i+1))); err != nil {
+			t.Fatal(err)
+		}
+		ack, err := stream.Recv()
+		if err != nil {
+			t.Fatalf("%d-byte payload killed the stream: %v", n, err)
+		}
+		if want := n <= P; ack.Accepted != want {
+			t.Fatalf("%d-byte payload: %+v", n, ack)
+		}
+		if !ack.Accepted && (ack.Retryable || !strings.Contains(ack.Error, "size limit")) {
+			t.Fatalf("%d-byte payload: %+v", n, ack)
+		}
 	}
 }

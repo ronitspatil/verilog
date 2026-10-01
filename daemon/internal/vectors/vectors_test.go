@@ -288,5 +288,8 @@ func TestSignedVectors(t *testing.T) {
 		"public_key":     "0x" + hex.EncodeToString(pub),
 		"key_id":         canonical.KeyID(pub).Hex(),
 		"run":            run,
+		// Proof of possession for registering the key under run[0].agent_id:
+		// ed25519(seed, "VeriLog/pop/v1\n" || keccak256(agent_id) || public_key).
+		"pop": "0x" + hex.EncodeToString(canonical.SignPoP(priv, canonical.AgentKey(run[0].AgentID))),
 	}))
 }

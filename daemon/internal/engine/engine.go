@@ -8,6 +8,8 @@
 //	                                                 ▼ resolve each submitter's result (ack)
 //	sealer goroutine ── every EpochInterval, or when a shard reaches EpochMaxLogs:
 //	   swap the shard's tree for a fresh one (ingestion never waits on hashing),
+//	   re-check the agent keys on chain and leave out events whose key's
+//	   revocation is already in effect (they could never verify),
 //	   build the root, commit a "sealed" WAL record, enqueue an anchor job.
 //	anchor worker ── anchors sealed epochs one at a time, then finalize():
 //	   write the evidence bundle, advance the checkpoint, compact the WAL.
@@ -45,6 +47,20 @@ type Config struct {
 	SubmitQueue   int           // capacity of the submit channel (backpressure point)
 	ChainID       string        // recorded in evidence bundles
 	Contract      string        // recorded in evidence bundles
+	// KeyCheck, if set, is consulted when an epoch is sealed: events signed
+	// with a key whose revocation is already in effect are left out of the
+	// epoch. The ingest-time check uses a cache, so a key revoked moments
+	// ago (or a replay of old events) can still be accepted; anchoring such
+	// events after the revocation would only produce evidence that can never
+	// verify.
+	KeyCheck KeyChecker
+}
+
+// KeyChecker re-checks agent keys on chain when an epoch is sealed.
+type KeyChecker interface {
+	// RevokedNow reports whether the revocation of keyID of agentKey is in
+	// effect now (a scheduled, not yet effective revocation is not).
+	RevokedNow(ctx context.Context, agentKey, keyID canonical.Digest) (bool, error)
 }
 
 // Enqueuer receives sealed epochs for anchoring (anchor.Worker).
@@ -55,6 +71,7 @@ type Enqueuer interface {
 // Prepared is a validated, canonicalized event ready to commit.
 type Prepared struct {
 	AgentID   string
+	KeyID     canonical.Digest
 	Canonical []byte
 	Digest    [32]byte // SHA-256 of Canonical
 	Leaf      [32]byte // keccak256(Digest)
@@ -67,7 +84,7 @@ func Prepare(ev canonical.Event) (Prepared, error) {
 		return Prepared{}, err
 	}
 	d := canonical.ContentDigest(canon)
-	return Prepared{AgentID: ev.AgentID, Canonical: canon, Digest: d, Leaf: merkle.LeafFromDigest(d)}, nil
+	return Prepared{AgentID: ev.AgentID, KeyID: ev.KeyID, Canonical: canon, Digest: d, Leaf: merkle.LeafFromDigest(d)}, nil
 }
 
 // Result is the outcome of one submission.
@@ -81,6 +98,9 @@ type Result struct {
 // Stats are cumulative counters.
 type Stats struct {
 	Accepted, Duplicates, SealedEpochs, AnchoredEpochs uint64
+	// RevokedExcluded counts accepted events left out of their epoch at
+	// seal time because their key's revocation was already in effect.
+	RevokedExcluded uint64
 }
 
 type entry struct {
@@ -88,6 +108,7 @@ type entry struct {
 	canonical []byte
 	digest    [32]byte
 	leaf      merkle.Hash
+	keyID     canonical.Digest
 }
 
 // shard holds one agent's open epoch.
@@ -192,8 +213,8 @@ type Engine struct {
 	cpMu       sync.Mutex
 	checkpoint store.Checkpoint
 
-	accepted, duplicates, sealed, anchored atomic.Uint64
-	fatal                                  chan error
+	accepted, duplicates, sealed, anchored, revokedExcluded atomic.Uint64
+	fatal                                                   chan error
 }
 
 // New creates an engine. Call Recover with the WAL's records, then Start.
@@ -294,7 +315,11 @@ func (e *Engine) Recover(recs []wal.Record) error {
 
 	toEntry := func(r wal.Record) entry {
 		d := canonical.ContentDigest(r.Event)
-		return entry{seq: r.Seq, canonical: []byte(r.Event), digest: d, leaf: merkle.LeafFromDigest(d)}
+		en := entry{seq: r.Seq, canonical: []byte(r.Event), digest: d, leaf: merkle.LeafFromDigest(d)}
+		if ev, err := canonical.ParseEvent(r.Event); err == nil {
+			en.keyID = ev.KeyID
+		}
+		return en
 	}
 	var requeued, reopened int
 	for _, agentID := range order {
@@ -302,13 +327,22 @@ func (e *Engine) Recover(recs []wal.Record) error {
 		i := 0
 		for _, s := range l.seals {
 			var entries []entry
+			skip := make(map[uint64]bool, len(s.Skip))
+			for _, q := range s.Skip {
+				skip[q] = true
+			}
 			for i < len(l.events) && l.events[i].Seq <= s.LastSeq {
 				if l.events[i].Seq < s.FirstSeq {
 					return fmt.Errorf("engine: recover %s: event seq %d precedes sealed epoch [%d,%d] and is not anchored",
 						agentID, l.events[i].Seq, s.FirstSeq, s.LastSeq)
 				}
-				entries = append(entries, toEntry(l.events[i]))
+				if !skip[l.events[i].Seq] {
+					entries = append(entries, toEntry(l.events[i]))
+				}
 				i++
+			}
+			if len(entries) == 0 && s.Count == 0 {
+				continue // every event was left out at seal time: nothing to anchor
 			}
 			b, err := e.buildSealed(agentID, entries)
 			if err != nil {
@@ -335,11 +369,7 @@ func (e *Engine) buildSealed(agentID string, entries []entry) (*sealedEpoch, err
 	if len(entries) == 0 {
 		return nil, merkle.ErrEmptyTree
 	}
-	leaves := make([]merkle.Hash, len(entries))
-	for i, en := range entries {
-		leaves[i] = en.leaf
-	}
-	tree, err := merkle.Build(leaves)
+	tree, err := merkle.Build(leavesOf(entries))
 	if err != nil {
 		return nil, err
 	}
@@ -461,7 +491,7 @@ func (e *Engine) commit(batch []*submission) {
 		} else {
 			inBatch[p.AgentID] = map[[32]byte]entry{}
 		}
-		en := entry{seq: e.nextSeq, canonical: p.Canonical, digest: p.Digest, leaf: p.Leaf}
+		en := entry{seq: e.nextSeq, canonical: p.Canonical, digest: p.Digest, leaf: p.Leaf, keyID: p.KeyID}
 		e.nextSeq++
 		inBatch[p.AgentID][p.Digest] = en
 		recs = append(recs, wal.Record{Type: wal.TypeEvent, AgentID: p.AgentID, Seq: en.seq, Event: p.Canonical})
@@ -553,21 +583,30 @@ func (e *Engine) sealWhere(ctx context.Context, pred func(int) bool) error {
 }
 
 // seal closes a shard's open epoch. The swap holds the shard lock only for a
-// pointer exchange; root computation and the WAL write happen outside it.
+// pointer exchange; the key re-check, root computation and the WAL write
+// happen outside it.
 func (e *Engine) seal(ctx context.Context, s *shard) error {
 	tree, entries := s.swap()
 	if len(entries) == 0 {
 		return nil
 	}
-	snap, err := tree.Seal()
-	if err != nil {
-		return err
-	}
-	b := &sealedEpoch{agentID: s.agentID, agentKey: s.agentKey, entries: entries, tree: snap}
-	rec := &wal.Record{
-		Type: wal.TypeSealed, AgentID: s.agentID,
-		FirstSeq: entries[0].seq, LastSeq: entries[len(entries)-1].seq,
-		Count: len(entries), Root: canonical.Digest(snap.Root()).Hex(),
+	firstSeq, lastSeq := entries[0].seq, entries[len(entries)-1].seq
+	kept, skipped := e.recheckKeys(ctx, s, entries)
+	rec := &wal.Record{Type: wal.TypeSealed, AgentID: s.agentID, FirstSeq: firstSeq, LastSeq: lastSeq, Skip: skipped}
+	var b *sealedEpoch
+	if len(kept) > 0 {
+		var snap *merkle.Sealed
+		var err error
+		if len(skipped) == 0 {
+			snap, err = tree.Seal()
+		} else {
+			snap, err = merkle.Build(leavesOf(kept))
+		}
+		if err != nil {
+			return err
+		}
+		b = &sealedEpoch{agentID: s.agentID, agentKey: s.agentKey, entries: kept, tree: snap}
+		rec.Count, rec.Root = len(kept), canonical.Digest(snap.Root()).Hex()
 	}
 	// The seal must be durable before anchoring, so a crash can never anchor
 	// a grouping that replay would not reproduce.
@@ -581,10 +620,64 @@ func (e *Engine) seal(ctx context.Context, s *shard) error {
 		// Events stay durable in the WAL; replay will reopen them.
 		return err
 	}
+	if b == nil {
+		e.log.Error("engine: epoch sealed empty: every event was signed with a revoked key", "agent", s.agentID,
+			"excluded", len(skipped), "first_seq", firstSeq, "last_seq", lastSeq)
+		return nil
+	}
 	e.sealed.Add(1)
-	e.log.Info("engine: epoch sealed", "agent", s.agentID, "events", len(entries), "root", rec.Root, "first_seq", rec.FirstSeq, "last_seq", rec.LastSeq)
+	e.log.Info("engine: epoch sealed", "agent", s.agentID, "events", len(kept), "excluded", len(skipped), "root", rec.Root, "first_seq", firstSeq, "last_seq", lastSeq)
 	e.enqueueAnchor(b)
 	return nil
+}
+
+// recheckKeys asks KeyCheck, once per distinct key, whether the key's
+// revocation is in effect, and splits the entries into those to anchor and
+// the sequence numbers of those left out. A failed lookup keeps the events
+// (the verifier still judges the key against the anchor time).
+func (e *Engine) recheckKeys(ctx context.Context, s *shard, entries []entry) ([]entry, []uint64) {
+	if e.cfg.KeyCheck == nil {
+		return entries, nil
+	}
+	revoked := map[canonical.Digest]bool{}
+	for _, en := range entries {
+		if _, ok := revoked[en.keyID]; ok {
+			continue
+		}
+		cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		r, err := e.cfg.KeyCheck.RevokedNow(cctx, s.agentKey, en.keyID)
+		cancel()
+		if err != nil {
+			e.log.Warn("engine: seal-time key check failed; anchoring the events anyway", "agent", s.agentID, "key_id", en.keyID.Hex(), "err", err)
+		}
+		revoked[en.keyID] = r && err == nil
+	}
+	var kept []entry
+	var skipped []uint64
+	excluded := map[canonical.Digest]int{}
+	for _, en := range entries {
+		if revoked[en.keyID] {
+			skipped = append(skipped, en.seq)
+			excluded[en.keyID]++
+			continue
+		}
+		kept = append(kept, en)
+	}
+	for keyID, n := range excluded {
+		e.revokedExcluded.Add(uint64(n))
+		e.log.Error("engine: events signed with a revoked key left out of the epoch; they can never verify",
+			"agent", s.agentID, "key_id", keyID.Hex(), "events", n,
+			"hint", "drain an agent's events before its key's revocation takes effect (see the key rotation runbook)")
+	}
+	return kept, skipped
+}
+
+func leavesOf(entries []entry) []merkle.Hash {
+	leaves := make([]merkle.Hash, len(entries))
+	for i, en := range entries {
+		leaves[i] = en.leaf
+	}
+	return leaves
 }
 
 func (e *Engine) enqueueAnchor(b *sealedEpoch) {
@@ -668,10 +761,11 @@ func (e *Engine) finalize(b *sealedEpoch, res anchor.Result) error {
 // Stats returns cumulative counters.
 func (e *Engine) Stats() Stats {
 	return Stats{
-		Accepted:       e.accepted.Load(),
-		Duplicates:     e.duplicates.Load(),
-		SealedEpochs:   e.sealed.Load(),
-		AnchoredEpochs: e.anchored.Load(),
+		Accepted:        e.accepted.Load(),
+		Duplicates:      e.duplicates.Load(),
+		SealedEpochs:    e.sealed.Load(),
+		AnchoredEpochs:  e.anchored.Load(),
+		RevokedExcluded: e.revokedExcluded.Load(),
 	}
 }
 

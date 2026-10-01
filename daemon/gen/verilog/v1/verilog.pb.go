@@ -35,7 +35,9 @@ type LogEvent struct {
 	StepNumber uint64 `protobuf:"varint,2,opt,name=step_number,json=stepNumber,proto3" json:"step_number,omitempty"`
 	EventType  string `protobuf:"bytes,3,opt,name=event_type,json=eventType,proto3" json:"event_type,omitempty"`
 	// UTF-8 JSON document. Re-canonicalized by the daemon, so key order and
-	// whitespace do not matter, but the value must be valid JSON.
+	// whitespace do not matter, but the value must be valid JSON. Events whose
+	// payload_json exceeds the daemon's --max-payload-bytes are rejected; the
+	// SDK replaces an oversized payload with a signed stand-in before chaining.
 	PayloadJson  string                 `protobuf:"bytes,4,opt,name=payload_json,json=payloadJson,proto3" json:"payload_json,omitempty"`
 	TimestampUtc *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=timestamp_utc,json=timestampUtc,proto3" json:"timestamp_utc,omitempty"`
 	// Root run this event belongs to; each run is its own hash chain.
@@ -168,7 +170,12 @@ type Ack struct {
 	Leaf []byte `protobuf:"bytes,5,opt,name=leaf,proto3" json:"leaf,omitempty"`
 	// True when an identical event was already committed to the open epoch;
 	// the event is not committed twice.
-	Duplicate     bool `protobuf:"varint,6,opt,name=duplicate,proto3" json:"duplicate,omitempty"`
+	Duplicate bool `protobuf:"varint,6,opt,name=duplicate,proto3" json:"duplicate,omitempty"`
+	// Set on a rejection that may succeed if the identical event is sent again
+	// later, for example because the agent key is not yet visible on chain.
+	// The client should retry it (with backoff, for a bounded time) instead of
+	// leaving a gap in the run's hash chain.
+	Retryable     bool `protobuf:"varint,7,opt,name=retryable,proto3" json:"retryable,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -241,6 +248,13 @@ func (x *Ack) GetLeaf() []byte {
 func (x *Ack) GetDuplicate() bool {
 	if x != nil {
 		return x.Duplicate
+	}
+	return false
+}
+
+func (x *Ack) GetRetryable() bool {
+	if x != nil {
+		return x.Retryable
 	}
 	return false
 }
@@ -488,14 +502,15 @@ const file_verilog_v1_verilog_proto_rawDesc = "" +
 	"\tprev_hash\x18\a \x01(\fR\bprevHash\x12\x15\n" +
 	"\x06key_id\x18\b \x01(\fR\x05keyId\x12\x1c\n" +
 	"\tsignature\x18\t \x01(\fR\tsignature\x12\x1a\n" +
-	"\bsequence\x18\x0f \x01(\x04R\bsequence\"\xac\x01\n" +
+	"\bsequence\x18\x0f \x01(\x04R\bsequence\"\xca\x01\n" +
 	"\x03Ack\x12\x1a\n" +
 	"\bsequence\x18\x01 \x01(\x04R\bsequence\x12\x1a\n" +
 	"\baccepted\x18\x02 \x01(\bR\baccepted\x12\x14\n" +
 	"\x05error\x18\x03 \x01(\tR\x05error\x12%\n" +
 	"\x0econtent_digest\x18\x04 \x01(\fR\rcontentDigest\x12\x12\n" +
 	"\x04leaf\x18\x05 \x01(\fR\x04leaf\x12\x1c\n" +
-	"\tduplicate\x18\x06 \x01(\bR\tduplicate\"\x9d\x01\n" +
+	"\tduplicate\x18\x06 \x01(\bR\tduplicate\x12\x1c\n" +
+	"\tretryable\x18\a \x01(\bR\tretryable\"\x9d\x01\n" +
 	"\x0fGetProofRequest\x12\x19\n" +
 	"\bagent_id\x18\x01 \x01(\tR\aagentId\x12\x19\n" +
 	"\bepoch_id\x18\x02 \x01(\x04R\aepochId\x12\x1f\n" +

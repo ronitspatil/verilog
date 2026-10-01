@@ -25,7 +25,7 @@ func (f *fakeSource) AgentKey(_ context.Context, _, keyID canonical.Digest) (Key
 }
 
 func TestValidAt(t *testing.T) {
-	pub := make(ed25519.PublicKey, ed25519.PublicKeySize)
+	pub := ed25519.NewKeyFromSeed(make([]byte, 32)).Public().(ed25519.PublicKey)
 	k := Key{Pubkey: pub, ValidFrom: 100}
 	for ts, want := range map[uint64]bool{99: false, 100: true, 10_000: true} {
 		if k.ValidAt(ts) != want {
@@ -40,6 +40,15 @@ func TestValidAt(t *testing.T) {
 	}
 	if (Key{}).ValidAt(150) {
 		t.Error("unregistered key valid")
+	}
+	if !k.RevokedBy(200) || k.RevokedBy(199) || (Key{Pubkey: pub}).RevokedBy(1<<40) {
+		t.Error("RevokedBy")
+	}
+	// A small-order key registered before the contract refused them is never valid (H1).
+	weak := make(ed25519.PublicKey, ed25519.PublicKeySize)
+	weak[0] = 1 // the identity point
+	if (Key{Pubkey: weak, ValidFrom: 1}).ValidAt(150) || (Key{Pubkey: weak}).WellFormed() == nil {
+		t.Error("weak key accepted")
 	}
 }
 

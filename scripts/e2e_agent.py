@@ -7,6 +7,11 @@ signs with the key in VERILOG_SIGNING_KEY_FILE.
 With --capture FILE the events go to an in-process stand-in for a
 compromised daemon instead, which writes the signed canonical events to FILE
 (JSON lines) without anchoring them.
+
+--big-output N makes the tool of the first run return N bytes (an oversized
+tool output). --open-run ID also records two events of run ID that never
+ends (an agent crash). --key-wait S bounds how long events rejected as "key
+not registered" are retried.
 """
 
 import argparse
@@ -22,7 +27,7 @@ from langchain_core.prompts import PromptTemplate
 from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import tool
 
-from verilog_sdk import VeriLogLangGraphCallback
+from verilog_sdk import VeriLogClient, VeriLogLangGraphCallback
 from verilog_sdk._proto import verilog_pb2, verilog_pb2_grpc
 from verilog_sdk.canonical import event_text
 
@@ -45,9 +50,16 @@ class CaptureDaemon(verilog_pb2_grpc.VeriLogServicer):
             yield verilog_pb2.Ack(sequence=ev.sequence, accepted=True)
 
 
+BIG_OUTPUT = 0
+
+
 @tool
 def lookup_weather(city: str) -> str:
     """Look up the weather for a city."""
+    global BIG_OUTPUT
+    if BIG_OUTPUT:
+        n, BIG_OUTPUT = BIG_OUTPUT, 0
+        return "x" * n
     return f"sunny and 21C in {city}"
 
 
@@ -57,7 +69,12 @@ def main() -> int:
     ap.add_argument("--capture", help="write signed events to this file instead of sending them to a daemon")
     ap.add_argument("--agent-id", required=True)
     ap.add_argument("--runs", type=int, default=3)
+    ap.add_argument("--big-output", type=int, default=0)
+    ap.add_argument("--open-run")
+    ap.add_argument("--key-wait", type=float, default=60.0)
     args = ap.parse_args()
+    global BIG_OUTPUT
+    BIG_OUTPUT = args.big_output
 
     cities = ["Paris", "Tokyo", "Lima", "Oslo", "Cairo"]
     llm = FakeListLLM(responses=cities)
@@ -76,13 +93,18 @@ def main() -> int:
         server.start()
     elif not target:
         ap.error("--target or --capture is required")
-    handler = VeriLogLangGraphCallback(args.agent_id, target=target)
+    client = VeriLogClient(target, key_wait_timeout=args.key_wait)
+    handler = VeriLogLangGraphCallback(args.agent_id, client=client)
     for i in range(args.runs):
         out = chain.invoke({"question": f"trip #{i}"}, config={"callbacks": [handler]})
         print(f"run {i}: {out}", file=sys.stderr)
-    ok = handler.close(timeout=30)
+    if args.open_run:
+        client.submit(args.agent_id, args.open_run, "chain_start", {"note": "crashes before run_end"})
+        client.submit(args.agent_id, args.open_run, "tool_start", {"tool": "lookup_weather"})
+    ok = handler.close(timeout=30) and client.close(timeout=30)
     stats = handler.client.stats()
-    print(f"acked={stats.acked} rejected={stats.rejected} dropped={stats.dropped}", file=sys.stderr)
+    print(f"acked={stats.acked} rejected={stats.rejected} dropped={stats.dropped} truncated={stats.truncated} "
+          f"chain_gaps={stats.chain_gaps}", file=sys.stderr)
     if capture is not None:
         server.stop(grace=None)
         with open(args.capture, "w") as f:

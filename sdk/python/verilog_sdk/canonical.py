@@ -20,7 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -42,6 +42,8 @@ SIGNING_DOMAIN = b"VeriLog/event/v1\n"
 ZERO_HASH = bytes(32)
 
 _MAX_DEPTH = 128
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 def _utf16_key(s: str) -> bytes:
@@ -122,7 +124,9 @@ def canonical_json(value: Any) -> str:
 def format_timestamp(ts_ns: int) -> str:
     """Format a Unix timestamp in nanoseconds the way the daemon hashes it."""
     secs, nanos = divmod(ts_ns, 1_000_000_000)
-    base = datetime.fromtimestamp(secs, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    # Not datetime.fromtimestamp: it fails on some platforms for far-future
+    # values the daemon accepts (up to year 9999).
+    base = (_EPOCH + timedelta(seconds=secs)).strftime("%Y-%m-%dT%H:%M:%S")
     return f"{base}.{nanos:09d}Z"
 
 

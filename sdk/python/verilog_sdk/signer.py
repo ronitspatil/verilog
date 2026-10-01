@@ -23,7 +23,10 @@ from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption,
 
 from ._keccak import keccak256
 
-__all__ = ["Signer", "ENV_KEY_FILE", "ENV_KEY", "keccak256", "write_key_file"]
+__all__ = ["Signer", "ENV_KEY_FILE", "ENV_KEY", "POP_DOMAIN", "keccak256", "write_key_file"]
+
+#: Prefix of the proof-of-possession message (see Signer.proof_of_possession).
+POP_DOMAIN = b"VeriLog/pop/v1\n"
 
 ENV_KEY_FILE = "VERILOG_SIGNING_KEY_FILE"
 ENV_KEY = "VERILOG_SIGNING_KEY"
@@ -65,6 +68,15 @@ class Signer:
     def sign(self, message: bytes) -> bytes:
         """Ed25519 signature (64 bytes, deterministic)."""
         return self._key.sign(message)
+
+    def proof_of_possession(self, agent_id: str) -> bytes:
+        """Signature over ``POP_DOMAIN || keccak256(agent_id) || public_key``.
+
+        The key admin checks it (``verilog-verify keycheck``) before
+        registering the key: it shows the requester holds the private key and
+        meant it for this agent, and keycheck also refuses unsafe keys.
+        """
+        return self.sign(POP_DOMAIN + keccak256(agent_id.encode("utf-8")) + self.public_key)
 
     @classmethod
     def generate(cls) -> "Signer":

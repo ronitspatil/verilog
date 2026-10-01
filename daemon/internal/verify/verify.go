@@ -1,14 +1,18 @@
 // Package verify implements forensic verification of logged events against
 // the Merkle roots and agent keys recorded on chain.
 //
-// Single-event mode checks one event: inclusion in the anchored epoch, a
-// valid Ed25519 signature, and a key that was registered and not revoked at
-// the epoch's anchor time. Run mode checks every event of one run the same
-// way, plus the hash chain: contiguous from genesis, no forks, epochs never
-// going backwards along the chain, and a terminal run_end event.
+// Single-event mode checks one event: an event file that is exactly the
+// canonical bytes, inclusion in the anchored epoch, a valid Ed25519
+// signature, and a well-formed key that was registered and not revoked at
+// the epoch's anchor time. Run mode requires the complete evidence of the
+// agent (every anchored epoch, each rebuilding its on-chain root), checks
+// every event of one run the same way, plus the hash chain: contiguous from
+// genesis, no forks, epochs never going backwards along the chain, and a
+// terminal run_end event.
 //
 // Only the chain is trusted. Evidence bundles and event files come from the
-// daemon host and are treated as untrusted input.
+// daemon host and are treated as untrusted input: any defect in them is a
+// FAILURE verdict, never a "no verdict" outcome.
 package verify
 
 import (
@@ -29,8 +33,10 @@ import (
 	"github.com/ronitspatil/verilog/daemon/internal/registry"
 )
 
-// OperationalError means verification could not be performed (bad input
-// files, RPC failure, epoch not anchored). It is never a verdict.
+// OperationalError means verification could not be performed: bad
+// arguments, unreadable files, or an RPC failure. It is never a verdict, and
+// a defect in the evidence itself (an unanchored epoch, a malformed event, a
+// missing bundle) is never an OperationalError: it is a FAILURE.
 type OperationalError struct{ Err error }
 
 func (e *OperationalError) Error() string { return e.Err.Error() }
@@ -58,6 +64,10 @@ type Report struct {
 	KeyID      canonical.Digest
 	PrevHash   canonical.Digest
 	KeyStatus  string // e.g. "valid at anchor time"
+	// Canonical holds the canonical bytes of the event when the event file
+	// parsed but was not in canonical form: these are the bytes that were
+	// hashed and signed, which may display different values.
+	Canonical []byte
 }
 
 // Input describes one event to verify.
@@ -117,6 +127,8 @@ type Verifier struct {
 type anchorInfo struct {
 	root      canonical.Digest
 	timestamp uint64
+	count     uint32
+	found     bool // false: the epoch is not anchored for the agent
 }
 
 // New binds the registry at contract. It returns an *OperationalError if
@@ -153,6 +165,8 @@ func Verify(ctx context.Context, backend bind.ContractBackend, in Input) (*Repor
 	return v.Event(ctx, in.EventJSON, in.Proof, in.EpochID, in.AgentID)
 }
 
+// anchor reads an epoch's anchor. An epoch that is not anchored is not an
+// error (found is false): it is a claim of the evidence that the chain refutes.
 func (v *Verifier) anchor(ctx context.Context, agentKey canonical.Digest, epoch uint64) (anchorInfo, error) {
 	var id [40]byte
 	copy(id[:32], agentKey[:])
@@ -164,10 +178,7 @@ func (v *Verifier) anchor(ctx context.Context, agentKey canonical.Digest, epoch 
 	if err != nil {
 		return anchorInfo{}, opErr("RPC error reading agentAnchors: %v", err)
 	}
-	if out.MerkleRoot == ([32]byte{}) {
-		return anchorInfo{}, opErr("epoch %d is not anchored for agent key %s", epoch, agentKey.Hex())
-	}
-	a := anchorInfo{root: out.MerkleRoot, timestamp: out.Timestamp}
+	a := anchorInfo{root: out.MerkleRoot, timestamp: out.Timestamp, count: out.LogCount, found: out.MerkleRoot != ([32]byte{})}
 	v.anchors[id] = a
 	return a, nil
 }
@@ -202,18 +213,24 @@ func (v *Verifier) Event(ctx context.Context, eventJSON []byte, proof []merkle.H
 		return nil, err
 	}
 
-	rep := &Report{
-		AgentKey: agentKey, OnChainRoot: anc.root, OnChainCheck: "skipped",
-		AnchoredAt: time.Unix(int64(anc.timestamp), 0).UTC(),
-	}
+	rep := &Report{AgentKey: agentKey, OnChainRoot: anc.root, OnChainCheck: "skipped"}
 	fail := func(reason string) (*Report, error) {
 		rep.Verified, rep.Reason = false, reason
 		return rep, nil
 	}
+	// The evidence claims the event is anchored in this epoch: if the chain
+	// has no such epoch, the claim is false.
+	if !anc.found {
+		return fail(fmt.Sprintf("epoch %d is not anchored for agent key %s", epochID, agentKey.Hex()))
+	}
+	rep.AnchoredAt = time.Unix(int64(anc.timestamp), 0).UTC()
 
 	// From here on, any defect in the event is evidence of tampering.
-	ev, err := canonical.ParseEvent(eventJSON)
+	ev, canon, err := canonical.ParseCanonicalEvent(eventJSON)
 	if err != nil {
+		if errors.Is(err, canonical.ErrNotCanonical) {
+			rep.Canonical = canon
+		}
 		return fail(fmt.Sprintf("event file is not a valid VeriLog event: %v", err))
 	}
 	rep.RunID, rep.StepNumber, rep.EventType, rep.KeyID, rep.PrevHash = ev.RunID, ev.StepNumber, ev.EventType, ev.KeyID, ev.PrevHash
@@ -223,10 +240,6 @@ func (v *Verifier) Event(ctx context.Context, eventJSON []byte, proof []merkle.H
 			who = agentKey.Hex()
 		}
 		return fail(fmt.Sprintf("event agent_id %q does not belong to agent %s", ev.AgentID, who))
-	}
-	canon, err := ev.Canonical()
-	if err != nil {
-		return fail(fmt.Sprintf("event cannot be canonicalized: %v", err))
 	}
 	rep.ContentDigest = canonical.ContentDigest(canon)
 	rep.Leaf = merkle.LeafFromDigest(rep.ContentDigest)
@@ -249,33 +262,45 @@ func (v *Verifier) Event(ctx context.Context, eventJSON []byte, proof []merkle.H
 		rep.OnChainCheck = "agrees"
 	}
 
-	// Source authenticity: the key must be registered on chain for this agent
-	// and valid at the anchor time, and the signature must verify.
-	key, err := v.agentKey(ctx, agentKey, ev.KeyID)
+	reason, status, err := v.checkSource(ctx, agentKey, ev, epochID, anc.timestamp)
 	if err != nil {
 		return nil, err
 	}
-	switch {
-	case !key.Registered():
-		rep.KeyStatus = "not registered"
-		return fail(fmt.Sprintf("signing key %s is not registered on chain for agent %q", ev.KeyID.Hex(), ev.AgentID))
-	case !key.ValidAt(anc.timestamp):
-		rep.KeyStatus = keyWindow(key)
-		return fail(fmt.Sprintf("signing key %s was not valid when epoch %d was anchored at %d (%s)",
-			ev.KeyID.Hex(), epochID, anc.timestamp, keyWindow(key)))
+	rep.KeyStatus = status
+	if reason != "" {
+		return fail(reason)
 	}
-	if err := ev.VerifySig(key.Pubkey); err != nil {
-		rep.KeyStatus = "valid at anchor time"
-		return fail(fmt.Sprintf("signature does not verify with registered key %s: %v", ev.KeyID.Hex(), err))
-	}
-	rep.KeyStatus = "valid at anchor time (" + keyWindow(key) + ")"
 	rep.Verified = true
 	return rep, nil
+}
+
+// checkSource checks source authenticity: the event's key must be registered
+// on chain for the agent, be a well-formed Ed25519 key, and be valid at the
+// anchor time of the epoch, and the signature must verify. It returns the
+// reason the check failed ("" if it passed) and a description of the key.
+func (v *Verifier) checkSource(ctx context.Context, agentKey canonical.Digest, ev canonical.Event, epochID, anchoredAt uint64) (reason, status string, err error) {
+	key, err := v.agentKey(ctx, agentKey, ev.KeyID)
+	if err != nil {
+		return "", "", err
+	}
+	switch {
+	case !key.Registered():
+		return fmt.Sprintf("signing key %s is not registered on chain for agent %q", ev.KeyID.Hex(), ev.AgentID), "not registered", nil
+	case key.WellFormed() != nil:
+		return fmt.Sprintf("registered signing key %s is unsafe and proves nothing: %v", ev.KeyID.Hex(), key.WellFormed()), "unsafe key", nil
+	case !key.ValidAt(anchoredAt):
+		return fmt.Sprintf("signing key %s was not valid when epoch %d was anchored at %d (%s)",
+			ev.KeyID.Hex(), epochID, anchoredAt, keyWindow(key)), keyWindow(key), nil
+	}
+	if err := ev.VerifySig(key.Pubkey); err != nil {
+		return fmt.Sprintf("signature does not verify with registered key %s: %v", ev.KeyID.Hex(), err), "valid at anchor time", nil
+	}
+	return "", "valid at anchor time (" + keyWindow(key) + ")", nil
 }
 
 func keyWindow(k keys.Key) string {
 	if k.RevokedAt == 0 {
 		return fmt.Sprintf("registered at %d, not revoked", k.ValidFrom)
 	}
-	return fmt.Sprintf("registered at %d, revoked at %d", k.ValidFrom, k.RevokedAt)
+	return fmt.Sprintf("registered at %d, revoked effective %d", k.ValidFrom, k.RevokedAt)
 }

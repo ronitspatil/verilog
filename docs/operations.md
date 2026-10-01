@@ -102,7 +102,7 @@ Flags win over environment variables.
 | `--retry-initial`, `--retry-max` | | `1s`, `60s` | anchoring backoff bounds |
 | `--wal-segment-bytes` | `VERILOG_WAL_SEGMENT_BYTES` | 64 MiB | WAL rotation size |
 | `--commit-batch` | | `4096` | max events per fsync |
-| `--max-payload-bytes` | `VERILOG_MAX_PAYLOAD_BYTES` | 1 MiB | per-event payload limit |
+| `--max-payload-bytes` | `VERILOG_MAX_PAYLOAD_BYTES` | 1 MiB | per-event payload limit; larger payloads get a per-event rejection (the gRPC receive limit is 4× this plus 1 MiB). Keep the SDK's `max_payload_bytes` at or below it |
 | `--stream-window` | | `1024` | unacknowledged events per stream |
 | `--log-level`, `--log-format` | `VERILOG_LOG_LEVEL`, `VERILOG_LOG_FORMAT` | `info`, `text` | logging |
 
@@ -115,29 +115,65 @@ trust anchor for keys.
 ```sh
 # On the agent host: generate the key (32-byte seed, hex, mode 0600; never printed).
 python -m verilog_sdk keygen --out /etc/verilog/support-bot.key --agent-id support-bot
-#   pubkey:   0x…     key_id: 0x…     plus the registerAgentKey command
+#   pubkey: 0x…   key_id: 0x…   pop: 0x…   plus the keycheck and registerAgentKey commands
 
-# The key admin (KEY_ADMIN_ROLE) registers it:
+# The key admin first checks the key and its proof of possession:
+verilog-verify keycheck --agent-id support-bot --pubkey 0x<pubkey> --pop 0x<pop>
+#   [KEY OK] Safe Ed25519 key with a valid proof of possession   (exit 0)
+#   [KEY REJECTED] <reason>                                       (exit 1: do not register)
+
+# ...then (KEY_ADMIN_ROLE) registers it:
 cast send $REGISTRY 'registerAgentKey(bytes32,bytes32)' $(cast keccak support-bot) 0x<pubkey> --rpc-url $RPC …
 
 # The agent loads it from VERILOG_SIGNING_KEY_FILE (preferred) or VERILOG_SIGNING_KEY (hex).
 export VERILOG_SIGNING_KEY_FILE=/etc/verilog/support-bot.key
 ```
 
-- **Rotation:** generate a new key, register it, restart the agent with it,
-  then `revokeAgentKey(agentId, oldKeyId)`. Each event names its own
-  `key_id`, so a run may mix keys.
+- **Key checks.** `keycheck` accepts only a safe Ed25519 key (on the curve,
+  canonically encoded, of prime order) with a valid proof of possession for
+  the agent id. `registerAgentKey` itself reverts with `WeakPubkey` for
+  small-order and non-canonical encodings; the daemon and the verifier refuse
+  every unsafe key, including one registered in an older registry.
+- **Revocation** is `revokeAgentKey(agentId, keyId, effectiveAt)`, where
+  `effectiveAt` is a block timestamp no earlier than the revoking block, so
+  it is never retroactive. For a suspected compromise use the current block
+  time. Once a revocation is recorded the daemon refuses new events signed
+  with the key (within its one-minute key cache), even before `effectiveAt`.
+  A recorded revocation cannot be moved.
 - **Validity** uses trusted anchor time, never the signed timestamp: a key is
   valid for an epoch when `validFrom <= anchor.timestamp` and
-  (`revokedAt == 0` or `anchor.timestamp < revokedAt`). Revoking a key
-  therefore invalidates every epoch anchored from then on, and none before. A
-  revoked key cannot be registered again.
+  (`revokedAt == 0` or `anchor.timestamp < revokedAt`), where `revokedAt` is
+  the revocation's `effectiveAt`. A revocation therefore invalidates every
+  epoch anchored from `effectiveAt` on, and none before. A revoked key cannot
+  be registered again. Each event names its own `key_id`, so a run may mix
+  keys.
 - **Who holds `KEY_ADMIN_ROLE`.** The constructor gives `DEFAULT_ADMIN_ROLE`
   and `KEY_ADMIN_ROLE` to the admin. The contract refuses to let any account
   hold `ANCHORER_ROLE` together with either admin role, and `Deploy.s.sol`
   refuses an anchorer equal to the admin, so the daemon can never register
   its own key. Locally and on testnets the admin is a plain dev key, distinct
   from the anchorer key (`scripts/e2e.sh` uses anvil accounts #0 and #1).
+
+### Rotation: drain before revoke
+
+1. Generate a new key on the agent host, `keycheck` it and register it.
+2. Restart the agent with the new key. Runs still open under the old key end
+   when the agent stops (`run_end` status `"closed"`).
+3. Wait until the old key's last events are anchored: the agent's final
+   `run_end` events appear in the evidence bundles (or run mode passes for its
+   last runs). Allow at least one `--epoch-interval` plus anchoring latency.
+4. Revoke with a margin:
+   `revokeAgentKey(agentId, oldKeyId, now + margin)`, with the margin at least
+   `--epoch-interval` + `--confirm-timeout` + 60 s (the daemon's key cache), so
+   anything accepted before the daemon saw the revocation is anchored before
+   it takes effect.
+
+When the daemon seals an epoch it re-reads the keys, uncached, and leaves out
+events whose key's revocation is already in effect (they could never verify,
+and a replay of old events after a revocation gets nothing anchored). It logs
+them at ERROR and counts them in `revoked_excluded` on the periodic stats log
+line. A non-zero count means events missed the drain window, and their runs
+will not verify.
 
 ### Production: hand the admin roles to a 2-of-3 Safe
 
@@ -185,39 +221,53 @@ bin/verilog-verify export --bundle /var/lib/verilog/evidence/<agentKey>/epoch-3.
 bin/verilog-verify --event case-42/event.json --proof case-42/proof.json \
     --epoch 3 --agent-id support-bot --rpc "$RPC" --contract 0xRegistry
 
-# Run mode: a whole run (its run_id is in every event) from a copy of the evidence bundles.
+# Run mode: a whole run (its run_id is in every event) from a copy of all the agent's evidence bundles.
 bin/verilog-verify --run-id 01a0f526-62a8-7390-aefb-ba42851014ac --bundles ./evidence/<agentKey> \
     --agent-id support-bot --rpc "$RPC" --contract 0xRegistry
 ```
 
 **Single-event mode** succeeds when:
 
-- the recomputed root equals the anchored root (and the contract's
-  `verifyAnchoredLeaf` agrees);
-- the signing key is registered on chain for the agent and valid at the
-  epoch's anchor time;
+- the event file is exactly the canonical event bytes (one trailing newline
+  allowed). Any other spelling, even of the same values, is a FAILURE, and
+  the signed bytes are printed on stderr;
+- the epoch is anchored and the recomputed root equals the anchored root
+  (and the contract's `verifyAnchoredLeaf` agrees);
+- the signing key is a safe Ed25519 key registered on chain for the agent
+  and valid at the epoch's anchor time;
 - the Ed25519 signature verifies.
 
-**Run mode** applies those checks to every event of the run found under
-`--bundles` (searched recursively; bundles are untrusted input), then checks
-the chain:
+**Run mode** needs the complete evidence of the agent. `--bundles` is searched
+recursively; bundles are untrusted input.
 
-- it starts at step 1 with a zero `prev_hash` and has no missing steps;
-- each `prev_hash` is the previous event's digest;
-- no two different events share a step (a fork means key misuse);
-- no event is anchored in an earlier epoch than its predecessor (a later
-  epoch means it was withheld);
-- the last event is `run_end`. A missing `run_end` is a FAILURE ("run ended
-  without terminal event after step N"); `--allow-incomplete` turns it into
-  SUCCESS with a warning on stderr, for investigations of crashed agents only.
+- There must be a bundle for every epoch `1..latestEpoch(agent)`, and each
+  epoch's event list must rebuild its on-chain root with a count equal to its
+  `logCount`. A missing or mismatched epoch is a FAILURE, so the verifier sees
+  every anchored copy of every event. Run mode therefore reads the agent's
+  whole history.
+- Bundles of other agents, bundles of epochs that are not anchored, and files
+  that are not bundles are ignored with a warning; events of other agents are
+  skipped.
+- Every event of the run is checked as in single-event mode. An event's epoch
+  is its earliest anchored copy that verifies; other copies (a replay
+  anchored after the key was revoked, say) only produce a warning.
+- The chain starts at step 1 with a zero `prev_hash` and has no missing
+  steps; each `prev_hash` is the previous event's digest; no two different
+  events share a step (a fork means key misuse); no event is anchored in an
+  earlier epoch than its predecessor (a later epoch means it was withheld).
+- The last event is `run_end`. A missing `run_end` is a FAILURE ("run ended
+  without terminal event after step N"). With `--allow-incomplete` it is the
+  distinct verdict `[SUCCESS-INCOMPLETE]` (exit 3), for investigations of
+  crashed agents only.
 
 `verilog-verify` prints exactly one line on stdout and sets its exit code:
 
 | stdout | exit | meaning |
 |---|---|---|
 | `[SUCCESS] Log Integrity Verified` | 0 | every check above passed |
-| `[FAILURE] Tampered Log Detected` | 1 | root mismatch, unparseable event, another agent's event, unregistered or not-yet/no-longer valid key, bad signature; in run mode also a gap, fork, reorder, events after `run_end`, or a missing `run_end` |
-| *(nothing)* | 2 | no verdict: bad arguments, unreadable files, RPC failure, no contract, epoch not anchored, or no events of the run in the evidence |
+| `[FAILURE] Tampered Log Detected` | 1 | any defect in the evidence: root mismatch, non-canonical or unparseable event file, an epoch that is not anchored, another agent's event, an unsafe, unregistered or not-yet/no-longer valid key, bad signature; in run mode also missing or mismatched epochs, no events of the run, a gap, fork, reorder, events after `run_end`, or a missing `run_end` |
+| `[SUCCESS-INCOMPLETE] Log Integrity Verified, Run Incomplete` | 3 | run mode with `--allow-incomplete` only: every event present verifies and the chain is intact, but there is no `run_end`, so truncation cannot be ruled out. Not a pass |
+| *(nothing)* | 2 | no verdict: bad arguments, files that cannot be read, RPC failure, no contract at the address |
 
 Details (digests, roots, run id and step, key status, reason, warnings,
 self-reported `sdk_dropped` counts) go to stderr. `--agent-id` accepts the

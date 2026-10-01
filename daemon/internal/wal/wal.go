@@ -5,7 +5,10 @@
 //   - "event":  one accepted event with its global sequence number and its
 //     canonical JSON.
 //   - "sealed": an epoch boundary. All events of AgentID with sequence in
-//     [FirstSeq, LastSeq] form one sealed epoch with the given root.
+//     [FirstSeq, LastSeq], except those listed in Skip, form one sealed
+//     epoch with the given root. Skipped events (left out at seal time
+//     because their key was revoked) are never anchored; a seal that skips
+//     every event has Count 0 and no root.
 //
 // Anchoring progress is not stored here; it lives in the checkpoint file
 // (package store). A segment is deleted once every event and seal it holds
@@ -41,10 +44,11 @@ type Record struct {
 	Seq     uint64          `json:"seq,omitempty"`   // event
 	Event   json.RawMessage `json:"event,omitempty"` // event: canonical event JSON
 	// Sealed epoch fields.
-	FirstSeq uint64 `json:"first,omitempty"`
-	LastSeq  uint64 `json:"last,omitempty"`
-	Count    int    `json:"count,omitempty"`
-	Root     string `json:"root,omitempty"`
+	FirstSeq uint64   `json:"first,omitempty"`
+	LastSeq  uint64   `json:"last,omitempty"`
+	Count    int      `json:"count,omitempty"`
+	Root     string   `json:"root,omitempty"`
+	Skip     []uint64 `json:"skip,omitempty"`
 }
 
 // highSeq is the sequence a record must be anchored past before it can be dropped.
@@ -65,7 +69,7 @@ func (r Record) validate() error {
 			return errors.New("event record without seq or event")
 		}
 	case TypeSealed:
-		if r.FirstSeq == 0 || r.LastSeq < r.FirstSeq || r.Count <= 0 || r.Root == "" {
+		if r.FirstSeq == 0 || r.LastSeq < r.FirstSeq || r.Count < 0 || (r.Count == 0) != (r.Root == "") || (r.Count == 0 && len(r.Skip) == 0) {
 			return errors.New("malformed sealed record")
 		}
 	default:

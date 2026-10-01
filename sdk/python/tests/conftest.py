@@ -2,6 +2,7 @@ import hashlib
 import json
 import pathlib
 import threading
+import time
 from concurrent import futures
 
 import grpc
@@ -54,14 +55,23 @@ class FakeDaemon(verilog_pb2_grpc.VeriLogServicer):
     ``reject_types``: event types answered with accepted=False.
     ``gate``: if set, each stream waits for this threading.Event before
     reading (to let the client's queue overflow).
+    ``unregistered_for``: answer every event with a retryable "key not
+    registered" rejection for this many seconds after the first event (a key
+    registered moments ago, not yet visible to the daemon).
+    ``max_payload``: reject larger payload_json like verilogd's --max-payload-bytes.
+    ``accepted`` holds the events acknowledged as accepted, in order.
     """
 
-    def __init__(self, fail_after=None, reject_types=(), gate=None):
+    def __init__(self, fail_after=None, reject_types=(), gate=None, unregistered_for=None, max_payload=None):
         self.events = []
+        self.accepted = []
         self.streams = 0
         self.fail_after = fail_after
         self.reject_types = set(reject_types)
         self.gate = gate
+        self.unregistered_for = unregistered_for
+        self.max_payload = max_payload
+        self.first_seen = None
         self.lock = threading.Lock()
 
     def IngestStream(self, request_iterator, context):
@@ -77,9 +87,20 @@ class FakeDaemon(verilog_pb2_grpc.VeriLogServicer):
             if stream_no == 1 and self.fail_after is not None and acked >= self.fail_after:
                 context.abort(grpc.StatusCode.UNAVAILABLE, "injected failure")
             acked += 1
-            if ev.event_type in self.reject_types:
+            with self.lock:
+                if self.first_seen is None:
+                    self.first_seen = time.monotonic()
+                hidden = self.unregistered_for is not None and time.monotonic() - self.first_seen < self.unregistered_for
+            if hidden:
+                yield verilog_pb2.Ack(sequence=ev.sequence, accepted=False, retryable=True,
+                                      error="key_id 0x.. is not registered for agent")
+            elif self.max_payload is not None and len(ev.payload_json.encode()) > self.max_payload:
+                yield verilog_pb2.Ack(sequence=ev.sequence, accepted=False, error="payload_json exceeds the size limit")
+            elif ev.event_type in self.reject_types:
                 yield verilog_pb2.Ack(sequence=ev.sequence, accepted=False, error="rejected by test")
             else:
+                with self.lock:
+                    self.accepted.append(ev)
                 yield verilog_pb2.Ack(sequence=ev.sequence, accepted=True)
 
 

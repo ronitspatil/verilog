@@ -51,6 +51,15 @@ type Options struct {
 	Keys            keys.Source // on-chain agent keys (usually a keys.Cache); required
 }
 
+// MaxRecvMsgSize is the gRPC receive limit for a payload cap of maxPayload
+// bytes: four times the cap plus 1 MiB. It must stay well above the cap so
+// that an oversized payload reaches prepare and gets a per-event rejection;
+// a message over the gRPC limit fails the whole stream instead, and a client
+// that re-sends unacknowledged events would then retry it forever.
+func MaxRecvMsgSize(maxPayload int) int {
+	return 4*maxPayload + 1<<20
+}
+
 // NewServer returns a Server.
 func NewServer(eng *engine.Engine, st *store.Store, opts Options, logger *slog.Logger) *Server {
 	if opts.MaxPayloadBytes <= 0 {
@@ -172,12 +181,13 @@ func (s *Server) prepare(ctx context.Context, msg *verilogv1.LogEvent) (inflight
 		item.ack = reject(item.seq, err.Error())
 		return item, nil
 	}
-	reason, err := s.authenticate(ctx, ev)
+	reason, retryable, err := s.authenticate(ctx, ev)
 	if err != nil {
 		return item, err
 	}
 	if reason != "" {
 		item.ack = reject(item.seq, reason)
+		item.ack.Retryable = retryable
 		return item, nil
 	}
 	prep, err := engine.Prepare(ev)
@@ -198,25 +208,36 @@ func (s *Server) prepare(ctx context.Context, msg *verilogv1.LogEvent) (inflight
 }
 
 // authenticate checks the event's signature against its on-chain key. It
-// returns a rejection reason, or an error if the registry could not be read.
-func (s *Server) authenticate(ctx context.Context, ev canonical.Event) (string, error) {
+// returns a rejection reason (retryable when re-sending the same event later
+// may succeed), or an error if the registry could not be read.
+//
+// A key whose revocation has been recorded is refused even before the
+// revocation takes effect: scheduling a revocation stops intake, and the time
+// until it takes effect lets events already accepted get anchored (the
+// engine re-checks revocation when it seals an epoch).
+func (s *Server) authenticate(ctx context.Context, ev canonical.Event) (reason string, retryable bool, err error) {
 	if s.keys == nil {
-		return "daemon has no agent key registry configured", nil
+		return "daemon has no agent key registry configured", false, nil
 	}
 	key, err := s.keys.AgentKey(ctx, canonical.AgentKey(ev.AgentID), ev.KeyID)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	switch {
 	case !key.Registered():
-		return fmt.Sprintf("key_id %s is not registered for agent %q", ev.KeyID.Hex(), ev.AgentID), nil
+		// Possibly registered moments ago and not yet visible (or cached as
+		// unknown): the client retries for a while instead of leaving a gap.
+		return fmt.Sprintf("key_id %s is not registered for agent %q", ev.KeyID.Hex(), ev.AgentID), true, nil
 	case key.Revoked():
-		return fmt.Sprintf("key_id %s of agent %q is revoked", ev.KeyID.Hex(), ev.AgentID), nil
+		return fmt.Sprintf("key_id %s of agent %q is revoked (effective at %d)", ev.KeyID.Hex(), ev.AgentID, key.RevokedAt), false, nil
+	}
+	if err := key.WellFormed(); err != nil {
+		return fmt.Sprintf("key_id %s of agent %q is not usable: %v", ev.KeyID.Hex(), ev.AgentID, err), false, nil
 	}
 	if err := ev.VerifySig(key.Pubkey); err != nil {
-		return fmt.Sprintf("signature does not verify with key_id %s: %v", ev.KeyID.Hex(), err), nil
+		return fmt.Sprintf("signature does not verify with key_id %s: %v", ev.KeyID.Hex(), err), false, nil
 	}
-	return "", nil
+	return "", false, nil
 }
 
 // eventFromProto maps a LogEvent onto the canonical event, checking the

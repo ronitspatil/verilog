@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"math/big"
+	"strings"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
@@ -56,12 +57,31 @@ func TestChainSourceReadsRegistry(t *testing.T) {
 		t.Fatal("key registered for another agent")
 	}
 
-	if _, err := reg.RevokeAgentKey(opts, agent, canonical.KeyID(pub)); err != nil {
+	// Schedule the revocation an hour ahead: recorded now, effective later.
+	head, _ := client.HeaderByNumber(ctx, nil)
+	effective := head.Time + 3600
+	if _, err := reg.RevokeAgentKey(opts, agent, canonical.KeyID(pub), effective); err != nil {
 		t.Fatal(err)
 	}
 	sim.Commit()
 	k, _ = src.AgentKey(ctx, agent, canonical.KeyID(pub))
-	if !k.Revoked() || k.ValidAt(k.RevokedAt) || !k.ValidAt(k.ValidFrom) {
+	if !k.Revoked() || k.RevokedAt != effective || k.ValidAt(k.RevokedAt) || !k.ValidAt(k.RevokedAt-1) || !k.ValidAt(k.ValidFrom) {
 		t.Fatalf("revocation not visible: %+v", k)
+	}
+	check := RevocationCheck{Src: src, Now: func(context.Context) (uint64, error) { return head.Time + 10, nil }}
+	if r, err := check.RevokedNow(ctx, agent, canonical.KeyID(pub)); err != nil || r {
+		t.Fatalf("scheduled revocation reported in effect: %v %v", r, err)
+	}
+	check.Now = func(context.Context) (uint64, error) { return effective, nil }
+	if r, err := check.RevokedNow(ctx, agent, canonical.KeyID(pub)); err != nil || !r {
+		t.Fatalf("revocation in effect not reported: %v %v", r, err)
+	}
+
+	// The contract refuses the identity point (H1): with it, R = identity,
+	// S = 0 is a valid signature of any message.
+	var identity [32]byte
+	identity[0] = 1
+	if _, err := reg.RegisterAgentKey(opts, agent, identity); err == nil || !strings.Contains(err.Error(), "revert") {
+		t.Fatalf("weak key registered: %v", err)
 	}
 }

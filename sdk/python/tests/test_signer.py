@@ -56,5 +56,24 @@ def test_keygen_writes_private_file(tmp_path, capsys):
     assert "0x" + keccak256(b"support-bot").hex() in printed
     assert signer.seed_hex() not in printed
     # Never overwrites by accident.
-    assert main(["keygen", "--out", str(out)]) == 2
+    assert main(["keygen", "--out", str(out), "--agent-id", "support-bot"]) == 2
     assert Signer.from_file(str(out)).key_id == signer.key_id
+
+
+def test_proof_of_possession_matches_go_vectors():
+    import json
+    from .conftest import TESTDATA
+
+    data = json.loads((TESTDATA / "signed_vectors.json").read_text())
+    signer = Signer.from_hex(data["seed"])
+    assert "0x" + signer.proof_of_possession(data["run"][0]["agent_id"]).hex() == data["pop"]
+
+
+def test_keygen_prints_proof_of_possession(tmp_path, capsys):
+    from verilog_sdk.__main__ import main
+
+    assert main(["keygen", "--out", str(tmp_path / "k"), "--agent-id", "bot-1"]) == 0
+    out = capsys.readouterr().out
+    signer = Signer.from_file(str(tmp_path / "k"))
+    assert f"pop:      0x{signer.proof_of_possession('bot-1').hex()}" in out
+    assert "verilog-verify keycheck --agent-id bot-1" in out

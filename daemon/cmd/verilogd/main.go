@@ -22,6 +22,7 @@ import (
 	"github.com/ronitspatil/verilog/daemon/internal/anchor"
 	"github.com/ronitspatil/verilog/daemon/internal/config"
 	"github.com/ronitspatil/verilog/daemon/internal/engine"
+	"github.com/ronitspatil/verilog/daemon/internal/finality"
 	"github.com/ronitspatil/verilog/daemon/internal/ingest"
 	"github.com/ronitspatil/verilog/daemon/internal/keys"
 	"github.com/ronitspatil/verilog/daemon/internal/redact"
@@ -80,6 +81,7 @@ func run() (err error) {
 		MaxFeeCap:      cfg.MaxFeeCap,
 		MaxTipCap:      cfg.MaxTipCap,
 		PendingFile:    filepath.Join(cfg.DataDir, anchor.PendingFileName),
+		Finality:       cfg.Finality,
 	}, logger)
 	if err != nil {
 		return err
@@ -87,8 +89,15 @@ func run() (err error) {
 	if err := chain.CheckRole(dialCtx); err != nil {
 		return err
 	}
+	final, err := cfg.Finality.Check(dialCtx, eth)
+	if err != nil {
+		return err
+	}
+	if cfg.Finality.Kind == finality.Depth && cfg.Finality.Depth == 0 {
+		logger.Warn("--finality depth:0 treats a mined anchor as final: a reorg can lose anchored events; use only for development")
+	}
 	logger.Info("chain ready", "rpc", redact.URL(cfg.RPCURL), "chain_id", chain.ChainID(), "contract", cfg.Contract,
-		"signer", cfg.Signer, "address", chain.From())
+		"signer", cfg.Signer, "address", chain.From(), "finality", cfg.Finality, "final_block", final.Number)
 	keySource, err := keys.NewChainSource(cfg.Contract, eth)
 	if err != nil {
 		return err
@@ -115,7 +124,11 @@ func run() (err error) {
 		return err
 	}
 	defer w.Close()
-	worker := anchor.NewWorker(chain, anchor.Backoff{Initial: cfg.RetryInitial, Max: cfg.RetryMax}, logger)
+	worker := anchor.NewWorker(chain, anchor.WorkerOptions{
+		Backoff:         anchor.Backoff{Initial: cfg.RetryInitial, Max: cfg.RetryMax},
+		FinalityPoll:    cfg.FinalityPoll,
+		FinalityTimeout: cfg.FinalityTimeout,
+	}, logger)
 	eng, err := engine.New(engine.Config{
 		EpochInterval: cfg.EpochInterval,
 		EpochMaxLogs:  cfg.EpochMaxLogs,

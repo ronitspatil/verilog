@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
+	"sort"
 	"strings"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 
+	"github.com/ronitspatil/verilog/daemon/internal/finality"
 	"github.com/ronitspatil/verilog/daemon/internal/registry"
 	"github.com/ronitspatil/verilog/daemon/internal/signer"
 )
@@ -24,6 +26,8 @@ type Backend interface {
 	bind.ContractBackend
 	bind.DeployBackend
 	ChainID(ctx context.Context) (*big.Int, error)
+	NonceAt(ctx context.Context, account common.Address, blockNumber *big.Int) (uint64, error)
+	TransactionByHash(ctx context.Context, hash common.Hash) (*types.Transaction, bool, error)
 }
 
 // Options configures an EthChain.
@@ -35,12 +39,26 @@ type Options struct {
 	MaxFeeCap *big.Int
 	MaxTipCap *big.Int
 	// PendingFile, when set, persists the in-flight transaction before it
-	// is broadcast, so a restarted daemon reuses its nonce instead of
-	// anchoring the same root again.
+	// is broadcast, and every mined anchor until it is final, so a restarted
+	// daemon reuses its nonce instead of anchoring the same root again and
+	// still confirms finality before the WAL is compacted.
 	PendingFile string
+	// Finality decides when a mined anchor is final (zero: finalized).
+	Finality finality.Mode
 }
 
 // EthChain anchors roots with EIP-1559 transactions to a VeriLogRegistry.
+//
+// Anchoring is pipelined: once a transaction is mined, the next request may
+// be sent while the earlier anchor awaits finality. Nonce ordering stays safe
+// because (1) every transaction is persisted before it is broadcast, (2) a new
+// transaction never takes a nonce at or below one awaiting finality, and (3) an
+// anchor removed by a reorg is answered by broadcasting the same signed
+// transaction again (and, if it does not return, replacing it with the same
+// nonce and higher fees), so per-agent epochs keep their order. Only when the
+// nonce of an anchor ends up used by another transaction in a final block (a
+// second user of the anchoring key) is the request anchored again with a new
+// nonce.
 //
 // It is not safe for concurrent use; Worker calls it from one goroutine.
 type EthChain struct {
@@ -62,13 +80,29 @@ type EthChain struct {
 	// nonceGone counts consecutive "nonce too low" answers for pending
 	// while none of its transactions has a receipt.
 	nonceGone int
+	// mined are the anchors mined but not yet released (final and
+	// completed), in the order they were mined. With Options.PendingFile
+	// they survive restarts.
+	mined []*minedTx
 }
 
 type pendingTx struct {
 	req    Request
-	tx     *types.Transaction // latest version
+	tx     *types.Transaction // latest version; nil for an anchor recovered from chain state without its transaction
 	hashes []common.Hash      // every version sent with this nonce
 }
+
+// minedTx is a mined anchor awaiting finality.
+type minedTx struct {
+	pendingTx
+	res     Result
+	reorged bool // its nonce is no longer used on the canonical chain
+	polls   int  // finality checks since it was reorged out
+}
+
+// reorgReplaceAfter is the number of finality checks a reorged-out
+// transaction is rebroadcast unchanged before it is replaced with higher fees.
+const reorgReplaceAfter = 3
 
 // NewEthChain builds an anchorer. The chain ID is fetched from the backend;
 // a pending transaction left by a previous run is loaded from
@@ -138,30 +172,42 @@ func (c *EthChain) CheckRole(ctx context.Context) error {
 	return nil
 }
 
-// Anchor submits anchorEpoch and waits for the receipt.
+// Anchor submits anchorEpoch for req and waits until it is mined. A request
+// already mined (before a restart, say) returns its recorded anchor.
 func (c *EthChain) Anchor(ctx context.Context, req Request) (Result, error) {
+	if m := c.findMined(req); m != nil {
+		return m.res, nil
+	}
 	if c.pending != nil && c.pending.req != req {
-		// The worker only moves past a request once it is confirmed, so a
-		// pending transaction for another request has been mined.
-		c.log.Info("anchor: discarding pending transaction of a completed request", "tx", c.pending.tx.Hash(), "nonce", c.pending.tx.Nonce())
-		if err := c.clearPending(); err != nil {
-			return Result{}, err
+		// A transaction for another request is in flight: after a restart
+		// the queue order can differ from the order requests were sent in.
+		// Its nonce comes first, so it is completed first; its job finds
+		// the mined anchor when it comes up.
+		c.log.Info("anchor: completing the in-flight transaction of another epoch first",
+			"tx", c.pending.tx.Hash(), "nonce", c.pending.tx.Nonce(), "agent_key", common.Hash(c.pending.req.AgentKey))
+		if _, err := c.mine(ctx, c.pending.req); err != nil {
+			return Result{}, fmt.Errorf("in-flight transaction of another epoch: %w", err)
 		}
 	}
+	return c.mine(ctx, req)
+}
+
+func (c *EthChain) mine(ctx context.Context, req Request) (Result, error) {
 	// 1. A previous attempt (or an earlier version of it, or one sent before
 	//    a restart) may have been mined after we stopped waiting.
 	if res, ok, err := c.pendingReceipt(ctx, req); err != nil || ok {
 		return res, err
 	}
-	// 2. The root may already be anchored (e.g. crash after confirmation but
-	//    before the checkpoint was written).
-	if res, ok, err := c.alreadyAnchored(ctx, req); err != nil {
-		return Result{}, err
-	} else if ok {
-		return res, c.clearPending()
+	// 2. The root may already be anchored (e.g. crash after the receipt but
+	//    before the mined anchor was recorded).
+	if res, ok, err := c.alreadyAnchored(ctx, req); err != nil || ok {
+		return res, err
 	}
 	// 3. Send (replace, or rebroadcast at the fee ceiling) and wait.
-	tx, err := c.send(ctx, req)
+	tx, err := c.sendVersion(ctx, req, c.pending, func(p *pendingTx) error {
+		c.pending = p
+		return c.save()
+	})
 	if err != nil {
 		return Result{}, err
 	}
@@ -172,32 +218,39 @@ func (c *EthChain) Anchor(ctx context.Context, req Request) (Result, error) {
 	if err != nil {
 		return Result{}, fmt.Errorf("awaiting confirmation of %s: %w", tx.Hash(), err)
 	}
-	return c.fromReceipt(req, rcpt)
+	return c.recordMined(req, rcpt)
 }
 
 // pendingReceipt looks for a receipt of any version of the pending
-// transaction.
+// transaction of req.
 func (c *EthChain) pendingReceipt(ctx context.Context, req Request) (Result, bool, error) {
-	if c.pending == nil {
+	if c.pending == nil || c.pending.req != req {
 		return Result{}, false, nil
 	}
-	for _, h := range c.pending.hashes {
+	rcpt, err := c.receiptOf(ctx, c.pending.hashes)
+	if err != nil || rcpt == nil {
+		return Result{}, false, err
+	}
+	res, err := c.recordMined(req, rcpt)
+	return res, true, err
+}
+
+// receiptOf returns the receipt of whichever of hashes is mined, or nil.
+func (c *EthChain) receiptOf(ctx context.Context, hashes []common.Hash) (*types.Receipt, error) {
+	for _, h := range hashes {
 		rcpt, err := c.backend.TransactionReceipt(ctx, h)
 		switch {
 		case err == nil:
-			res, err := c.fromReceipt(req, rcpt)
-			return res, true, err
+			return rcpt, nil
 		case !errors.Is(err, ethereum.NotFound):
-			return Result{}, false, fmt.Errorf("receipt of %s: %w", h, err)
+			return nil, fmt.Errorf("receipt of %s: %w", h, err)
 		}
 	}
-	return Result{}, false, nil
+	return nil, nil
 }
 
-func (c *EthChain) fromReceipt(req Request, rcpt *types.Receipt) (Result, error) {
-	if err := c.clearPending(); err != nil {
-		return Result{}, err
-	}
+// resultFrom checks a receipt of req's transaction and reads its anchor.
+func (c *EthChain) resultFrom(req Request, rcpt *types.Receipt) (Result, error) {
 	if rcpt.Status != types.ReceiptStatusSuccessful {
 		return Result{}, fmt.Errorf("anchor transaction %s reverted in block %s", rcpt.TxHash, rcpt.BlockNumber)
 	}
@@ -212,9 +265,34 @@ func (c *EthChain) fromReceipt(req Request, rcpt *types.Receipt) (Result, error)
 		if ev.AgentId != req.AgentKey || ev.MerkleRoot != req.Root {
 			continue
 		}
-		return Result{EpochID: ev.EpochId.Uint64(), TxHash: rcpt.TxHash.Hex(), BlockNumber: rcpt.BlockNumber.Uint64()}, nil
+		return Result{EpochID: ev.EpochId.Uint64(), TxHash: rcpt.TxHash.Hex(),
+			BlockNumber: rcpt.BlockNumber.Uint64(), BlockHash: rcpt.BlockHash.Hex()}, nil
 	}
 	return Result{}, fmt.Errorf("receipt of %s has no matching LogAnchored event", rcpt.TxHash)
+}
+
+// recordMined turns the pending transaction of req into a mined anchor
+// awaiting finality, in one write of the pending record.
+func (c *EthChain) recordMined(req Request, rcpt *types.Receipt) (Result, error) {
+	res, err := c.resultFrom(req, rcpt)
+	if err != nil {
+		if cerr := c.clearPending(); cerr != nil {
+			return Result{}, cerr
+		}
+		return Result{}, err
+	}
+	m := &minedTx{pendingTx: pendingTx{req: req, hashes: []common.Hash{rcpt.TxHash}}, res: res}
+	if c.pending != nil && c.pending.req == req {
+		m.pendingTx = *c.pending
+	}
+	c.pending, c.nonceGone = nil, 0
+	c.mined = append(c.mined, m)
+	if err := c.save(); err != nil {
+		return Result{}, err
+	}
+	c.log.Info("anchor: transaction mined, awaiting finality", "tx", res.TxHash, "block", res.BlockNumber,
+		"block_hash", res.BlockHash, "epoch", res.EpochID, "finality", c.opts.Finality, "agent_key", common.Hash(req.AgentKey))
+	return res, nil
 }
 
 func (c *EthChain) alreadyAnchored(ctx context.Context, req Request) (Result, bool, error) {
@@ -233,27 +311,281 @@ func (c *EthChain) alreadyAnchored(ctx context.Context, req Request) (Result, bo
 	if a.MerkleRoot != req.Root || a.LogCount != req.Count {
 		return Result{}, false, nil
 	}
-	res := Result{EpochID: latest.Uint64()}
-	it, err := c.contract.FilterLogAnchored(&bind.FilterOpts{Context: ctx}, [][32]byte{req.AgentKey}, []*big.Int{latest})
-	if err != nil {
+	m := &minedTx{pendingTx: pendingTx{req: req}, res: Result{EpochID: latest.Uint64()}}
+	if c.pending != nil && c.pending.req == req {
+		m.pendingTx = *c.pending
+	}
+	if it, err := c.contract.FilterLogAnchored(&bind.FilterOpts{Context: ctx}, [][32]byte{req.AgentKey}, []*big.Int{latest}); err != nil {
 		c.log.Warn("anchor: root already anchored but its transaction could not be located", "epoch", latest, "err", err)
-		return res, true, nil
+	} else {
+		for it.Next() {
+			m.res.TxHash = it.Event.Raw.TxHash.Hex()
+			m.res.BlockNumber = it.Event.Raw.BlockNumber
+			m.res.BlockHash = it.Event.Raw.BlockHash.Hex()
+		}
+		it.Close()
 	}
-	defer it.Close()
-	for it.Next() {
-		res.TxHash = it.Event.Raw.TxHash.Hex()
-		res.BlockNumber = it.Event.Raw.BlockNumber
+	if m.res.TxHash != "" && (m.tx == nil || !containsHash(m.hashes, common.HexToHash(m.res.TxHash))) {
+		// Keep the transaction that holds the anchor, to resend it after a reorg.
+		m.tx, m.hashes = nil, []common.Hash{common.HexToHash(m.res.TxHash)}
+		if tx, _, err := c.backend.TransactionByHash(ctx, common.HexToHash(m.res.TxHash)); err == nil {
+			m.tx = tx
+		}
 	}
-	c.log.Info("anchor: root already anchored on chain, recovering", "epoch", latest, "tx", res.TxHash)
-	return res, true, nil
+	c.pending, c.nonceGone = nil, 0
+	c.mined = append(c.mined, m)
+	if err := c.save(); err != nil {
+		return Result{}, false, err
+	}
+	c.log.Info("anchor: root already anchored on chain, recovering", "epoch", latest, "tx", m.res.TxHash, "block", m.res.BlockNumber)
+	return m.res, true, nil
 }
 
-// send signs and broadcasts anchorEpoch. When a previous transaction for the
-// same request is still pending, it is replaced (same nonce, fees +25%); if
-// the fee ceiling leaves no room for a valid replacement, the pending
-// transaction is rebroadcast unchanged instead. A new transaction is
-// persisted before it is broadcast.
-func (c *EthChain) send(ctx context.Context, req Request) (*types.Transaction, error) {
+func containsHash(hs []common.Hash, h common.Hash) bool {
+	for _, x := range hs {
+		if x == h {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *EthChain) findMined(req Request) *minedTx {
+	for _, m := range c.mined {
+		if m.req == req {
+			return m
+		}
+	}
+	return nil
+}
+
+// nextNonce is the lowest nonce a new transaction may take: above every
+// anchor awaiting finality, so a reorg never hands a later epoch the nonce
+// (and the place) of an earlier one.
+func (c *EthChain) nextNonce() uint64 {
+	var n uint64
+	for _, m := range c.mined {
+		if m.tx != nil {
+			n = max(n, m.tx.Nonce()+1)
+		}
+	}
+	return n
+}
+
+// Final reports whether the mined anchor of req is final. Before saying so
+// it checks that the transaction is in a canonical block at or below the
+// final block and re-reads agentAnchors(agentId, epochId) at the final
+// block. It also resends every anchor a reorg removed.
+func (c *EthChain) Final(ctx context.Context, req Request) (Status, Result, error) {
+	m := c.findMined(req)
+	if m == nil {
+		return Reanchor, Result{}, nil
+	}
+	point, err := c.opts.Finality.Point(ctx, c.backend)
+	if err != nil {
+		return Pending, m.res, err
+	}
+	if err := c.resendReorged(ctx); err != nil {
+		return Pending, m.res, err
+	}
+	if m.tx == nil {
+		return c.finalFromState(ctx, m, point)
+	}
+	rcpt, err := c.receiptOf(ctx, m.hashes)
+	if err != nil {
+		return Pending, m.res, err
+	}
+	if rcpt == nil {
+		used, err := c.backend.NonceAt(ctx, c.from, point.Number)
+		if err != nil {
+			return Pending, m.res, fmt.Errorf("reading the final nonce: %w", err)
+		}
+		if used > m.tx.Nonce() {
+			c.log.Error("anchor: the anchor's nonce was used by another transaction in a final block; anchoring the epoch again "+
+				"(is another process using the anchoring key?)", "nonce", m.tx.Nonce(), "tx", m.res.TxHash, "epoch", m.res.EpochID,
+				"agent_key", common.Hash(req.AgentKey))
+			return c.drop(m)
+		}
+		return Pending, m.res, nil
+	}
+	if rcpt.BlockHash.Hex() != m.res.BlockHash {
+		res, err := c.resultFrom(req, rcpt)
+		if err != nil {
+			c.log.Error("anchor: after a reorg the anchor transaction no longer anchors the root; anchoring the epoch again",
+				"tx", rcpt.TxHash, "block", rcpt.BlockNumber, "block_hash", rcpt.BlockHash, "err", err)
+			return c.drop(m)
+		}
+		c.log.Warn("anchor: reorg moved the anchor transaction to another block", "tx", res.TxHash,
+			"old_block", m.res.BlockNumber, "old_block_hash", m.res.BlockHash, "old_epoch", m.res.EpochID,
+			"new_block", res.BlockNumber, "new_block_hash", res.BlockHash, "new_epoch", res.EpochID)
+		m.res, m.reorged, m.polls = res, false, 0
+		if err := c.save(); err != nil {
+			return Pending, m.res, err
+		}
+	}
+	if rcpt.BlockNumber.Cmp(point.Number) > 0 {
+		return Pending, m.res, nil
+	}
+	if canon, err := c.backend.HeaderByNumber(ctx, rcpt.BlockNumber); err != nil {
+		return Pending, m.res, fmt.Errorf("reading block %s: %w", rcpt.BlockNumber, err)
+	} else if canon.Hash() != rcpt.BlockHash {
+		return Pending, m.res, nil // the node's receipt index lags a reorg
+	}
+	return c.confirmAt(ctx, m, point)
+}
+
+// confirmAt re-reads the anchor at the final block: Final if it matches.
+func (c *EthChain) confirmAt(ctx context.Context, m *minedTx, point *types.Header) (Status, Result, error) {
+	ok, err := c.anchoredAt(ctx, m.req, m.res.EpochID, point.Number)
+	if err != nil {
+		return Pending, m.res, err
+	}
+	if !ok {
+		c.log.Error("anchor: the anchor read at the final block does not match the receipt; anchoring the epoch again",
+			"epoch", m.res.EpochID, "tx", m.res.TxHash, "block", m.res.BlockNumber, "final_block", point.Number,
+			"final_block_hash", point.Hash(), "agent_key", common.Hash(m.req.AgentKey), "root", common.Hash(m.req.Root))
+		return c.drop(m)
+	}
+	// The final block must still be canonical after the read (depth mode).
+	if h, err := c.backend.HeaderByNumber(ctx, point.Number); err != nil {
+		return Pending, m.res, fmt.Errorf("reading block %s: %w", point.Number, err)
+	} else if h.Hash() != point.Hash() {
+		return Pending, m.res, nil
+	}
+	res := m.res
+	res.Finality = c.opts.Finality.String()
+	res.FinalBlockNumber = point.Number.Uint64()
+	res.FinalBlockHash = point.Hash().Hex()
+	return Final, res, nil
+}
+
+// finalFromState judges an anchor recovered without its transaction by
+// chain state alone.
+func (c *EthChain) finalFromState(ctx context.Context, m *minedTx, point *types.Header) (Status, Result, error) {
+	if ok, err := c.anchoredAt(ctx, m.req, m.res.EpochID, point.Number); err != nil {
+		return Pending, m.res, err
+	} else if ok {
+		return c.confirmAt(ctx, m, point)
+	}
+	if ok, err := c.anchoredAt(ctx, m.req, m.res.EpochID, nil); err != nil || ok {
+		return Pending, m.res, err
+	}
+	c.log.Warn("anchor: reorg removed an anchor recovered from chain state; anchoring the epoch again",
+		"epoch", m.res.EpochID, "tx", m.res.TxHash, "block", m.res.BlockNumber, "block_hash", m.res.BlockHash)
+	return c.drop(m)
+}
+
+// anchoredAt reports whether agentAnchors(agentId, epoch) at block holds
+// req's root and count (block nil: the head).
+func (c *EthChain) anchoredAt(ctx context.Context, req Request, epoch uint64, block *big.Int) (bool, error) {
+	a, err := c.contract.AgentAnchors(&bind.CallOpts{Context: ctx, BlockNumber: block}, req.AgentKey, new(big.Int).SetUint64(epoch))
+	if err != nil {
+		return false, fmt.Errorf("reading agentAnchors at block %v: %w", block, err)
+	}
+	return a.MerkleRoot == req.Root && a.LogCount == req.Count, nil
+}
+
+// resendReorged finds the mined anchors whose nonce the canonical chain no
+// longer uses (a reorg removed them), logs each once at WARN, and sends the
+// same signed transaction again. If the oldest has not returned after a few
+// checks, it is replaced (same nonce, higher fees).
+func (c *EthChain) resendReorged(ctx context.Context) error {
+	var withTx []*minedTx
+	for _, m := range c.mined {
+		if m.tx != nil {
+			withTx = append(withTx, m)
+		}
+	}
+	if len(withTx) == 0 {
+		return nil
+	}
+	used, err := c.backend.NonceAt(ctx, c.from, nil)
+	if err != nil {
+		return fmt.Errorf("reading the nonce: %w", err)
+	}
+	sort.Slice(withTx, func(i, j int) bool { return withTx[i].tx.Nonce() < withTx[j].tx.Nonce() })
+	first := true
+	for _, m := range withTx {
+		if m.tx.Nonce() < used {
+			m.reorged, m.polls = false, 0 // the receipt check decides by which transaction
+			continue
+		}
+		if !m.reorged {
+			canonical := "none"
+			if h, err := c.backend.HeaderByNumber(ctx, new(big.Int).SetUint64(m.res.BlockNumber)); err == nil {
+				canonical = h.Hash().Hex()
+			}
+			c.log.Warn("anchor: reorg removed the anchor transaction; sending it again", "tx", m.res.TxHash,
+				"nonce", m.tx.Nonce(), "block", m.res.BlockNumber, "block_hash", m.res.BlockHash,
+				"canonical_block_hash", canonical, "epoch", m.res.EpochID, "agent_key", common.Hash(m.req.AgentKey))
+			m.reorged = true
+		}
+		m.polls++
+		if first && m.polls > reorgReplaceAfter {
+			m.polls = 0
+			if _, err := c.sendVersion(ctx, m.req, &m.pendingTx, func(p *pendingTx) error {
+				m.pendingTx = *p
+				return c.save()
+			}); err != nil {
+				c.log.Warn("anchor: replacing a reorged-out transaction failed", "nonce", m.tx.Nonce(), "err", err)
+			}
+		} else if err := c.broadcast(ctx, m.tx, nil); err != nil {
+			c.log.Debug("anchor: resending a reorged-out transaction", "tx", m.tx.Hash(), "err", err)
+		}
+		first = false
+	}
+	return nil
+}
+
+// drop forgets a mined anchor that is gone for good.
+func (c *EthChain) drop(m *minedTx) (Status, Result, error) {
+	if err := c.forget(m.req); err != nil {
+		return Pending, m.res, err
+	}
+	return Reanchor, m.res, nil
+}
+
+func (c *EthChain) forget(req Request) error {
+	for i, m := range c.mined {
+		if m.req == req {
+			c.mined = append(c.mined[:i], c.mined[i+1:]...)
+			return c.save()
+		}
+	}
+	return nil
+}
+
+// Release forgets req's anchor once its job is complete.
+func (c *EthChain) Release(req Request) error { return c.forget(req) }
+
+// Retain forgets the anchors of requests that are no longer queued: their
+// jobs completed before a crash that came before Release.
+func (c *EthChain) Retain(reqs []Request) error {
+	keep := make(map[Request]bool, len(reqs))
+	for _, r := range reqs {
+		keep[r] = true
+	}
+	kept := c.mined[:0]
+	for _, m := range c.mined {
+		if keep[m.req] {
+			kept = append(kept, m)
+		} else {
+			c.log.Info("anchor: forgetting the anchor of a completed epoch", "epoch", m.res.EpochID, "tx", m.res.TxHash)
+		}
+	}
+	if len(kept) == len(c.mined) {
+		return nil
+	}
+	c.mined = kept
+	return c.save()
+}
+
+// sendVersion signs and broadcasts anchorEpoch for req. When prev (an
+// unmined transaction for req) is set, it is replaced (same nonce, fees
+// +25%); if the fee ceiling leaves no room for a valid replacement, prev is
+// rebroadcast unchanged instead. A new version is handed to install, which
+// must persist it, before it is broadcast.
+func (c *EthChain) sendVersion(ctx context.Context, req Request, prev *pendingTx, install func(*pendingTx) error) (*types.Transaction, error) {
 	head, err := c.backend.HeaderByNumber(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("reading head: %w", err)
@@ -268,22 +600,24 @@ func (c *EthChain) send(ctx context.Context, req Request) (*types.Transaction, e
 	feeCap := new(big.Int).Add(new(big.Int).Mul(head.BaseFee, big.NewInt(2)), tip)
 
 	var nonce uint64
-	if c.pending != nil {
-		old := c.pending.tx
+	if prev != nil {
+		old := prev.tx
 		nonce = old.Nonce()
 		tip = maxBig(tip, bump(old.GasTipCap()))
 		feeCap = maxBig(feeCap, bump(old.GasFeeCap()))
 	} else if nonce, err = c.backend.PendingNonceAt(ctx, c.from); err != nil {
 		return nil, fmt.Errorf("reading nonce: %w", err)
+	} else {
+		nonce = max(nonce, c.nextNonce())
 	}
 	tip, feeCap, capped := c.applyCeiling(tip, feeCap)
-	if c.pending != nil {
-		old := c.pending.tx
+	if prev != nil {
+		old := prev.tx
 		if tip.Cmp(minReplacement(old.GasTipCap())) < 0 || feeCap.Cmp(minReplacement(old.GasFeeCap())) < 0 {
 			c.log.Error("anchor: fee ceiling reached; not bumping fees, waiting for the pending transaction",
 				"tx", old.Hash(), "nonce", nonce, "tip_wei", old.GasTipCap(), "max_fee_wei", old.GasFeeCap(),
 				"base_fee_wei", head.BaseFee, "agent_key", common.Hash(req.AgentKey), "root", common.Hash(req.Root))
-			if err := c.broadcast(ctx, old); err != nil {
+			if err := c.broadcast(ctx, old, prev); err != nil {
 				return nil, err
 			}
 			return old, nil
@@ -308,15 +642,14 @@ func (c *EthChain) send(ctx context.Context, req Request) (*types.Transaction, e
 	}
 
 	p := &pendingTx{req: req, tx: tx}
-	if c.pending != nil {
-		p.hashes = append(p.hashes, c.pending.hashes...)
+	if prev != nil {
+		p.hashes = append(p.hashes, prev.hashes...)
 	}
 	p.hashes = append(p.hashes, tx.Hash())
-	if err := c.savePending(p); err != nil { // before the broadcast: never send what a restart cannot see
+	if err := install(p); err != nil { // before the broadcast: never send what a restart cannot see
 		return nil, err
 	}
-	c.pending = p
-	if err := c.broadcast(ctx, tx); err != nil {
+	if err := c.broadcast(ctx, tx, p); err != nil {
 		return nil, err
 	}
 	c.log.Info("anchor: transaction sent", "tx", tx.Hash(), "nonce", tx.Nonce(), "replaces", len(p.hashes)-1,
@@ -327,15 +660,18 @@ func (c *EthChain) send(ctx context.Context, req Request) (*types.Transaction, e
 // broadcast sends tx. "Already known" is success. "Nonce too low" means the
 // nonce was used: by a version of this transaction (whose receipt the next
 // attempt finds) or, if no version is ever mined, by another transaction. In
-// that case the pending transaction is dropped on the second consecutive
-// such answer and the next attempt starts with a fresh nonce.
-func (c *EthChain) broadcast(ctx context.Context, tx *types.Transaction) error {
+// that case the in-flight transaction (p is c.pending) is dropped on the
+// second consecutive such answer and the next attempt starts with a fresh
+// nonce. Anchors awaiting finality are never dropped here: Final decides.
+func (c *EthChain) broadcast(ctx context.Context, tx *types.Transaction, p *pendingTx) error {
 	err := c.backend.SendTransaction(ctx, tx)
 	if err == nil || strings.Contains(err.Error(), "already known") {
-		c.nonceGone = 0
+		if p != nil && p == c.pending {
+			c.nonceGone = 0
+		}
 		return nil
 	}
-	if strings.Contains(strings.ToLower(err.Error()), "nonce too low") && c.pending != nil {
+	if strings.Contains(strings.ToLower(err.Error()), "nonce too low") && p != nil && p == c.pending {
 		c.nonceGone++
 		if c.nonceGone >= 2 {
 			c.log.Error("anchor: the pending transaction's nonce was used by another transaction; starting over with a fresh nonce",

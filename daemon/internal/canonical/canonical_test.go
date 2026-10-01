@@ -12,8 +12,8 @@ func TestCanonicalizeJSON(t *testing.T) {
 		{`{"b":1,"a":2}`, `{"a":2,"b":1}`},
 		{" { \"a\" : [ 1 , 2 , { \"z\" : null , \"y\" : true } ] } ", `{"a":[1,2,{"y":true,"z":null}]}`},
 		{`"<script>&</script>"`, `"<script>&</script>"`}, // no HTML escaping
-		{`"\u00e9\u20ac\ud83d\ude00"`, `"é€😀"`},           // escapes decoded to UTF-8
-		{`"\u2028\u2029"`, "\"\u2028\u2029\""},              // not escaped by JCS
+		{`"\u00e9\u20ac\ud83d\ude00"`, `"é€😀"`},          // escapes decoded to UTF-8
+		{`"\u2028\u2029"`, "\"\u2028\u2029\""},           // not escaped by JCS
 		{`"\u0000\u001f\b\f\n\r\t\"\\\/"`, `"\u0000\u001f\b\f\n\r\t\"\\/"`},
 		{`123456789012345678901234567890`, `123456789012345678901234567890`}, // exact integer
 		{`-0`, `0`},

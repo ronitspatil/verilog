@@ -8,7 +8,7 @@
 // anchor time.
 //
 //	verilog-verify --event event.json --proof proof.json --epoch N \
-//	    --agent-id ID --rpc URL --contract 0xADDR
+//	    --agent-id ID --rpc URL --contract 0xADDR --chain-id N [--finality finalized]
 //
 // Run mode: the complete evidence of the agent (a bundle for every anchored
 // epoch, each rebuilding its on-chain root and count), every event of the run
@@ -16,7 +16,14 @@
 // run's hash chain (contiguous from step 1, no forks, epochs in chain order)
 // and a terminal run_end event.
 //
-//	verilog-verify --run-id RUN --bundles DIR --agent-id ID --rpc URL --contract 0xADDR
+//	verilog-verify --run-id RUN --bundles DIR --agent-id ID --rpc URL --contract 0xADDR --chain-id N
+//
+// --chain-id is required: the endpoint's eth_chainId must match it. Every
+// read is pinned to the final block under --finality (finalized, safe,
+// latest or depth:N; default finalized), printed on stderr. An epoch anchored
+// at the head but not final yet is "not anchored yet" (exit 2); in run mode
+// the verdict covers the final epochs, and a non-final epoch holding events
+// of the run makes the run not anchored yet (exit 2).
 //
 // stdout is exactly one verdict line:
 //
@@ -27,7 +34,8 @@
 //	    has no run_end, so truncation cannot be ruled out)
 //
 // Exit status 2 means no verdict could be reached (bad arguments, files that
-// cannot be read, RPC failure); nothing is printed on stdout. A defect in the
+// cannot be read, RPC failure, chain id mismatch, evidence not final yet);
+// nothing is printed on stdout. A defect in the
 // evidence itself (an unanchored epoch, a malformed event or bundle, missing
 // epochs) is a FAILURE, never exit 2.
 //
@@ -55,12 +63,14 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -68,6 +78,7 @@ import (
 
 	verilogv1 "github.com/ronitspatil/verilog/daemon/gen/verilog/v1"
 	"github.com/ronitspatil/verilog/daemon/internal/canonical"
+	"github.com/ronitspatil/verilog/daemon/internal/finality"
 	"github.com/ronitspatil/verilog/daemon/internal/merkle"
 	"github.com/ronitspatil/verilog/daemon/internal/store"
 	"github.com/ronitspatil/verilog/daemon/internal/verify"
@@ -119,6 +130,8 @@ func runVerify(args []string, stdout, stderr io.Writer) int {
 	contract := fs.String("contract", os.Getenv("VERILOG_CONTRACT"), "VeriLogRegistry address (env VERILOG_CONTRACT)")
 	onchain := fs.Bool("onchain-check", true, "also evaluate each proof with the contract's verifyAnchoredLeaf")
 	timeout := fs.Duration("timeout", 30*time.Second, "RPC timeout")
+	chainIDFlag := fs.String("chain-id", os.Getenv("VERILOG_CHAIN_ID"), "required: the chain id the registry lives on; a different eth_chainId is exit 2 (env VERILOG_CHAIN_ID)")
+	finalityFlag := fs.String("finality", "finalized", "block every read is pinned to: finalized, safe, latest or depth:N; an epoch not final there is \"not anchored yet\" (exit 2)")
 	if err := fs.Parse(args); err != nil {
 		return exitOperational
 	}
@@ -142,6 +155,16 @@ func runVerify(args []string, stdout, stderr io.Writer) int {
 		return operational("--allow-incomplete only applies to run mode")
 	case !common.IsHexAddress(*contract):
 		return operational("--contract must be a 0x address")
+	case *chainIDFlag == "":
+		return operational("--chain-id (or VERILOG_CHAIN_ID) is required: a verdict is only meaningful for the chain the registry lives on")
+	}
+	wantChainID, ok := new(big.Int).SetString(*chainIDFlag, 10)
+	if !ok || wantChainID.Sign() <= 0 {
+		return operational("--chain-id must be a positive decimal number")
+	}
+	mode, err := finality.Parse(*finalityFlag)
+	if err != nil {
+		return operational("--finality: %v", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
@@ -176,13 +199,34 @@ func runVerify(args []string, stdout, stderr io.Writer) int {
 		return operational("dialing RPC: %v", err)
 	}
 	defer client.Close()
-	v, err := verify.New(ctx, client, common.HexToAddress(*contract), *onchain)
+	point, err := pinChain(ctx, client, wantChainID, mode)
 	if err != nil {
 		return operational("%v", err)
+	}
+	fmt.Fprintf(stderr, "chain:          id %s, verdict at block %s (%s, finality %s)\n", wantChainID, point.Number, point.Hash().Hex(), mode)
+	v, err := verify.NewAt(ctx, client, common.HexToAddress(*contract), *onchain, point.Number)
+	if err != nil {
+		return operational("%v", err)
+	}
+	// The pinned block must still be the canonical one once every read is
+	// done (a reorg deeper than the finality rule would change the answer).
+	stillCanonical := func() error {
+		h, err := client.HeaderByNumber(ctx, point.Number)
+		if err != nil {
+			return fmt.Errorf("re-reading block %s: %v", point.Number, err)
+		}
+		if h.Hash() != point.Hash() {
+			return fmt.Errorf("block %s was reorganized during verification (%s, now %s); retry, or use a stronger --finality",
+				point.Number, point.Hash().Hex(), h.Hash().Hex())
+		}
+		return nil
 	}
 
 	if runMode {
 		rep, err := v.Run(ctx, verify.RunInput{AgentID: *agentID, RunID: *runID, Epochs: evidence, AllowIncomplete: *allowIncomplete})
+		if err == nil {
+			err = stillCanonical()
+		}
 		if err != nil {
 			return operational("%v", err)
 		}
@@ -215,6 +259,9 @@ func runVerify(args []string, stdout, stderr io.Writer) int {
 	}
 
 	rep, err := v.Event(ctx, eventJSON, proof, *epoch, *agentID)
+	if err == nil {
+		err = stillCanonical()
+	}
 	if err != nil {
 		return operational("%v", err)
 	}
@@ -248,6 +295,25 @@ func runVerify(args []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintln(stdout, successLine)
 	return exitVerified
+}
+
+// chainReader is what pinChain needs (*ethclient.Client implements it).
+type chainReader interface {
+	ChainID(ctx context.Context) (*big.Int, error)
+	finality.HeaderReader
+}
+
+// pinChain checks that the endpoint serves chain want and returns the final
+// block under mode, to which every read is pinned.
+func pinChain(ctx context.Context, c chainReader, want *big.Int, mode finality.Mode) (*types.Header, error) {
+	got, err := c.ChainID(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("reading eth_chainId: %v", err)
+	}
+	if got.Cmp(want) != 0 {
+		return nil, fmt.Errorf("the RPC endpoint serves chain id %s, not --chain-id %s: wrong endpoint or wrong chain", got, want)
+	}
+	return mode.Check(ctx, c)
 }
 
 // loadEvidence reads every evidence bundle (*.json) under dir. The bundles
@@ -374,7 +440,7 @@ func runExport(args []string, stderr io.Writer) error {
 			return errors.New("event not found in bundle")
 		}
 		eventJSON, proof = ev.CanonicalEvent, ev.Proof
-		meta = fmt.Sprintf("--epoch %d --agent-id %q --contract %s", b.EpochID, b.AgentID, b.Contract)
+		meta = fmt.Sprintf("--epoch %d --agent-id %q --contract %s --chain-id %s", b.EpochID, b.AgentID, b.Contract, b.ChainID)
 	case *daemon != "" && *bundlePath == "":
 		if *agentID == "" || *epoch == 0 {
 			return errors.New("--agent-id and --epoch are required with --daemon")

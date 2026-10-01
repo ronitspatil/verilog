@@ -30,6 +30,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 
 	verilogv1 "github.com/ronitspatil/verilog/daemon/gen/verilog/v1"
@@ -150,6 +151,7 @@ func runExport(args []string, stderr io.Writer) error {
 	fs.SetOutput(stderr)
 	bundlePath := fs.String("bundle", "", "evidence bundle file (data-dir/evidence/<agentKey>/epoch-N.json)")
 	daemon := fs.String("daemon", "", "verilogd gRPC address, to fetch the proof with GetProof instead of reading a bundle")
+	daemonCA := fs.String("daemon-ca", "", "PEM CA certificate to connect to --daemon over TLS (plaintext if unset)")
 	agentID := fs.String("agent-id", "", "agent id (with --daemon)")
 	epoch := fs.Uint64("epoch", 0, "epoch id (with --daemon)")
 	index := fs.Int("index", -1, "leaf index of the event")
@@ -197,7 +199,15 @@ func runExport(args []string, stderr io.Writer) error {
 			}
 			req.Selector = &verilogv1.GetProofRequest_ContentDigest{ContentDigest: d[:]}
 		}
-		conn, err := grpc.NewClient(*daemon, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		creds := insecure.NewCredentials()
+		if *daemonCA != "" {
+			tlsCreds, err := credentials.NewClientTLSFromFile(*daemonCA, "")
+			if err != nil {
+				return fmt.Errorf("--daemon-ca: %w", err)
+			}
+			creds = tlsCreds
+		}
+		conn, err := grpc.NewClient(*daemon, grpc.WithTransportCredentials(creds))
 		if err != nil {
 			return err
 		}

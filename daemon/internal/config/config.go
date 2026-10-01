@@ -27,6 +27,8 @@ const (
 // Config is the daemon configuration.
 type Config struct {
 	Listen          string
+	TLSCert         string
+	TLSKey          string
 	DataDir         string
 	RPCURL          string
 	Contract        common.Address
@@ -66,6 +68,8 @@ func Load(args []string, getenv func(string) string, stderr io.Writer) (*Config,
 		maxPayload = env("VERILOG_MAX_PAYLOAD_BYTES", strconv.Itoa(1<<20))
 	)
 	fs.StringVar(&c.Listen, "listen", env("VERILOG_LISTEN", "127.0.0.1:50051"), "gRPC listen address (env VERILOG_LISTEN)")
+	fs.StringVar(&c.TLSCert, "tls-cert", env("VERILOG_TLS_CERT", ""), "PEM certificate for gRPC TLS (env VERILOG_TLS_CERT); plaintext if unset")
+	fs.StringVar(&c.TLSKey, "tls-key", env("VERILOG_TLS_KEY", ""), "PEM private key for gRPC TLS (env VERILOG_TLS_KEY)")
 	fs.StringVar(&c.DataDir, "data-dir", env("VERILOG_DATA_DIR", "./verilog-data"), "directory for the WAL, checkpoint and evidence bundles (env VERILOG_DATA_DIR)")
 	fs.StringVar(&c.RPCURL, "rpc", env("VERILOG_RPC_URL", ""), "EVM JSON-RPC endpoint (env VERILOG_RPC_URL)")
 	fs.StringVar(&contract, "contract", env("VERILOG_CONTRACT", ""), "VeriLogRegistry address (env VERILOG_CONTRACT)")
@@ -117,6 +121,9 @@ func Load(args []string, getenv func(string) string, stderr io.Writer) (*Config,
 		return nil, errors.New("--contract (or VERILOG_CONTRACT) must be a 0x address")
 	}
 	c.Contract = common.HexToAddress(contract)
+	if (c.TLSCert == "") != (c.TLSKey == "") {
+		return nil, errors.New("--tls-cert and --tls-key must be set together")
+	}
 	if c.CommitBatch <= 0 || c.StreamWindow <= 0 {
 		return nil, errors.New("--commit-batch and --stream-window must be positive")
 	}

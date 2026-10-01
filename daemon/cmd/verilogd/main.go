@@ -15,6 +15,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/ethclient"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/keepalive"
@@ -69,6 +70,13 @@ func run() error {
 	logger.Info("chain ready", "chain_id", chain.ChainID(), "contract", cfg.Contract, "signer", chain.From())
 
 	// Storage and engine.
+	lock, err := lockDataDir(cfg.DataDir)
+	if err != nil {
+		return err
+	}
+	if lock != nil {
+		defer lock.Close()
+	}
 	st, err := store.Open(cfg.DataDir)
 	if err != nil {
 		return err
@@ -105,11 +113,19 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	srv := grpc.NewServer(
-		grpc.MaxRecvMsgSize(cfg.MaxPayloadBytes+64<<10),
+	opts := []grpc.ServerOption{
+		grpc.MaxRecvMsgSize(cfg.MaxPayloadBytes + 64<<10),
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{MinTime: 10 * time.Second, PermitWithoutStream: true}),
 		grpc.KeepaliveParams(keepalive.ServerParameters{Time: 30 * time.Second, Timeout: 10 * time.Second}),
-	)
+	}
+	if cfg.TLSCert != "" {
+		creds, err := credentials.NewServerTLSFromFile(cfg.TLSCert, cfg.TLSKey)
+		if err != nil {
+			return fmt.Errorf("loading TLS certificate: %w", err)
+		}
+		opts = append(opts, grpc.Creds(creds))
+	}
+	srv := grpc.NewServer(opts...)
 	verilogv1.RegisterVeriLogServer(srv, ingest.NewServer(eng, st, ingest.Options{
 		MaxPayloadBytes: cfg.MaxPayloadBytes,
 		Window:          cfg.StreamWindow,
@@ -120,7 +136,7 @@ func run() error {
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(lis) }()
-	logger.Info("verilogd listening", "addr", lis.Addr().String(), "data_dir", cfg.DataDir,
+	logger.Info("verilogd listening", "addr", lis.Addr().String(), "tls", cfg.TLSCert != "", "data_dir", cfg.DataDir,
 		"epoch_interval", cfg.EpochInterval, "epoch_max_logs", cfg.EpochMaxLogs)
 
 	statsTick := time.NewTicker(time.Minute)

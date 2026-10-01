@@ -10,7 +10,7 @@ import (
 )
 
 // Anvil's first well-known development key. Never use it outside local dev.
-const devKey = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcbc2f9b0e5f1f1e1b"
+const devKey = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
 
 func envOf(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
 
@@ -40,6 +40,7 @@ func TestLoadRejects(t *testing.T) {
 		{"--log-level", "loud"},
 		{"--contract", "nope"},
 		{"stray"},
+		{"--tls-cert", "cert.pem"},
 	} {
 		if _, err := Load(append(append([]string{}, base...), extra...), envOf(nil), io.Discard); err == nil {
 			t.Errorf("accepted %v", extra)

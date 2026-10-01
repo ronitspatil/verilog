@@ -3,6 +3,7 @@ package wal
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -14,7 +15,7 @@ func ev(agent string, seq uint64) Record {
 
 func TestWriteAndReopen(t *testing.T) {
 	dir := t.TempDir()
-	l, recs, err := Open(dir, 1<<20, nil)
+	l, recs, err := openAll(dir, 1<<20, nil)
 	if err != nil || len(recs) != 0 {
 		t.Fatalf("open: %v %d", err, len(recs))
 	}
@@ -27,7 +28,7 @@ func TestWriteAndReopen(t *testing.T) {
 	}
 	l.Close()
 
-	l2, recs, err := Open(dir, 1<<20, nil)
+	l2, recs, err := openAll(dir, 1<<20, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,7 +43,7 @@ func TestWriteAndReopen(t *testing.T) {
 }
 
 func TestRejectsInvalidRecords(t *testing.T) {
-	l, _, _ := Open(t.TempDir(), 1<<20, nil)
+	l, _, _ := openAll(t.TempDir(), 1<<20, nil)
 	defer l.Close()
 	for _, r := range []Record{
 		{Type: TypeEvent, AgentID: "a"},
@@ -57,7 +58,7 @@ func TestRejectsInvalidRecords(t *testing.T) {
 
 func TestTornTailIsTruncated(t *testing.T) {
 	dir := t.TempDir()
-	l, _, _ := Open(dir, 1<<20, nil)
+	l, _, _ := openAll(dir, 1<<20, nil)
 	if err := l.Write([]Record{ev("a", 1), ev("a", 2)}); err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +68,7 @@ func TestTornTailIsTruncated(t *testing.T) {
 	f.WriteString(`{"t":"event","agent":"a","seq":3,"ev`) // crash mid-write
 	f.Close()
 
-	l2, recs, err := Open(dir, 1<<20, nil)
+	l2, recs, err := openAll(dir, 1<<20, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +79,7 @@ func TestTornTailIsTruncated(t *testing.T) {
 		t.Fatal(err)
 	}
 	l2.Close()
-	_, recs, err = Open(dir, 1<<20, nil)
+	_, recs, err = openAll(dir, 1<<20, nil)
 	if err != nil || len(recs) != 3 {
 		t.Fatalf("after rewrite: %v %d", err, len(recs))
 	}
@@ -86,20 +87,20 @@ func TestTornTailIsTruncated(t *testing.T) {
 
 func TestCorruptionInOlderSegmentIsFatal(t *testing.T) {
 	dir := t.TempDir()
-	l, _, _ := Open(dir, 1, nil) // rotate after every write
+	l, _, _ := openAll(dir, 1, nil) // rotate after every write
 	l.Write([]Record{ev("a", 1)})
 	l.Write([]Record{ev("a", 2)})
 	l.Close()
 	path := filepath.Join(dir, segName(1))
 	os.WriteFile(path, []byte("garbage\n"+`{"t":"event","agent":"a","seq":1,"event":{}}`+"\n"), 0o600)
-	if _, _, err := Open(dir, 1, nil); err == nil {
+	if _, _, err := openAll(dir, 1, nil); err == nil {
 		t.Fatal("expected corruption error")
 	}
 }
 
 func TestRotationAndCompaction(t *testing.T) {
 	dir := t.TempDir()
-	l, _, _ := Open(dir, 1, nil) // every write rotates
+	l, _, _ := openAll(dir, 1, nil) // every write rotates
 	defer l.Close()
 	l.Write([]Record{ev("a", 1), ev("b", 2)})
 	l.Write([]Record{ev("a", 3)})
@@ -123,8 +124,63 @@ func TestRotationAndCompaction(t *testing.T) {
 		t.Fatalf("segments = %d", l.Segments())
 	}
 	l.Close()
-	_, recs, err := Open(dir, 1, nil)
+	_, recs, err := openAll(dir, 1, nil)
 	if err != nil || len(recs) != 0 {
 		t.Fatalf("reopen after compaction: %v %d", err, len(recs))
+	}
+}
+
+// openAll opens the log and replays every record.
+func openAll(dir string, maxSeg int64, logger *slog.Logger) (*Log, []Record, error) {
+	l, err := Open(dir, maxSeg, logger)
+	if err != nil {
+		return nil, nil, err
+	}
+	var recs []Record
+	err = l.Replay(func(r Record, _ Loc) error { recs = append(recs, r); return nil })
+	return l, recs, err
+}
+
+func TestAppendLocsAndReader(t *testing.T) {
+	dir := t.TempDir()
+	l, _, _ := openAll(dir, 64, nil) // rotate often
+	var locs []Loc
+	for i := uint64(1); i <= 6; i++ {
+		ls, err := l.Append([]Record{ev("a", i)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		locs = append(locs, ls...)
+	}
+	if l.Bytes() == 0 {
+		t.Fatal("Bytes() = 0")
+	}
+	r := l.NewReader()
+	defer r.Close()
+	for i, loc := range locs {
+		rec, err := r.Read(loc)
+		if err != nil || rec.Seq != uint64(i+1) {
+			t.Fatalf("read %d: %+v %v", i, rec, err)
+		}
+	}
+	l.Close()
+	// Replay reports the same locations.
+	l2, err := Open(dir, 64, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l2.Close()
+	i := 0
+	if err := l2.Replay(func(rec Record, loc Loc) error {
+		if loc != locs[i] {
+			t.Fatalf("replay loc %d = %+v, want %+v", i, loc, locs[i])
+		}
+		i++
+		return nil
+	}); err != nil || i != len(locs) {
+		t.Fatalf("replay: %v (%d records)", err, i)
+	}
+	if l2.Bytes() != l.Bytes() {
+		t.Fatalf("Bytes after reopen = %d, want %d", l2.Bytes(), l.Bytes())
 	}
 }

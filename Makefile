@@ -14,19 +14,32 @@ PROTOC ?= protoc
 # Directory containing google/protobuf/timestamp.proto (shipped with protoc).
 PROTOC_INCLUDE ?= $(shell dirname $$(dirname $$(command -v $(PROTOC))))/include
 
-.PHONY: all tools venv proto bindings vectors build certs test test-go test-contracts test-python bench e2e clean
+.PHONY: all tools venv lock proto bindings vectors build certs test test-go test-contracts test-python bench e2e clean
 
 all: build test
 
-tools: ## Install protoc plugins and abigen
-	go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
-	go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
-	go install github.com/ethereum/go-ethereum/cmd/abigen@latest
+# Generator versions match daemon/go.mod and the headers of the committed
+# generated code; `make proto bindings` must reproduce it byte for byte.
+# protoc itself must be 3.20.3 (see the headers in daemon/gen).
+PROTOC_GEN_GO_VERSION      := v1.36.12
+PROTOC_GEN_GO_GRPC_VERSION := v1.6.2
+ABIGEN_VERSION             := v1.17.7
 
-venv: ## Create the Python venv with the SDK installed in editable mode
+tools: ## Install pinned protoc plugins and abigen
+	go install google.golang.org/protobuf/cmd/protoc-gen-go@$(PROTOC_GEN_GO_VERSION)
+	go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@$(PROTOC_GEN_GO_GRPC_VERSION)
+	go install github.com/ethereum/go-ethereum/cmd/abigen@$(ABIGEN_VERSION)
+
+LOCK := sdk/python/requirements-dev.txt
+
+venv: ## Create the Python venv from the hashed lock, SDK installed in editable mode
 	$(PYTHON) -m venv $(VENV)
-	$(VENV)/bin/pip install -q --upgrade pip
-	$(VENV)/bin/pip install -q -e 'sdk/python[dev]'
+	$(VENV)/bin/pip install -q --require-hashes -r $(LOCK)
+	$(VENV)/bin/pip install -q --no-deps --no-build-isolation -e sdk/python
+
+lock: ## Re-resolve the Python lock (needs uv: pip install uv)
+	cd sdk/python && uv pip compile pyproject.toml --extra dev --universal --python-version 3.10 \
+		--generate-hashes --custom-compile-command 'make lock' -q -o requirements-dev.txt
 
 proto: ## Regenerate Go and Python gRPC code from proto/
 	$(PROTOC) -I proto -I $(PROTOC_INCLUDE) \

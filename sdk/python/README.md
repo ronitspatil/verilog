@@ -100,7 +100,8 @@ close runs you start.
 
 ```sh
 python3 -m venv .venv
-.venv/bin/pip install -e '.[dev]'
+.venv/bin/pip install --require-hashes -r requirements-dev.txt
+.venv/bin/pip install --no-deps --no-build-isolation -e .
 .venv/bin/pytest
 ```
 

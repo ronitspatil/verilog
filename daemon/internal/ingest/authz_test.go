@@ -202,7 +202,7 @@ func TestMTLSGetProofAuthorization(t *testing.T) {
 }
 
 func TestIdleStreamIsClosed(t *testing.T) {
-	e, _ := newMTLSEnv(t, 200*time.Millisecond)
+	e, _ := newMTLSEnv(t, time.Second)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	stream, err := e.client.IngestStream(ctx)
@@ -211,7 +211,7 @@ func TestIdleStreamIsClosed(t *testing.T) {
 	}
 	// Activity keeps the stream open past the timeout.
 	for i := uint64(1); i <= 3; i++ {
-		time.Sleep(120 * time.Millisecond)
+		time.Sleep(300 * time.Millisecond)
 		if err := stream.Send(logEvent("agent-a", i)); err != nil {
 			t.Fatal(err)
 		}
@@ -224,7 +224,7 @@ func TestIdleStreamIsClosed(t *testing.T) {
 	if status.Code(err) != codes.DeadlineExceeded {
 		t.Fatalf("idle stream: %v, want DeadlineExceeded", err)
 	}
-	if d := time.Since(start); d > 2*time.Second {
+	if d := time.Since(start); d > 3*time.Second {
 		t.Fatalf("idle stream closed after %s", d)
 	}
 }

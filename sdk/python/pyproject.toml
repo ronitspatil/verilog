@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "verilog-sdk"
-version = "0.1.0"
+version = "0.2.0"
 description = "VeriLog client SDK: tamper-evident audit logging for LangChain/LangGraph agents"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,6 +12,7 @@ license = { text = "MIT" }
 dependencies = [
     "grpcio>=1.84.0",
     "protobuf>=7.35.1,<8",
+    "cryptography>=42",
 ]
 
 [project.optional-dependencies]

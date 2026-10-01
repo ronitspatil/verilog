@@ -5,9 +5,13 @@ Every hook snapshots its arguments into JSON-compatible data and hands them to
 canonical JSON and all network I/O happen on the client's background thread,
 so the agent is never blocked and SDK failures are logged, never raised.
 
-``step_number`` is monotonic per root run: the first event of a top-level
-invocation is step 1, and every nested chain, LLM and tool event of that
-invocation continues the same counter. Each payload carries ``run_id``,
+Each top-level invocation (the callback whose ``parent_run_id`` is None) is
+one hash-chained run: every nested chain, LLM and tool event is submitted
+with the root's ``run_id``, and the client's background thread assigns
+``step_number`` and ``prev_hash`` and signs each event. When the root run
+ends (``*_end`` or ``*_error`` of the root) the handler also submits a
+``run_end`` event, and ``close()`` submits ``run_end`` with status
+``"closed"`` for runs still open. Each payload carries ``run_id``,
 ``parent_run_id`` and ``root_run_id`` so traces can be reassembled.
 """
 
@@ -15,13 +19,13 @@ from __future__ import annotations
 
 import logging
 import threading
-from collections import defaultdict
-from typing import Any, Dict, List, Optional, Sequence
+import uuid
+from typing import Any, Dict, Optional
 from uuid import UUID
 
 from langchain_core.callbacks import AsyncCallbackHandler, BaseCallbackHandler
 
-from .client import VeriLogClient
+from .client import EVENT_RUN_END, VeriLogClient
 
 __all__ = ["VeriLogLangGraphCallback", "AsyncVeriLogLangGraphCallback", "to_jsonable"]
 
@@ -84,7 +88,9 @@ class _VeriLogCallbackCore:
         self._max_str = max_str_len
         self._lock = threading.Lock()
         self._root_of: Dict[UUID, UUID] = {}
-        self._steps: Dict[UUID, int] = defaultdict(int)
+        self._open_roots: Dict[UUID, None] = {}
+        # Run id used if a callback arrives without one (LangChain always sets it).
+        self._fallback_run = uuid.uuid4()
 
     # -------------------------------------------------------------- helpers
 
@@ -100,22 +106,26 @@ class _VeriLogCallbackCore:
     def _emit(
         self,
         event_type: str,
-        run_id: UUID,
+        run_id: Optional[UUID],
         parent_run_id: Optional[UUID],
         fields: Dict[str, Any],
         *,
         starting: bool = False,
         ending: bool = False,
+        status: Optional[str] = None,
     ) -> None:
         try:
+            if run_id is None:
+                run_id = self._fallback_run
             with self._lock:
                 root = self._root(run_id, parent_run_id, starting)
-                self._steps[root] += 1
-                step = self._steps[root]
+                root_ends = ending and run_id == root
+                if starting and run_id == root:
+                    self._open_roots[root] = None
                 if ending:
                     self._root_of.pop(run_id, None)
-                    if run_id == root:
-                        self._steps.pop(root, None)
+                if root_ends:
+                    self._open_roots.pop(root, None)
             payload = {
                 "run_id": str(run_id),
                 "parent_run_id": str(parent_run_id) if parent_run_id else None,
@@ -124,9 +134,19 @@ class _VeriLogCallbackCore:
             for key, value in fields.items():
                 if value is not None:
                     payload[key] = to_jsonable(value, self._max_str)
-            self.client.submit(self.agent_id, step, event_type, payload)
+            self.client.submit(self.agent_id, str(root), event_type, payload)
+            if root_ends:
+                self.client.submit(self.agent_id, str(root), EVENT_RUN_END, {"status": status or "ok"})
         except Exception:  # never break the agent
             log.exception("verilog_sdk: failed to record %s", event_type)
+
+    def _end_open_runs(self) -> None:
+        with self._lock:
+            roots = list(self._open_roots)
+            self._open_roots.clear()
+            self._root_of.clear()
+        for root in roots:
+            self.client.submit(self.agent_id, str(root), EVENT_RUN_END, {"status": "closed"})
 
     @staticmethod
     def _name(serialized: Optional[Dict[str, Any]], kwargs: Dict[str, Any]) -> Optional[str]:
@@ -147,7 +167,9 @@ class _VeriLogCallbackCore:
         return self.client.flush(timeout)
 
     def close(self, timeout: float = 5.0) -> bool:
-        """Flush and, if this handler created its client, close it."""
+        """End runs still open (``run_end`` with status "closed"), flush and,
+        if this handler created its client, close it."""
+        self._end_open_runs()
         if self._owns_client:
             return self.client.close(timeout)
         return self.client.flush(timeout)
@@ -176,7 +198,7 @@ class _VeriLogCallbackCore:
         self._emit("llm_end", run_id, parent_run_id, fields, ending=True)
 
     def _llm_error(self, error, run_id, parent_run_id):
-        self._emit("llm_error", run_id, parent_run_id, {"error": error}, ending=True)
+        self._emit("llm_error", run_id, parent_run_id, {"error": error}, ending=True, status="error")
 
     def _tool_start(self, serialized, input_str, run_id, parent_run_id, tags, metadata, inputs, kwargs):
         self._emit("tool_start", run_id, parent_run_id, {
@@ -188,7 +210,7 @@ class _VeriLogCallbackCore:
         self._emit("tool_end", run_id, parent_run_id, {"output": output}, ending=True)
 
     def _tool_error(self, error, run_id, parent_run_id):
-        self._emit("tool_error", run_id, parent_run_id, {"error": error}, ending=True)
+        self._emit("tool_error", run_id, parent_run_id, {"error": error}, ending=True, status="error")
 
     def _chain_start(self, serialized, inputs, run_id, parent_run_id, tags, metadata, kwargs):
         self._emit("chain_start", run_id, parent_run_id, {
@@ -200,7 +222,7 @@ class _VeriLogCallbackCore:
         self._emit("chain_end", run_id, parent_run_id, {"outputs": outputs}, ending=True)
 
     def _chain_error(self, error, run_id, parent_run_id):
-        self._emit("chain_error", run_id, parent_run_id, {"error": error}, ending=True)
+        self._emit("chain_error", run_id, parent_run_id, {"error": error}, ending=True, status="error")
 
 
 class VeriLogLangGraphCallback(_VeriLogCallbackCore, BaseCallbackHandler):

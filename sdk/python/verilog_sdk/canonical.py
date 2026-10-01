@@ -1,9 +1,10 @@
-"""Canonical JSON (RFC 8785 style), matching the daemon's Go implementation.
+"""Canonical JSON (RFC 8785 style) and canonical event v2, matching the
+daemon's Go implementation byte for byte.
 
-The daemon re-canonicalizes every payload and its canonicalization is the
-authoritative one; the SDK emits canonical payloads so that what the client
-sends is byte-identical to what gets hashed, which keeps payloads compact and
-makes client-side digests reproducible.
+The agent signs ``SIGNING_DOMAIN + canonical(event without "sig")``; the
+daemon rebuilds the same bytes from the fields it receives and rejects the
+event if the signature does not verify, so any drift between the two
+canonicalizations shows up as a rejected event, never as a silent mismatch.
 
 Rules (see daemon/internal/canonical):
   * object members sorted by the UTF-16 code units of their names;
@@ -24,12 +25,21 @@ from decimal import Decimal
 from typing import Any
 
 __all__ = [
+    "SIGNING_DOMAIN",
+    "ZERO_HASH",
     "canonical_json",
     "canonical_event",
+    "signing_bytes",
     "content_digest",
     "format_es6_float",
     "format_timestamp",
 ]
+
+#: Prefix of every signed message (domain separation for the agent key).
+SIGNING_DOMAIN = b"VeriLog/event/v1\n"
+
+#: prev_hash of the first event of a run.
+ZERO_HASH = bytes(32)
 
 _MAX_DEPTH = 128
 
@@ -116,18 +126,88 @@ def format_timestamp(ts_ns: int) -> str:
     return f"{base}.{nanos:09d}Z"
 
 
-def canonical_event(
-    agent_id: str, step_number: int, event_type: str, payload: Any, timestamp_ns: int
+def _hex32(value: bytes, name: str) -> str:
+    if len(value) != 32:
+        raise ValueError(f"{name} must be 32 bytes")
+    return "0x" + value.hex()
+
+
+def event_text(
+    *,
+    agent_id: str,
+    run_id: str,
+    step_number: int,
+    prev_hash: bytes,
+    event_type: str,
+    payload_text: str,
+    timestamp_ns: int,
+    key_id: bytes,
+    sig: bytes | None,
 ) -> str:
-    """Canonical event text, identical to what the daemon hashes."""
-    return canonical_json(
-        {
-            "agent_id": agent_id,
-            "event_type": event_type,
-            "payload": payload,
-            "step_number": step_number,
-            "timestamp_utc": format_timestamp(timestamp_ns),
-        }
+    """Canonical event JSON from an already canonical payload text.
+
+    With ``sig=None`` the "sig" member is left out (the signed body). Members
+    are emitted in their sorted order: agent_id, event_type, key_id, payload,
+    prev_hash, run_id, sig, step_number, timestamp_utc.
+    """
+    if not agent_id or not run_id or not event_type:
+        raise ValueError("agent_id, run_id and event_type are required")
+    if step_number < 0:
+        raise ValueError("step_number must be non-negative")
+    parts = [
+        '{"agent_id":', canonical_json(agent_id),
+        ',"event_type":', canonical_json(event_type),
+        ',"key_id":"', _hex32(key_id, "key_id"), '"',
+        ',"payload":', payload_text,
+        ',"prev_hash":"', _hex32(prev_hash, "prev_hash"), '"',
+        ',"run_id":', canonical_json(run_id),
+    ]
+    if sig is not None:
+        if len(sig) != 64:
+            raise ValueError("sig must be 64 bytes")
+        parts += [',"sig":"0x', sig.hex(), '"']
+    parts += [
+        ',"step_number":', str(int(step_number)),
+        ',"timestamp_utc":"', format_timestamp(timestamp_ns), '"}',
+    ]
+    return "".join(parts)
+
+
+def signing_bytes(
+    agent_id: str,
+    run_id: str,
+    step_number: int,
+    prev_hash: bytes,
+    event_type: str,
+    payload: Any,
+    timestamp_ns: int,
+    key_id: bytes,
+) -> bytes:
+    """The bytes the agent signs: SIGNING_DOMAIN || canonical(event without sig)."""
+    body = event_text(
+        agent_id=agent_id, run_id=run_id, step_number=step_number, prev_hash=prev_hash,
+        event_type=event_type, payload_text=canonical_json(payload), timestamp_ns=timestamp_ns,
+        key_id=key_id, sig=None,
+    )
+    return SIGNING_DOMAIN + body.encode("utf-8")
+
+
+def canonical_event(
+    agent_id: str,
+    run_id: str,
+    step_number: int,
+    prev_hash: bytes,
+    event_type: str,
+    payload: Any,
+    timestamp_ns: int,
+    key_id: bytes,
+    sig: bytes,
+) -> str:
+    """Canonical signed event text, identical to what the daemon hashes."""
+    return event_text(
+        agent_id=agent_id, run_id=run_id, step_number=step_number, prev_hash=prev_hash,
+        event_type=event_type, payload_text=canonical_json(payload), timestamp_ns=timestamp_ns,
+        key_id=key_id, sig=sig,
     )
 
 

@@ -7,10 +7,32 @@ the agent.
 ```python
 from verilog_sdk import VeriLogLangGraphCallback
 
+# The agent's signing key comes from VERILOG_SIGNING_KEY_FILE (or VERILOG_SIGNING_KEY).
 handler = VeriLogLangGraphCallback(agent_id="support-bot", target="127.0.0.1:50051")
 graph.invoke(inputs, config={"callbacks": [handler]})
-handler.close()  # flush and stop the background sender
+handler.close()  # end open runs, flush and stop the background sender
 ```
+
+## Signing keys
+
+Every event is signed in the agent process with the agent's Ed25519 key, so
+the daemon host cannot forge or rearrange events. Generate a key on the agent
+host and give the printed public key to the key admin, who registers it on
+chain:
+
+```sh
+python -m verilog_sdk keygen --out /etc/verilog/support-bot.key --agent-id support-bot
+# key file: ... (mode 0600)   pubkey: 0x...   key_id: 0x...
+# register (as KEY_ADMIN_ROLE):
+#   cast send <REGISTRY> 'registerAgentKey(bytes32,bytes32)' <agentId> <pubkey> ...
+export VERILOG_SIGNING_KEY_FILE=/etc/verilog/support-bot.key
+```
+
+The SDK loads the seed from `VERILOG_SIGNING_KEY_FILE` (preferred) or the hex
+value in `VERILOG_SIGNING_KEY`, or you pass `signer=Signer.from_file(...)`. The
+seed is never logged. Keep it on the agent host only: never on the daemon host
+and never in credentials the daemon can read. Rotation: generate a new key,
+have it registered, restart the agent with it, then have the old key revoked.
 
 - Hooks: `on_llm_start`, `on_chat_model_start`, `on_llm_end`, `on_llm_error`,
   `on_tool_start`, `on_tool_end`, `on_tool_error`, `on_chain_start`,
@@ -23,8 +45,13 @@ handler.close()  # flush and stop the background sender
   `OverflowPolicy.BLOCK` (waits up to `block_timeout`, then drops the new
   event). Drops are counted in `client.stats()`.
 - SDK errors are logged on the `verilog_sdk` logger and never raised.
-- `step_number` is monotonic per root run; payloads include `run_id`,
-  `parent_run_id` and `root_run_id`.
+- Each root run (`parent_run_id is None`) is a hash chain. The background
+  thread assigns `step_number` (from 1) and `prev_hash` (the previous event's
+  content digest) after dequeue, then signs. Overflow drops therefore never
+  leave a gap: the thread emits a signed `sdk_dropped` event `{"count": n}`
+  into the affected run. The end of the root run, and `handler.close()` for
+  runs still open, emits `run_end` `{"status": "ok"|"error"|"closed", "steps": n}`.
+  Payloads include `run_id`, `parent_run_id` and `root_run_id`.
 - `AsyncVeriLogLangGraphCallback` is available where an
   `AsyncCallbackHandler` is required; the sync handler also works with
   `ainvoke` (it runs inline because it only enqueues).
@@ -35,8 +62,12 @@ Use `VeriLogClient` directly for non-LangChain agents:
 from verilog_sdk import VeriLogClient
 
 with VeriLogClient("127.0.0.1:50051") as client:
-    client.submit("agent-1", step_number=1, event_type="tool_call", payload={"tool": "search"})
+    client.submit("agent-1", run_id="run-42", event_type="tool_call", payload={"tool": "search"})
+    client.submit("agent-1", run_id="run-42", event_type="run_end", payload={"status": "ok"})
 ```
+
+A run without a final `run_end` fails verification in run mode, so always
+close runs you start.
 
 ## Development
 

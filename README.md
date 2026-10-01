@@ -1,252 +1,82 @@
 # VeriLog
 
-Tamper-evident cryptographic audit logging for autonomous AI agent workflows.
+Tamper-evident audit logging for autonomous AI agents.
 
-VeriLog captures agent execution traces (prompts, tool calls, state updates,
-LLM responses) off-chain, commits them into per-agent append-only Merkle trees,
-and periodically anchors each tree's root on an EVM chain. Every event is
-signed inside the agent process with the agent's Ed25519 key and hash-chained
-to the previous event of its run. Anyone holding an event, its inclusion proof
-and an RPC endpoint can later prove that the agent produced exactly this event,
-that it has not been edited since, and (in run mode) that no event of the run
-was dropped, inserted or reordered, even if the daemon host was compromised.
+VeriLog records an agent's execution trace (prompts, tool calls, state
+updates, LLM responses). Each event is signed inside the agent process with
+the agent's Ed25519 key and hash-chained to the previous event of its run. A
+daemon commits events into per-agent Merkle trees and periodically anchors
+each root on an EVM chain. With an event, its inclusion proof and an RPC
+endpoint, anyone can later prove the agent produced exactly that event, that
+it has not been edited, and (in run mode) that no event of the run was
+dropped, inserted or reordered, even if the daemon host was compromised.
 
 ```
  LangChain / LangGraph agent
-   │  VeriLogLangGraphCallback  (enqueue only, never blocks)
+   │  VeriLogLangGraphCallback (enqueue only, never blocks)
    ▼
- Python SDK background thread: assign step + prev_hash per run, Ed25519 sign
+ SDK background thread: step + prev_hash per run, Ed25519 sign
    │
-   └──gRPC IngestStream (bidi, acks)──▶ verilogd
-                                         │ verify signature against agentKeys (on chain)
-                                         │ canonicalize + SHA-256 + keccak leaf
-                                         │ WAL group commit (fsync) ──▶ ack
-                                         │ per-agent shard: append leaf
-                                         │ seal every N s / M logs (swap tree)
-                                         ▼
-                                 anchor worker ──anchorEpoch()──▶ VeriLogRegistry (EVM) ◀── key admin (multisig):
-                                         │ receipt → epochId                                registerAgentKey / revokeAgentKey
-                                         ▼
-                      data/evidence/<agentKey>/epoch-<n>.json  (+ GetProof RPC)
-                                         │
- auditor:  verilog-verify --event event.json --proof proof.json --epoch n --agent-id … --rpc … --contract …
-           verilog-verify --run-id R --bundles evidence/<agentKey> --agent-id … --rpc … --contract …
-           → [SUCCESS] Log Integrity Verified   |   [FAILURE] Tampered Log Detected
+   └─ gRPC IngestStream ─▶ verilogd
+                             │ check signature against on-chain agentKeys
+                             │ canonicalize, hash, WAL fsync ─▶ ack
+                             │ append to per-agent Merkle tree, seal epoch
+                             ▼
+                    anchorEpoch() ─▶ VeriLogRegistry (EVM) ◀─ key admin (multisig)
+                             ▼
+              evidence/<agentKey>/epoch-<n>.json  (+ GetProof RPC)
+                             ▼
+ verilog-verify ─▶ [SUCCESS] Log Integrity Verified | [FAILURE] Tampered Log Detected
 ```
 
-## Repository layout
+## What it guarantees
 
-| Path | What |
-|---|---|
-| `proto/verilog/v1/verilog.proto` | gRPC API: `IngestStream` (bidi) and `GetProof` |
-| `contracts/` | Foundry project: `VeriLogRegistry.sol`, tests, `script/Deploy.s.sol` |
-| `daemon/` | Go module `github.com/ronitspatil/verilog/daemon` |
-| `daemon/cmd/verilogd` | the daemon |
-| `daemon/cmd/verilog-verify` | forensic verifier and proof exporter |
-| `daemon/internal/canonical` | canonical event JSON, content digest, agent key (shared by daemon and verifier) |
-| `daemon/internal/merkle` | thread-safe Merkle tree, proofs, benchmarks |
-| `daemon/internal/engine` | committer, per-agent shards, sealing, WAL replay, evidence finalization |
-| `daemon/internal/wal` | JSONL write-ahead log with group-commit fsync and compaction |
-| `daemon/internal/anchor` | sequential retrying anchor worker, EIP-1559 go-ethereum client |
-| `daemon/internal/ingest` | gRPC service (rejects events with a bad or unregistered signature) |
-| `daemon/internal/keys` | on-chain agent key lookup, cache and validity rule |
-| `daemon/internal/store` | checkpoint and evidence bundles |
-| `daemon/internal/verify` | single-event and run verification used by `verilog-verify` |
-| `daemon/internal/registry`, `daemon/gen` | generated contract bindings (abigen) and protobuf code (committed) |
-| `sdk/python/` | `verilog-sdk` package: signing client, LangChain callback handlers, `keygen` |
-| `testdata/` | golden cross-implementation vectors (generated by Go, consumed by Foundry and pytest) |
-| `scripts/e2e.sh` | full local run against anvil, including attacks by a compromised daemon host |
+- **Signed at the source.** Events are signed in the agent process; the
+  daemon cannot forge or alter them.
+- **Complete runs.** Run-mode verification proves a run is complete from step
+  1 to `run_end`, in order, with nothing inserted, removed or replayed.
+- **Tamper-evident once anchored.** Changing any byte of an anchored event or
+  its proof fails verification, locally and through the contract.
+- **Durable acks.** An event is acknowledged only after its WAL record is
+  fsynced.
 
-## Hash scheme
+It does **not** detect suppression of a whole run, cannot tell a truncated
+run from a crashed agent, and cannot protect against a stolen agent key or
+agents that share a host with the daemon. See [docs/security.md](docs/security.md)
+for the threat model and the full list of limits.
 
-One scheme is used by the SDK, the daemon, the contract and the verifier, so a
-proof produced off-chain verifies on-chain with OpenZeppelin's `MerkleProof`.
-Canonical event v2 has nine fields:
+## Quickstart
 
-```
-event         = {agent_id, event_type, key_id, payload, prev_hash, run_id, sig, step_number, timestamp_utc}
-signed bytes  = "VeriLog/event/v1\n" || canonical(event without "sig")
-sig           = Ed25519(agent key, signed bytes)                    # 64 bytes, deterministic
-key_id        = keccak256(ed25519 public key)
-canonical     = JCS-style JSON of the event including "sig"
-contentDigest = sha256(canonical)
-prev_hash     = contentDigest of the previous event of the run       # 32 zero bytes for step 1
-leaf          = keccak256(contentDigest)                             # 32-byte preimage
-node          = keccak256(min(a, b) || max(a, b))                    # 64-byte preimage, sorted pair
-agentId       = keccak256(utf8(agent_id))                            # bytes32 key on chain
-```
-
-- **The whole signed event is hashed**, signature included. Changing the
-  agent, run, step, previous hash, event type, timestamp, key id or signature
-  breaks the proof, and the anchor proves "this signed record existed by block
-  time T", so old epochs stay valid after a later key revocation.
-- **Signatures are made in the agent process.** The domain tag stops the key
-  from signing anything that is also a valid message elsewhere, and
-  `agent_id` and `run_id` inside the signed bytes stop cross-agent and
-  cross-run replay. `key_id`, `prev_hash` and `sig` are `0x` lowercase hex.
-- **Runs are hash chains.** `run_id` is the LangChain root run id. The SDK
-  assigns `step_number` (from 1) and `prev_hash` on its background thread after
-  dequeue, so an overflow drop never leaves a gap: the SDK records a signed
-  `sdk_dropped` event `{"count": n}` instead. A run ends with a signed
-  `run_end` event `{"status": "ok"|"error"|"closed", "steps": n}`.
-- **Canonicalization** follows RFC 8785: members sorted by UTF-16 code units,
-  no insignificant whitespace, UTF-8 output with only mandatory escapes (no HTML
-  escaping), and non-integers in ECMAScript number format. One deliberate
-  deviation: integer literals are kept exactly (never rounded through a double),
-  so ids and counters above 2^53 survive. Duplicate keys and invalid UTF-8 are
-  rejected. `timestamp_utc` is RFC 3339 UTC with exactly nine fractional digits.
-  The daemon rebuilds the signed bytes from the fields it receives, so any
-  drift between the Python and Go canonicalization shows up as a rejected
-  event, never as a silent mismatch.
-- **Leaves and internal nodes are domain separated** by preimage length (32 vs
-  64 bytes). This is OpenZeppelin's recommended defence against
-  second-preimage attacks.
-- **Odd node rule:** when a level has an odd number of nodes, the last one is
-  promoted unchanged, and its proof has no sibling at that level. A one-event
-  epoch has `root == leaf` and an empty proof.
-
-Cross-implementation evidence: `daemon/internal/vectors` writes
-`testdata/merkle_vectors.json`, `testdata/canonical_vectors.json` and
-`testdata/signed_vectors.json` (a complete signed run from the public RFC 8032
-test seed). The Foundry suite verifies every Go proof with the contract and
-checks the vectors' key id against `registerAgentKey`, the Python suite
-reproduces every signed byte, signature and digest byte for byte, and the Go
-canonical tests regenerate them from their inputs. The Go anchor, keys and
-verify tests deploy the real contract on go-ethereum's simulated backend.
-
-## Key management
-
-Each agent has its own Ed25519 key. The private key lives only in the agent
-process; the public key is registered on chain, which is the verifier's only
-trust anchor for keys.
+Prerequisites: Go 1.27, Foundry (`forge`, `anvil`, `cast`), `protoc` 3.x,
+Python 3.12 and `jq`.
 
 ```sh
-# On the agent host: generate the key (32-byte seed, hex, mode 0600; never printed).
-python -m verilog_sdk keygen --out /etc/verilog/support-bot.key --agent-id support-bot
-#   pubkey:   0x…     key_id: 0x…     plus the registerAgentKey command
-
-# The key admin (KEY_ADMIN_ROLE) registers it:
-cast send $REGISTRY 'registerAgentKey(bytes32,bytes32)' $(cast keccak support-bot) 0x<pubkey> --rpc-url $RPC …
-
-# The agent loads it from VERILOG_SIGNING_KEY_FILE (preferred) or VERILOG_SIGNING_KEY (hex).
-export VERILOG_SIGNING_KEY_FILE=/etc/verilog/support-bot.key
-```
-
-- **Rotation:** generate a new key, register it, restart the agent with it,
-  then `revokeAgentKey(agentId, oldKeyId)`. Each event names its own `key_id`,
-  so a run may mix keys.
-- **Validity** uses trusted anchor time, never the signed timestamp: a key
-  is valid for an epoch when `validFrom <= anchor.timestamp` and
-  (`revokedAt == 0` or `anchor.timestamp < revokedAt`). Revoking a key
-  therefore invalidates every epoch anchored from then on, and none before.
-  A revoked key cannot be registered again.
-- **Who holds `KEY_ADMIN_ROLE`.** The constructor gives `DEFAULT_ADMIN_ROLE`
-  and `KEY_ADMIN_ROLE` to the admin. The contract refuses to let any account
-  hold `ANCHORER_ROLE` together with either admin role, and `Deploy.s.sol`
-  refuses an anchorer equal to the admin, so the daemon can never register its
-  own key. Locally and on testnets the admin is a plain dev key, distinct
-  from the anchorer key (`scripts/e2e.sh` uses anvil accounts #0 and #1).
-
-### Production: hand the admin roles to a 2-of-3 Safe
-
-In production both admin roles belong to a 2-of-3 Safe multisig whose three
-signers are hardware wallets, held by different people. Switching is two
-role grants and two renounces; no code changes:
-
-```sh
-SAFE=0x…                                   # the Safe's address
-KEY_ADMIN=$(cast keccak KEY_ADMIN_ROLE)
-DEFAULT_ADMIN=0x0000000000000000000000000000000000000000000000000000000000000000
-
-# 1. As the deployer (dev admin), grant both roles to the Safe.
-cast send $REGISTRY 'grantRole(bytes32,address)' $KEY_ADMIN     $SAFE --private-key $DEPLOYER_KEY --rpc-url $RPC
-cast send $REGISTRY 'grantRole(bytes32,address)' $DEFAULT_ADMIN $SAFE --private-key $DEPLOYER_KEY --rpc-url $RPC
-
-# 2. Check them before giving anything up.
-cast call $REGISTRY 'hasRole(bytes32,address)(bool)' $KEY_ADMIN     $SAFE --rpc-url $RPC   # true
-cast call $REGISTRY 'hasRole(bytes32,address)(bool)' $DEFAULT_ADMIN $SAFE --rpc-url $RPC   # true
-
-# 3. The deployer renounces both roles (KEY_ADMIN first; DEFAULT_ADMIN last).
-DEPLOYER=$(cast wallet address --private-key $DEPLOYER_KEY)
-cast send $REGISTRY 'renounceRole(bytes32,address)' $KEY_ADMIN     $DEPLOYER --private-key $DEPLOYER_KEY --rpc-url $RPC
-cast send $REGISTRY 'renounceRole(bytes32,address)' $DEFAULT_ADMIN $DEPLOYER --private-key $DEPLOYER_KEY --rpc-url $RPC
-
-# 4. Confirm the deployer and the anchorer hold neither role (all false).
-for a in $DEPLOYER $ANCHORER; do for r in $KEY_ADMIN $DEFAULT_ADMIN; do
-  cast call $REGISTRY 'hasRole(bytes32,address)(bool)' $r $a --rpc-url $RPC; done; done
-```
-
-From then on, `registerAgentKey`, `revokeAgentKey` and role changes are Safe
-transactions that two of the three hardware signers approve. Never grant
-either admin role to the daemon's anchorer address (the contract reverts with
-`AnchorerCannotAdminister`), and never keep the Safe signers' keys on the
-daemon host.
-
-## Deployment requirements
-
-The guarantee against a compromised daemon host holds only if the agents'
-signing keys are out of the daemon's reach:
-
-- **Agents must not share a host or credentials with the daemon.** Run them
-  as separate services, or at least in separate containers with separate
-  credentials, so that nothing on the daemon host (files, environment, secret
-  stores, mounted volumes, service accounts) can read an agent signing key.
-- **The daemon must never be able to read agent signing keys**, and must
-  never hold `KEY_ADMIN_ROLE` or `DEFAULT_ADMIN_ROLE` (the contract enforces
-  the latter).
-- **The key admin is not on the daemon host**: a multisig in production (see
-  above).
-
-Shared development setups (agent and daemon on one machine or under one
-account, as in `scripts/e2e.sh`) do **not** get the compromised-host
-guarantee: whoever controls that machine controls the agent key too. They
-still get tamper evidence from the moment of anchoring.
-
-## Setup
-
-These are the commands used to build and validate this repository (macOS,
-Apple Silicon). Toolchain: Go 1.27, Foundry (`forge`, `anvil`, `cast`),
-`protoc` 3.x, Python 3.12 and `jq`.
-
-```sh
-brew install go                                            # Go toolchain
-curl -L https://foundry.paradigm.xyz | bash && foundryup   # Foundry, if not installed
-
-git clone --recurse-submodules git@github.com:ronitspatil/verilog.git
-cd verilog                    # existing clone: git submodule update --init --recursive
-
+git clone --recurse-submodules git@github.com:ronitspatil/verilog.git && cd verilog
 make tools                    # protoc-gen-go, protoc-gen-go-grpc, abigen
 make venv PYTHON=python3.12   # sdk/python/.venv with the SDK installed editable
 make build                    # bin/verilogd, bin/verilog-verify
-make test                     # go vet + go test -race, forge test, pytest
+make test                     # Go, Foundry and pytest suites
 make e2e                      # anvil → deploy → daemon → SDK → anchor → verify
-make bench                    # Merkle and ingestion benchmarks
 ```
 
-Regenerate generated code only after changing the proto, the contract or the
-hash scheme: `make proto`, `make bindings`, `make vectors`.
-
-## Running it
+Deploy and run (see [docs/operations.md](docs/operations.md) for key
+management, the production multisig hand-off and all daemon flags):
 
 ```sh
-# 1. Deploy the registry. The deployer becomes the admin (DEFAULT_ADMIN_ROLE and
-#    KEY_ADMIN_ROLE; or set VERILOG_ADMIN). VERILOG_ANCHORER is the daemon's
-#    address and must differ from the admin. Hand the admin roles to a Safe
-#    in production (see Key management).
-cd contracts
-VERILOG_ANCHORER=0xDaemonAddress forge script script/Deploy.s.sol --rpc-url "$RPC" --private-key "$DEPLOYER_KEY" --broadcast
+# 1. Deploy the registry. VERILOG_ANCHORER is the daemon's address and must differ from the admin.
+cd contracts && VERILOG_ANCHORER=0xDaemonAddress forge script script/Deploy.s.sol \
+    --rpc-url "$RPC" --private-key "$DEPLOYER_KEY" --broadcast && cd ..
 
-# 2. Generate each agent's signing key on the agent host and register it as
-#    the key admin (see Key management).
+# 2. On the agent host: create the agent's signing key; the key admin registers the printed pubkey.
+python -m verilog_sdk keygen --out /etc/verilog/support-bot.key --agent-id support-bot
 
-# 3. Start the daemon. Its signer needs ANCHORER_ROLE (checked at startup).
+# 3. Start the daemon (its signer needs ANCHORER_ROLE).
 export VERILOG_PRIVATE_KEY=0x…            # or --private-key-file key.hex (chmod 600)
-bin/verilogd --rpc "$RPC" --contract 0xRegistry --data-dir /var/lib/verilog \
-             --epoch-interval 30s --epoch-max-logs 1000
+bin/verilogd --rpc "$RPC" --contract 0xRegistry --data-dir /var/lib/verilog
 ```
 
 ```python
-# 4. Instrument the agent (on the agent host, with VERILOG_SIGNING_KEY_FILE set).
+# 4. Instrument the agent (with VERILOG_SIGNING_KEY_FILE=/etc/verilog/support-bot.key).
 from verilog_sdk import VeriLogLangGraphCallback
 
 handler = VeriLogLangGraphCallback(agent_id="support-bot", target="daemon.internal:50051")
@@ -255,218 +85,49 @@ handler.close()
 ```
 
 ```sh
-# 5. Later: export one event and its proof, then verify it against the chain.
+# 5. Verify one event...
 bin/verilog-verify export --bundle /var/lib/verilog/evidence/<agentKey>/epoch-3.json --index 17 --out ./case-42
-#    or straight from the daemon: --daemon 127.0.0.1:50051 --agent-id support-bot --epoch 3 --index 17
 bin/verilog-verify --event case-42/event.json --proof case-42/proof.json \
     --epoch 3 --agent-id support-bot --rpc "$RPC" --contract 0xRegistry
 
-# 6. Or verify a whole run (its run_id is in every event) from a copy of the evidence bundles.
-bin/verilog-verify --run-id 01a0f526-62a8-7390-aefb-ba42851014ac --bundles ./evidence/<agentKey> \
+# ...or a whole run from a copy of the evidence bundles.
+bin/verilog-verify --run-id <run_id> --bundles ./evidence/<agentKey> \
     --agent-id support-bot --rpc "$RPC" --contract 0xRegistry
 ```
 
-**Single-event mode** succeeds when the recomputed root equals the anchored
-root (and the contract's `verifyAnchoredLeaf` agrees), the signing key is
-registered on chain for the agent and valid at the epoch's anchor time, and
-the Ed25519 signature verifies. **Run mode** applies those checks to every
-event of the run found under `--bundles` (searched recursively; bundles are
-untrusted input), then checks the chain: it starts at step 1 with a zero
-`prev_hash`, has no missing steps, each `prev_hash` is the previous event's
-digest, no two different events share a step (a fork means key misuse), no
-event is anchored in an earlier epoch than its predecessor (a later epoch
-means it was withheld), and the last event is `run_end`. A missing `run_end`
-is a FAILURE ("run ended without terminal event after step N");
-`--allow-incomplete` turns it into SUCCESS with a warning on stderr, for
-investigations of crashed agents only.
+`verilog-verify` prints one verdict line and exits `0` (verified), `1`
+(tampered) or `2` (no verdict, e.g. bad arguments or RPC failure).
 
-`verilog-verify` prints exactly one line on stdout and sets its exit code:
+## Deployment requirement
 
-| stdout | exit | meaning |
-|---|---|---|
-| `[SUCCESS] Log Integrity Verified` | 0 | every check above passed |
-| `[FAILURE] Tampered Log Detected` | 1 | root mismatch, unparseable event, another agent's event, unregistered or not-yet/no-longer valid key, bad signature; in run mode also a gap, fork, reorder, events after `run_end`, or a missing `run_end` |
-| *(nothing)* | 2 | no verdict: bad arguments, unreadable files, RPC failure, no contract, epoch not anchored, or no events of the run in the evidence |
+The compromised-host guarantee holds only if agents do not share a host or
+credentials with the daemon, the daemon can never read an agent signing key,
+and the key admin (a multisig in production) is not on the daemon host.
+Shared development setups such as `scripts/e2e.sh` still get tamper evidence
+from the moment of anchoring. Details: [docs/operations.md](docs/operations.md#deployment-requirements).
 
-Details (digests, roots, run id and step, key status, reason, warnings,
-self-reported `sdk_dropped` counts) go to stderr. `--agent-id` accepts the
-string id or the raw `0x…` bytes32 key. `--onchain-check=false` skips the
-contract cross-check.
+## Repository layout
 
-### Daemon configuration
-
-Flags win over environment variables.
-
-| Flag | Env | Default | Purpose |
-|---|---|---|---|
-| `--listen` | `VERILOG_LISTEN` | `127.0.0.1:50051` | gRPC address |
-| `--tls-cert`, `--tls-key` | `VERILOG_TLS_CERT`, `VERILOG_TLS_KEY` | unset (plaintext) | server TLS |
-| `--data-dir` | `VERILOG_DATA_DIR` | `./verilog-data` | WAL, checkpoint, evidence |
-| `--rpc` | `VERILOG_RPC_URL` | required | EVM JSON-RPC |
-| `--contract` | `VERILOG_CONTRACT` | required | registry address |
-| `--private-key-file` | `VERILOG_PRIVATE_KEY_FILE` | | otherwise `VERILOG_PRIVATE_KEY` |
-| `--epoch-interval` | `VERILOG_EPOCH_INTERVAL` | `30s` | seal every open epoch this often |
-| `--epoch-max-logs` | `VERILOG_EPOCH_MAX_LOGS` | `1000` | seal an agent's epoch at this size |
-| `--confirm-timeout` | `VERILOG_CONFIRM_TIMEOUT` | `2m` | receipt wait before retrying |
-| `--retry-initial`, `--retry-max` | | `1s`, `60s` | anchoring backoff bounds |
-| `--wal-segment-bytes` | `VERILOG_WAL_SEGMENT_BYTES` | 64 MiB | WAL rotation size |
-| `--commit-batch` | | `4096` | max events per fsync |
-| `--max-payload-bytes` | `VERILOG_MAX_PAYLOAD_BYTES` | 1 MiB | per-event payload limit |
-| `--stream-window` | | `1024` | unacknowledged events per stream |
-| `--log-level`, `--log-format` | `VERILOG_LOG_LEVEL`, `VERILOG_LOG_FORMAT` | `info`, `text` | logging |
-
-## Design notes
-
-**Never blocking the agent.** Callbacks snapshot their arguments and append to
-a bounded deque. Chaining, canonical JSON, signing (Ed25519, about 16-34 µs per
-event), protobuf encoding and all I/O run on the SDK's background thread. When the queue is full, the default `drop_oldest` policy
-drops (and counts) the oldest event; `block` waits briefly, then drops the new
-one; either way the loss is recorded in the run as a signed `sdk_dropped`
-event. SDK errors are logged on the `verilog_sdk` logger and never raised. The
-stream reconnects with exponential backoff and re-sends unacknowledged events
-byte for byte (signing is deterministic and done once); the daemon
-de-duplicates identical events within an open epoch and acks them with
-`duplicate=true`.
-
-**Signature enforcement at ingest.** The daemon looks up `(agentId, key_id)`
-in the registry (cached: registered keys re-read every minute so revocations
-show up, unknown keys after 5 s) and rejects events that are unsigned, use an
-unregistered or revoked key, or whose signature does not verify. If the
-registry cannot be read the stream fails with `UNAVAILABLE`, so the SDK
-re-sends instead of losing a valid event. This keeps garbage out of the log;
-it is not what an auditor relies on, because the daemon is the party under
-suspicion. The verifier repeats every check against the chain.
-
-**Daemon concurrency.** Each stream has a receive loop (validate,
-canonicalize, hash, submit) and an ordered ack loop, so one stream can have
-`--stream-window` events waiting on durability. A single committer goroutine
-assigns sequence numbers, writes a whole batch to the WAL with one fsync, then
-appends leaves to per-agent shards (mutex-guarded `merkle.Tree`s). Sealing
-swaps a shard's tree for a fresh one under the lock (a pointer exchange) and
-computes the root afterwards, so ingestion never waits on hashing or on the
-chain. Sealed epochs go to a FIFO drained by one anchor goroutine: one signer,
-one nonce source, per-agent epochs in order. Failed attempts retry with
-jittered exponential backoff, and a sealed epoch is never dropped.
-
-**Anchoring.** The chain ID comes from the RPC. Transactions are EIP-1559 via
-`bind.NewKeyedTransactorWithChainID` with a fee cap of `2×baseFee + tip`. They
-are awaited with `bind.WaitMined` under `--confirm-timeout`, and the receipt
-status and `LogAnchored` event are checked; the assigned `epochId` is read
-from the event. If a confirmation times out, the next attempt first looks for
-the earlier transaction's receipt and otherwise replaces it with the same nonce
-and 25% higher fees, so this process never anchors the same epoch twice.
-Before sending, it also checks whether the agent's latest on-chain epoch
-already holds this root (a crash after confirmation but before the checkpoint)
-and, if so, recovers that epoch instead of anchoring again.
-
-**Contract.** `AccessControl` with `ANCHORER_ROLE` and `KEY_ADMIN_ROLE` (the
-admin grants and revokes both; no account may hold the anchorer role together
-with an admin role) and custom errors. `agentKeys[agentId][keyId]` stores
-`{pubkey, validFrom, revokedAt}` in two slots; `registerAgentKey` returns
-`keyId = keccak256(pubkey)`. Zero agent id, zero root and zero `logCount` are
-rejected. `Anchor` packs into two slots, and `anchorEpoch` returns the new
-epoch. `verifyProof` is `pure` (`MerkleProof.verifyCalldata`).
-`verifyAnchoredLeaf` reverts with `EpochNotAnchored` for unknown epochs, so
-callers can tell "not anchored" apart from "not included".
-
-**Performance** (Apple M5, `make bench`): building a 1M-leaf tree takes about
-48 ms (about 21M leaves/s), a proof lookup about 51 ns, and engine ingestion
-with WAL fsync runs at about 190–240k events/s with pipelined submitters
-(group commit). Real numbers depend on the disk's fsync latency.
-
-## Guarantees and limits
-
-Threat model: the attacker controls the daemon host, including the anchorer
-key, the WAL and the evidence bundles. The agent hosts and the key admin are
-trusted. Under the deployment requirements above:
-
-| Attack | Outcome |
+| Path | What |
 |---|---|
-| Forge an event, or alter any field (including agent, step, timestamp) before anchoring | **Closed**: the signature fails |
-| Drop, reorder or insert an event in the middle of a run; replay an event into another run | **Closed**: `prev_hash`/`step_number` break (run mode), and `run_id` is signed |
-| Register its own key to sign forgeries | **Closed**: only `KEY_ADMIN_ROLE` registers keys, and the anchorer can never hold it |
-| Truncate a run's tail | **Detected** as "no terminal event", but it cannot be told apart from an agent crash |
-| Suppress a whole run, or never anchor it | **Not closed**: needs an external witness |
-| Compromised agent host or stolen signing key; payload truthfulness; trusted time | **Not closed**: non-repudiation binds to the key holder, and anchor time is only an upper bound |
+| `proto/` | gRPC API: `IngestStream` (bidi) and `GetProof` |
+| `contracts/` | Foundry project: `VeriLogRegistry.sol`, tests, deploy script |
+| `daemon/cmd/verilogd` | the daemon |
+| `daemon/cmd/verilog-verify` | forensic verifier and proof exporter |
+| `daemon/internal/` | canonical JSON, Merkle tree, WAL, engine, anchoring, ingest, keys, verification |
+| `sdk/python/` | `verilog-sdk`: signing client, LangChain callbacks, `keygen` |
+| `testdata/` | golden cross-implementation vectors (Go, Foundry, pytest) |
+| `scripts/e2e.sh` | full local run against anvil, including compromised-daemon attacks |
 
-What VeriLog guarantees:
+## Documentation
 
-- **Non-repudiation of anchored events.** A verified event was signed by a
-  key registered for that agent and valid when the epoch was anchored, and
-  has not changed since. Only the agent's key holder could have produced it.
-- **Run integrity.** A run that verifies in run mode is complete from step 1
-  to its `run_end`, in order, with no event inserted, removed, replayed from
-  another run or anchored out of order. Events the SDK itself had to drop are
-  reported as signed `sdk_dropped` counts, never as silent gaps.
-- **An ack means durable.** An event is acknowledged only after its WAL record
-  is written and fsynced. On restart the WAL is replayed: sealed but unanchored
-  epochs are rebuilt, their roots re-checked against the sealed record, and
-  re-queued; other unanchored events reopen the agent's current epoch. A torn
-  final WAL record (crash mid-write) is truncated. Corruption anywhere else
-  stops the daemon instead of guessing.
-- **Anchored means tamper-evident.** Once an epoch is anchored, changing any
-  byte of any of its events, or of the proof, makes verification fail both
-  locally and through the contract.
-- **Evidence is self-contained.** Each epoch's bundle stores the exact
-  canonical bytes (with signatures), digest, leaf and proof of every event,
-  plus the root, tx hash, block, chain ID and contract.
+- [docs/design.md](docs/design.md): hash scheme, canonical events, signing and
+  run chaining, Merkle rules, daemon internals, contract, performance, source map.
+- [docs/operations.md](docs/operations.md): build and test, deployment
+  requirements, daemon configuration, key management and rotation, the Safe
+  hand-off, verifier modes and exit codes.
+- [docs/security.md](docs/security.md): threat model, guarantees and limits.
+- [sdk/python/README.md](sdk/python/README.md): Python SDK usage.
 
-What it does not guarantee (state these explicitly in an audit):
-
-- **Whole-run suppression.** A compromised daemon can refuse or never anchor
-  an entire run, and nothing on chain shows that the run existed. Detecting
-  that needs an external witness (for example the agent keeping the `run_end`
-  digests the daemon acks). Not implemented.
-- **Tail truncation vs. crash.** A run whose last events were withheld looks
-  the same as a run whose agent crashed: both fail for a missing `run_end`.
-- **Agent-side compromise.** Anyone holding an agent's signing key can sign
-  as that agent; revoke it as soon as a compromise is suspected. Signatures
-  prove who recorded an event, not that its payload is true.
-- **Time.** `timestamp_utc` is the agent's claim. The anchor's block time is
-  only an upper bound on when an event existed.
-- **Shared hosts.** Agents that share a host or credentials with the daemon
-  do not get the compromised-host guarantees (see Deployment requirements).
-- **Tamper evidence starts at anchoring** for anything the agent did not
-  sign: the evidence bundles' metadata and the WAL could be altered on the
-  daemon host until then.
-- **SDK overload drops events.** Dropped events never reach the daemon; they
-  are counted in `client.stats()` and reported in the run as `sdk_dropped`.
-  Size the queue for your burst rate and alert on drops.
-- **Delivery is at-least-once** across reconnects. Identical events are
-  de-duplicated within an open epoch; a retransmission that arrives after its
-  epoch was sealed is committed again (same digest, new leaf). Run mode
-  counts it once, at its earliest epoch.
-- **No transport authentication.** Any client that can reach the port can
-  submit events, but only events signed with a registered key are accepted.
-  Bind to localhost or a private network and use `--tls-cert/--tls-key`.
-  Mutual TLS is not implemented.
-- **Finality.** An epoch counts as anchored after one successful receipt, with
-  no extra confirmation depth, so a deep reorg could drop an anchor the daemon
-  has already checkpointed. Use a chain with fast finality, or verify after
-  finality.
-- **fsync semantics.** Durability is whatever the OS's `fsync` provides. On
-  macOS that does not flush the drive's write cache (`F_FULLFSYNC` is not
-  used); on Linux it does.
-- **Key handling.** The daemon's anchorer key and the agents' signing keys are
-  read from an environment variable or a file and held in memory. They are
-  never logged. A KMS or HSM signer is not implemented.
-- **One daemon per data directory and signer.** The daemon locks its data
-  directory, but two daemons using the same signer key with different data
-  directories would race on nonces.
-- Event fields are size-limited (agent id 256 bytes, run id 256 bytes, event
-  type 128 bytes, payload `--max-payload-bytes`). WAL segments are deleted
-  once everything in them is anchored. Evidence bundles are kept forever;
-  archive them as needed.
-
-## Development
-
-- Go: `cd daemon && go vet ./... && go test -race ./...`
-- Contracts: `cd contracts && forge test` (includes fuzzing and the Go vectors)
-- Python: `sdk/python/.venv/bin/pytest -q sdk/python`
-- If you change canonicalization or hashing, run `make vectors` and commit the
-  updated `testdata/`. The Go vectors test fails until you do, and Foundry and
-  pytest pick up the new vectors.
-
-`scripts/e2e.sh` uses anvil's publicly known development keys (account #0 as
-the admin, #1 as the anchorer) and the vectors use the public RFC 8032 test
-seed. They are for local testing only.
+`scripts/e2e.sh` and the test vectors use publicly known development keys.
+They are for local testing only.

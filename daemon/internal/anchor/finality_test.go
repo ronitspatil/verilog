@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"math/big"
 	"os"
@@ -446,33 +445,6 @@ func TestReorgKeepsNonceOrderWhilePipelining(t *testing.T) {
 	if st, _ := final(t, c, testReq); st != Pending { // resends the first anchor
 		t.Fatalf("%v", st)
 	}
-	dbg := func(at string) {
-		ctx := context.Background()
-		p, _ := env.client.PendingNonceAt(ctx, env.addr)
-		m, _ := env.client.NonceAt(ctx, env.addr, nil)
-		h, _ := env.client.HeaderByNumber(ctx, nil)
-		var info []string
-		for _, mt := range c.mined {
-			if mt.tx != nil {
-				_, isPending, err := env.client.TransactionByHash(ctx, mt.tx.Hash())
-				info = append(info, fmt.Sprintf("n%d pending=%v err=%v", mt.tx.Nonce(), isPending, err))
-			}
-		}
-		t.Logf("DEBUG %s: pending=%d mined=%d head=%d %v", at, p, m, h.Number, info)
-	}
-	dbg("after final")
-	done := make(chan struct{})
-	defer close(done)
-	go func() {
-		for i := 0; i < 6; i++ {
-			select {
-			case <-done:
-				return
-			case <-time.After(500 * time.Millisecond):
-			}
-			dbg(fmt.Sprintf("t+%dms", 500*(i+1)))
-		}
-	}()
 	c.opts.ConfirmTimeout = 30 * time.Second
 	res2 := anchorMined(t, env, c, req2)
 	env.sim.Commit()

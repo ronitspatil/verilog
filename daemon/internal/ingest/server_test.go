@@ -14,6 +14,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
@@ -41,18 +42,29 @@ type env struct {
 	eng    *engine.Engine
 	sink   *jobSink
 	keys   *fakeKeys
+	// dial opens another client connection with the given credentials.
+	dial func(t *testing.T, creds credentials.TransportCredentials) verilogv1.VeriLogClient
+}
+
+// envOptions configures newEnvWith.
+type envOptions struct {
+	server []grpc.ServerOption              // e.g. grpc.Creds for mTLS
+	client credentials.TransportCredentials // creds of env.client (insecure if nil)
+	opts   Options                          // Authz and IdleTimeout are used
 }
 
 // fakeKeys is an in-memory key registry: keyID -> key, for every agent.
 type fakeKeys struct {
-	mu   sync.Mutex
-	keys map[canonical.Digest]keys.Key
-	err  error
+	mu    sync.Mutex
+	keys  map[canonical.Digest]keys.Key
+	err   error
+	calls int
 }
 
 func (f *fakeKeys) AgentKey(_ context.Context, _, keyID canonical.Digest) (keys.Key, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.calls++
 	if f.err != nil {
 		return keys.Key{}, f.err
 	}
@@ -67,7 +79,9 @@ func (f *fakeKeys) set(priv ed25519.PrivateKey, k keys.Key) {
 	f.keys[canonical.KeyID(pub)] = k
 }
 
-func newEnv(t *testing.T) *env {
+func newEnv(t *testing.T) *env { return newEnvWith(t, envOptions{}) }
+
+func newEnvWith(t *testing.T, o envOptions) *env {
 	t.Helper()
 	dir := t.TempDir()
 	w, recs, err := wal.Open(dir+"/wal", 1<<20, nil)
@@ -85,25 +99,33 @@ func newEnv(t *testing.T) *env {
 	eng.Start(ctx)
 
 	lis := bufconn.Listen(1 << 20)
-	srv := grpc.NewServer()
+	srv := grpc.NewServer(o.server...)
 	reg := &fakeKeys{keys: map[canonical.Digest]keys.Key{}}
 	reg.set(testKey, keys.Key{ValidFrom: 1})
-	verilogv1.RegisterVeriLogServer(srv, NewServer(eng, st, Options{MaxPayloadBytes: 4096, Window: 64, Keys: reg}, nil))
+	verilogv1.RegisterVeriLogServer(srv, NewServer(eng, st, Options{MaxPayloadBytes: 4096, Window: 64, Keys: reg,
+		Authz: o.opts.Authz, IdleTimeout: o.opts.IdleTimeout}, nil))
 	go srv.Serve(lis)
-	conn, err := grpc.NewClient("passthrough:///bufnet",
-		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return lis.Dial() }),
-		grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		t.Fatal(err)
-	}
 	t.Cleanup(func() {
-		conn.Close()
 		srv.Stop()
 		cancel()
 		eng.Close()
 		w.Close()
 	})
-	return &env{client: verilogv1.NewVeriLogClient(conn), eng: eng, sink: sink, keys: reg}
+	dial := func(t *testing.T, creds credentials.TransportCredentials) verilogv1.VeriLogClient {
+		t.Helper()
+		if creds == nil {
+			creds = insecure.NewCredentials()
+		}
+		conn, err := grpc.NewClient("passthrough:///bufnet",
+			grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return lis.Dial() }),
+			grpc.WithTransportCredentials(creds))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { conn.Close() })
+		return verilogv1.NewVeriLogClient(conn)
+	}
+	return &env{client: dial(t, o.client), eng: eng, sink: sink, keys: reg, dial: dial}
 }
 
 var testKey = ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))

@@ -278,21 +278,6 @@ func reorgOut(t *testing.T, env *simEnv, n uint64) common.Hash {
 	}
 	time.Sleep(200 * time.Millisecond) // let the pool re-inject, then drop them
 	env.sim.Rollback()
-	// The pool handles the new head asynchronously and, on a slow machine,
-	// after the rollback: it then still has the old head's nonce, or re-injects
-	// the dropped transaction. Drop again until it matches the chain.
-	ctx := context.Background()
-	for deadline := time.Now().Add(10 * time.Second); ; {
-		pending, _ := env.client.PendingNonceAt(ctx, env.addr)
-		if mined, _ := env.client.NonceAt(ctx, env.addr, nil); pending == mined {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the pool did not settle after the reorg")
-		}
-		time.Sleep(50 * time.Millisecond)
-		env.sim.Rollback()
-	}
 	return blk.Hash()
 }
 
@@ -456,6 +441,15 @@ func TestReorgKeepsNonceOrderWhilePipelining(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 		final(t, c, testReq)
+	}
+	// Mine both before asking for the second anchor again: otherwise its fee
+	// bump can race a block that already holds the first version, and the
+	// wait would be for the replacement that never lands.
+	for i := 0; nonceOf(t, env) < 3; i++ {
+		if i == 20 {
+			t.Fatalf("nonce %d after %d blocks, want 3", nonceOf(t, env), i)
+		}
+		env.sim.Commit()
 	}
 	c.opts.ConfirmTimeout = 30 * time.Second
 	res2 := anchorMined(t, env, c, req2)

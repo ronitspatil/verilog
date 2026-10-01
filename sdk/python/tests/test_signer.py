@@ -77,3 +77,31 @@ def test_keygen_prints_proof_of_possession(tmp_path, capsys):
     signer = Signer.from_file(str(tmp_path / "k"))
     assert f"pop:      0x{signer.proof_of_possession('bot-1').hex()}" in out
     assert "verilog-verify keycheck --agent-id bot-1" in out
+
+
+def test_group_or_world_readable_key_file_is_refused(tmp_path, caplog):
+    path = tmp_path / "k"
+    path.write_text(Signer.generate().seed_hex())
+    for mode in (0o644, 0o640, 0o604):
+        os.chmod(path, mode)
+        with pytest.raises(PermissionError, match="chmod 600") as exc:
+            Signer.from_file(str(path))
+        assert "VERILOG_INSECURE_KEY_FILE_PERMS" in str(exc.value)
+        with pytest.raises(PermissionError):
+            Signer.from_env({"VERILOG_SIGNING_KEY_FILE": str(path)}.get)
+    # The explicit development escape hatch accepts it, with a warning.
+    os.chmod(path, 0o644)
+    with caplog.at_level("WARNING", logger="verilog_sdk"):
+        a = Signer.from_file(str(path), insecure_key_file_perms=True)
+        b = Signer.from_env({"VERILOG_SIGNING_KEY_FILE": str(path), "VERILOG_INSECURE_KEY_FILE_PERMS": "1"}.get)
+    assert a.key_id == b.key_id
+    assert "readable by group or others" in caplog.text
+    os.chmod(path, 0o400)
+    Signer.from_file(str(path))
+
+
+def test_hex_key_from_env_warns(caplog):
+    with caplog.at_level("WARNING", logger="verilog_sdk"):
+        Signer.from_env({"VERILOG_SIGNING_KEY": TEST_SEED_HEX}.get)
+    assert "VERILOG_SIGNING_KEY_FILE" in caplog.text
+    assert TEST_SEED_HEX[2:] not in caplog.text

@@ -31,8 +31,10 @@ export VERILOG_SIGNING_KEY_FILE=/etc/verilog/support-bot.key
 ```
 
 The SDK loads the seed from `VERILOG_SIGNING_KEY_FILE` (preferred) or the hex
-value in `VERILOG_SIGNING_KEY`, or you pass `signer=Signer.from_file(...)`. The
-seed is never logged. Keep it on the agent host only: never on the daemon host
+value in `VERILOG_SIGNING_KEY` (logs a warning), or you pass
+`signer=Signer.from_file(...)`. A key file readable by group or others is
+refused (`PermissionError`) unless `VERILOG_INSECURE_KEY_FILE_PERMS=1` or
+`insecure_key_file_perms=True` (development only). The seed is never logged. Keep it on the agent host only: never on the daemon host
 and never in credentials the daemon can read. Rotation: generate a new key,
 have it registered, restart the agent with it, then have the old key revoked
 once its last events are anchored (see "Rotation" in the main README).

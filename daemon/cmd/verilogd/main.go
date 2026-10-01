@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -26,6 +27,8 @@ import (
 	"github.com/ronitspatil/verilog/daemon/internal/engine"
 	"github.com/ronitspatil/verilog/daemon/internal/ingest"
 	"github.com/ronitspatil/verilog/daemon/internal/keys"
+	"github.com/ronitspatil/verilog/daemon/internal/redact"
+	"github.com/ronitspatil/verilog/daemon/internal/signer"
 	"github.com/ronitspatil/verilog/daemon/internal/store"
 	"github.com/ronitspatil/verilog/daemon/internal/wal"
 )
@@ -37,18 +40,32 @@ func main() {
 	}
 }
 
-func run() error {
+func run() (err error) {
 	cfg, err := config.Load(os.Args[1:], os.Getenv, os.Stderr)
 	if err != nil {
 		return err
 	}
-	logger := newLogger(cfg)
+	// RPC URLs often embed credentials or API keys: keep them out of every
+	// log line and of the error returned to main.
+	red := redact.New(cfg.RPCURL)
+	defer func() { err = red.Error(err) }()
+	logger := newLogger(cfg, red)
 	slog.SetDefault(logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	key, err := cfg.LoadKey(os.Getenv, logger)
+	// The data dir lock comes first: it also guards the pending-transaction
+	// record the anchorer reads at startup.
+	lock, err := lockDataDir(cfg.DataDir)
+	if err != nil {
+		return err
+	}
+	if lock != nil {
+		defer lock.Close()
+	}
+
+	sgn, err := newSigner(ctx, cfg, logger)
 	if err != nil {
 		return err
 	}
@@ -61,14 +78,20 @@ func run() error {
 		return fmt.Errorf("dialing RPC: %w", err)
 	}
 	defer eth.Close()
-	chain, err := anchor.NewEthChain(dialCtx, eth, cfg.Contract, key, cfg.ConfirmTimeout, logger)
+	chain, err := anchor.NewEthChain(dialCtx, eth, cfg.Contract, sgn, anchor.Options{
+		ConfirmTimeout: cfg.ConfirmTimeout,
+		MaxFeeCap:      cfg.MaxFeeCap,
+		MaxTipCap:      cfg.MaxTipCap,
+		PendingFile:    filepath.Join(cfg.DataDir, anchor.PendingFileName),
+	}, logger)
 	if err != nil {
 		return err
 	}
 	if err := chain.CheckRole(dialCtx); err != nil {
 		return err
 	}
-	logger.Info("chain ready", "chain_id", chain.ChainID(), "contract", cfg.Contract, "signer", chain.From())
+	logger.Info("chain ready", "rpc", redact.URL(cfg.RPCURL), "chain_id", chain.ChainID(), "contract", cfg.Contract,
+		"signer", cfg.Signer, "address", chain.From())
 	keySource, err := keys.NewChainSource(cfg.Contract, eth)
 	if err != nil {
 		return err
@@ -86,13 +109,6 @@ func run() error {
 	}}
 
 	// Storage and engine.
-	lock, err := lockDataDir(cfg.DataDir)
-	if err != nil {
-		return err
-	}
-	if lock != nil {
-		defer lock.Close()
-	}
 	st, err := store.Open(cfg.DataDir)
 	if err != nil {
 		return err
@@ -205,10 +221,40 @@ loop:
 	return nil
 }
 
-func newLogger(cfg *config.Config) *slog.Logger {
-	opts := &slog.HandlerOptions{Level: cfg.LogLevel}
-	if cfg.LogFormat == "json" {
-		return slog.New(slog.NewJSONHandler(os.Stderr, opts))
+// newSigner returns the anchoring key's signer: a local key, or a key held
+// in AWS KMS (its private key never reaches this host).
+func newSigner(ctx context.Context, cfg *config.Config, logger *slog.Logger) (signer.Signer, error) {
+	switch cfg.Signer {
+	case config.SignerAWSKMS:
+		if os.Getenv(config.EnvPrivateKey) != "" {
+			logger.Warn(config.EnvPrivateKey + " is set but ignored with --signer aws-kms; unset it")
+		}
+		kctx, cancel := context.WithTimeout(ctx, time.Minute)
+		defer cancel()
+		client, err := signer.NewAWSKMSClient(kctx, cfg.KMSKeyID)
+		if err != nil {
+			return nil, err
+		}
+		s, err := signer.NewKMS(kctx, client, cfg.KMSKeyID, signer.KMSOptions{})
+		if err != nil {
+			return nil, err
+		}
+		logger.Info("aws-kms signer ready", "address", s.Address())
+		return s, nil
+	default:
+		key, err := cfg.LoadKey(os.Getenv, logger)
+		if err != nil {
+			return nil, err
+		}
+		return signer.NewLocal(key), nil
 	}
-	return slog.New(slog.NewTextHandler(os.Stderr, opts))
+}
+
+func newLogger(cfg *config.Config, red *redact.Redactor) *slog.Logger {
+	opts := &slog.HandlerOptions{Level: cfg.LogLevel}
+	var h slog.Handler = slog.NewTextHandler(os.Stderr, opts)
+	if cfg.LogFormat == "json" {
+		h = slog.NewJSONHandler(os.Stderr, opts)
+	}
+	return slog.New(red.Handler(h))
 }

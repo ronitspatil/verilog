@@ -356,6 +356,42 @@ BUNDLE2="$EVIDENCE/epoch-$LATEST.json"
 expect_verify 0 "$SUCCESS" --event "$WORK/ev2/event.json" --proof "$WORK/ev2/proof.json" --epoch "$LATEST" --agent-id "$AGENT_KEY" --rpc "$RPC" --contract "$CONTRACT"
 log "an epoch-1 proof does not verify against epoch $LATEST (expect FAILURE)"
 expect_verify 1 "$FAILURE" --event "$WORK/ev/event.json" --proof "$WORK/ev/proof.json" --epoch "$LATEST" --agent-id "$AGENT_ID" --rpc "$RPC" --contract "$CONTRACT"
+
+# ---------------------------------------------- kill between send and receipt
+log "kill -9 between send and receipt: the restarted daemon reuses the nonce and anchors the root once"
+cast rpc evm_setAutomine false --rpc-url "$RPC" >/dev/null
+EPOCHS_BEFORE="$(latest_epoch)"
+NONCE_BEFORE="$(cast nonce "$ANCHORER" --rpc-url "$RPC")"
+SENT="$(grep -c "anchor: transaction sent" "$WORK/daemon.log" || true)"
+BEFORE="$(anchored_count)"
+KILLED_ACKED="$("$PYTHON" "$ROOT/scripts/e2e_agent.py" --target "$TARGET" --agent-id "$AGENT_ID" --runs 1 2>"$WORK/agent3.log")" \
+  || { tail -n 20 "$WORK/agent3.log"; fail "agent run before the kill failed"; }
+for _ in $(seq 1 100); do [ "$(grep -c "anchor: transaction sent" "$WORK/daemon.log" || true)" -gt "$SENT" ] && break; sleep 0.1; done
+[ "$(grep -c "anchor: transaction sent" "$WORK/daemon.log" || true)" -gt "$SENT" ] || fail "no anchor transaction was sent"
+[ -f "$DATA/anchor-pending.json" ] || fail "the pending transaction was not persisted before broadcast"
+kill -KILL "$DAEMON_PID"; wait "$DAEMON_PID" 2>/dev/null || true; DAEMON_PID=""
+echo "killed with transaction $(jq -r .tx_hash "$DATA/anchor-pending.json") (nonce $(jq -r .nonce "$DATA/anchor-pending.json")) unmined"
+SENT="$(grep -c "anchor: transaction sent" "$WORK/daemon.log" || true)"
+start_daemon
+grep -q "anchor: resuming pending transaction" "$WORK/daemon.log" || fail "the restarted daemon did not resume the pending transaction"
+for _ in $(seq 1 100); do [ "$(grep -c "anchor: transaction sent" "$WORK/daemon.log" || true)" -gt "$SENT" ] && break; sleep 0.1; done
+tail -n +"$(( $(grep -n "anchor: resuming pending transaction" "$WORK/daemon.log" | tail -n 1 | cut -d: -f1) ))" "$WORK/daemon.log" \
+  | grep -q "anchor: transaction sent.* nonce=$(jq -r .nonce "$DATA/anchor-pending.json") replaces=1" \
+  || fail "the restarted daemon did not replace the pending transaction with the same nonce"
+cast rpc evm_setAutomine true --rpc-url "$RPC" >/dev/null
+cast rpc evm_mine --rpc-url "$RPC" >/dev/null
+wait_anchored $(( BEFORE + KILLED_ACKED ))
+sleep 1; cast rpc evm_mine --rpc-url "$RPC" >/dev/null
+EPOCHS_AFTER="$(latest_epoch)"
+NONCE_AFTER="$(cast nonce "$ANCHORER" --rpc-url "$RPC")"
+for e in $(seq $(( EPOCHS_BEFORE + 1 )) "$EPOCHS_AFTER"); do
+  [ -f "$EVIDENCE/epoch-$e.json" ] || fail "epoch $e is on chain without a daemon bundle: a root was anchored twice"
+done
+[ $(( NONCE_AFTER - NONCE_BEFORE )) = $(( EPOCHS_AFTER - EPOCHS_BEFORE )) ] \
+  || fail "the anchorer sent $(( NONCE_AFTER - NONCE_BEFORE )) transactions for $(( EPOCHS_AFTER - EPOCHS_BEFORE )) epochs"
+[ ! -f "$DATA/anchor-pending.json" ] || fail "pending record left behind after confirmation"
+echo "epochs $(( EPOCHS_BEFORE + 1 ))..$EPOCHS_AFTER anchored once each, $(( NONCE_AFTER - NONCE_BEFORE )) anchorer transactions"
+grep -q "VERILOG_PRIVATE_KEY environment variable" "$WORK/daemon.log" || fail "no warning for the anchoring key from the environment"
 stop_daemon
 
 # ---------------------------------------------------------------------------
@@ -476,4 +512,4 @@ expect_stderr "does not match the on-chain anchors"
 log "an untouched run still verifies against the complete evidence, attacks included (expect SUCCESS)"
 expect_verify 0 "$SUCCESS" --run-id "$BIG_RUN" --bundles "$WORK/all" --agent-id "$AGENT_ID" --rpc "$RPC" --contract "$CONTRACT"
 
-printf '\nE2E PASSED: %s + %s + %s signed events anchored by the daemon; weak key refused at registration; single-event and run mode SUCCESS, FAILURE (tamper, re-spelled file, withheld, decoy, missing epoch, forged, revoked key, reordered, curated re-anchor), SUCCESS-INCOMPLETE, oversized payload, replay after revocation, key rotation and operational exits verified.\n' "$ACKED" "$ACKED2" "$OLD_ACKED"
+printf '\nE2E PASSED: %s + %s + %s signed events anchored by the daemon; weak key refused at registration; single-event and run mode SUCCESS, FAILURE (tamper, re-spelled file, withheld, decoy, missing epoch, forged, revoked key, reordered, curated re-anchor), SUCCESS-INCOMPLETE, oversized payload, replay after revocation, key rotation, kill -9 between send and receipt and operational exits verified.\n' "$ACKED" "$ACKED2" "$OLD_ACKED"

@@ -1,0 +1,109 @@
+{
+  "cases": [
+    {
+      "name": "simple",
+      "agent_id": "agent-alpha",
+      "step_number": 1,
+      "event_type": "llm_start",
+      "payload_json": "{\"prompts\":[\"What is 2+2?\"],\"model\":\"gpt\"}",
+      "timestamp_utc": "2026-09-30T12:00:00.123456789Z",
+      "canonical_payload": "{\"model\":\"gpt\",\"prompts\":[\"What is 2+2?\"]}",
+      "canonical_event": "{\"agent_id\":\"agent-alpha\",\"event_type\":\"llm_start\",\"payload\":{\"model\":\"gpt\",\"prompts\":[\"What is 2+2?\"]},\"step_number\":1,\"timestamp_utc\":\"2026-09-30T12:00:00.123456789Z\"}",
+      "content_digest": "0x48a63c536f9b1fc5daf26443b46d0d66dffb968dab63328233f99808b895516d",
+      "leaf": "0x9a2f4ba68a557b1fc83f7eea1c195474ea5ea2e14f9a1f6698653a7fe2b28dba",
+      "agent_key": "0x765069f0d82dd70961ef67543724ecc2bc8bbdc4d1183662c723dc57f80e3720"
+    },
+    {
+      "name": "nested_unsorted_whitespace",
+      "agent_id": "agent-alpha",
+      "step_number": 2,
+      "event_type": "tool_start",
+      "payload_json": "{ \"tool\" : \"search\" ,\n \"input\" : { \"q\" : \"weather\", \"k\" : 3 } }",
+      "timestamp_utc": "2026-09-30T12:00:00.124456789Z",
+      "canonical_payload": "{\"input\":{\"k\":3,\"q\":\"weather\"},\"tool\":\"search\"}",
+      "canonical_event": "{\"agent_id\":\"agent-alpha\",\"event_type\":\"tool_start\",\"payload\":{\"input\":{\"k\":3,\"q\":\"weather\"},\"tool\":\"search\"},\"step_number\":2,\"timestamp_utc\":\"2026-09-30T12:00:00.124456789Z\"}",
+      "content_digest": "0xa29d13a597e3389e3c7172e216d242046fe83fe29028b2d94a21cedc35be9270",
+      "leaf": "0x0aedfd79219258a0d414b4c1281f77eb70c97aa507fe4f420fa88fe4b33974e3",
+      "agent_key": "0x765069f0d82dd70961ef67543724ecc2bc8bbdc4d1183662c723dc57f80e3720"
+    },
+    {
+      "name": "unicode_and_escapes",
+      "agent_id": "agent-β",
+      "step_number": 3,
+      "event_type": "llm_end",
+      "payload_json": "{\"text\":\"café € 😀 <b>&</b>\\n\\t\\\"q\\\"\",\"ctl\":\"\\u0001\"}",
+      "timestamp_utc": "2026-09-30T12:00:00.125456789Z",
+      "canonical_payload": "{\"ctl\":\"\\u0001\",\"text\":\"café € 😀 <b>&</b>\\n\\t\\\"q\\\"\"}",
+      "canonical_event": "{\"agent_id\":\"agent-β\",\"event_type\":\"llm_end\",\"payload\":{\"ctl\":\"\\u0001\",\"text\":\"café € 😀 <b>&</b>\\n\\t\\\"q\\\"\"},\"step_number\":3,\"timestamp_utc\":\"2026-09-30T12:00:00.125456789Z\"}",
+      "content_digest": "0x7446a219508cf513f87bc4129863fe8e95bb1f51655562b8ab3feaeafb71a170",
+      "leaf": "0xc2af4cce46534a6babd8e1d65bdd01889b7b8e17953bc35f8bf3ed8a3ac02add",
+      "agent_key": "0xcebe4d1ccbb4102aaddea42ccdba642cb248b5cc53fde225b6ad2e1738248e76"
+    },
+    {
+      "name": "numbers",
+      "agent_id": "agent-alpha",
+      "step_number": 4,
+      "event_type": "chain_end",
+      "payload_json": "{\"big\":123456789012345678901234567890,\"neg0\":-0,\"float\":1.50,\"exp\":1e21,\"small\":1e-7,\"int_as_float\":2.0}",
+      "timestamp_utc": "2026-09-30T12:00:00.126456789Z",
+      "canonical_payload": "{\"big\":123456789012345678901234567890,\"exp\":1e+21,\"float\":1.5,\"int_as_float\":2,\"neg0\":0,\"small\":1e-7}",
+      "canonical_event": "{\"agent_id\":\"agent-alpha\",\"event_type\":\"chain_end\",\"payload\":{\"big\":123456789012345678901234567890,\"exp\":1e+21,\"float\":1.5,\"int_as_float\":2,\"neg0\":0,\"small\":1e-7},\"step_number\":4,\"timestamp_utc\":\"2026-09-30T12:00:00.126456789Z\"}",
+      "content_digest": "0x2fd4b2a9e543d53430d5d5a9823b3c82319df4ae25d2f7ddb93980acc0f69ba0",
+      "leaf": "0x56c9e3c20170c686b84ab40ea0f00f630527156a1b7cc593bc275012f3179c3e",
+      "agent_key": "0x765069f0d82dd70961ef67543724ecc2bc8bbdc4d1183662c723dc57f80e3720"
+    },
+    {
+      "name": "empty_object_payload",
+      "agent_id": "agent-alpha",
+      "step_number": 5,
+      "event_type": "chain_start",
+      "payload_json": "{}",
+      "timestamp_utc": "2026-09-30T12:00:00.127456789Z",
+      "canonical_payload": "{}",
+      "canonical_event": "{\"agent_id\":\"agent-alpha\",\"event_type\":\"chain_start\",\"payload\":{},\"step_number\":5,\"timestamp_utc\":\"2026-09-30T12:00:00.127456789Z\"}",
+      "content_digest": "0x1e7d25c3e89aba5ced58b305aba816c6002d066de0f25eeea411726736c56ce6",
+      "leaf": "0x390c79f029429d04855bb6dbdcdcd765b993b75a3f6343e9272b610c092aa27d",
+      "agent_key": "0x765069f0d82dd70961ef67543724ecc2bc8bbdc4d1183662c723dc57f80e3720"
+    },
+    {
+      "name": "array_payload",
+      "agent_id": "agent-alpha",
+      "step_number": 6,
+      "event_type": "custom",
+      "payload_json": "[3,1,{\"b\":null,\"a\":true},\"x\"]",
+      "timestamp_utc": "2026-09-30T12:00:00.128456789Z",
+      "canonical_payload": "[3,1,{\"a\":true,\"b\":null},\"x\"]",
+      "canonical_event": "{\"agent_id\":\"agent-alpha\",\"event_type\":\"custom\",\"payload\":[3,1,{\"a\":true,\"b\":null},\"x\"],\"step_number\":6,\"timestamp_utc\":\"2026-09-30T12:00:00.128456789Z\"}",
+      "content_digest": "0x11e487219b310858cca0e4b0ea3c9919441e33347b243cbf7fea324a33e40781",
+      "leaf": "0x8d37151d85b8b8123a902d4e0274df3bdec9a9099448470cf9274e91ee073369",
+      "agent_key": "0x765069f0d82dd70961ef67543724ecc2bc8bbdc4d1183662c723dc57f80e3720"
+    },
+    {
+      "name": "string_payload",
+      "agent_id": "agent-alpha",
+      "step_number": 7,
+      "event_type": "custom",
+      "payload_json": "\"just a string\"",
+      "timestamp_utc": "2026-09-30T12:00:00.129456789Z",
+      "canonical_payload": "\"just a string\"",
+      "canonical_event": "{\"agent_id\":\"agent-alpha\",\"event_type\":\"custom\",\"payload\":\"just a string\",\"step_number\":7,\"timestamp_utc\":\"2026-09-30T12:00:00.129456789Z\"}",
+      "content_digest": "0x6042e8b9662c346a6fdd856d534588e6f5d5dc71b4fbd58b04ede14e747a47e2",
+      "leaf": "0xbf70ea616d881144a43a9c8fa71e521bb4f3e2311ec2993a2e73601cb25a508f",
+      "agent_key": "0x765069f0d82dd70961ef67543724ecc2bc8bbdc4d1183662c723dc57f80e3720"
+    },
+    {
+      "name": "utf16_key_order",
+      "agent_id": "agent-alpha",
+      "step_number": 8,
+      "event_type": "custom",
+      "payload_json": "{\"€\":1,\"\\r\":2,\"דּ\":3,\"1\":4,\"😀\":5,\"\\u0080\":6,\"ö\":7}",
+      "timestamp_utc": "2026-09-30T12:00:00.130456789Z",
+      "canonical_payload": "{\"\\r\":2,\"1\":4,\"\":6,\"ö\":7,\"€\":1,\"😀\":5,\"דּ\":3}",
+      "canonical_event": "{\"agent_id\":\"agent-alpha\",\"event_type\":\"custom\",\"payload\":{\"\\r\":2,\"1\":4,\"\":6,\"ö\":7,\"€\":1,\"😀\":5,\"דּ\":3},\"step_number\":8,\"timestamp_utc\":\"2026-09-30T12:00:00.130456789Z\"}",
+      "content_digest": "0x6d8862181f968614d5a69a605988451e14628d1d2086bfd5cd0def69b30946c7",
+      "leaf": "0xf9d2afb476a4335637092d25447eb8e0073e3966027db72467e4ded8aac00891",
+      "agent_key": "0x765069f0d82dd70961ef67543724ecc2bc8bbdc4d1183662c723dc57f80e3720"
+    }
+  ],
+  "comment": "Generated by daemon/internal/vectors. Timestamps use layout 2006-01-02T15:04:05.000000000Z."
+}

@@ -76,7 +76,7 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
-          cache-dependency-path: sdk/python/requirements-dev.lock
+          cache-dependency-path: sdk/python/requirements-dev.txt
       - name: venv from the hashed lock
         run: make venv PYTHON=python
       - run: sdk/python/.venv/bin/pytest -q sdk/python
@@ -84,7 +84,7 @@ jobs:
         run: |
           python -m venv /tmp/audit
           /tmp/audit/bin/pip install -q "pip-audit==$PIP_AUDIT_VERSION"
-          /tmp/audit/bin/pip-audit --require-hashes --disable-pip -r sdk/python/requirements-dev.lock
+          /tmp/audit/bin/pip-audit --require-hashes --disable-pip -r sdk/python/requirements-dev.txt
 
   reproducible:
     name: generated code is reproducible
@@ -103,7 +103,7 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
-          cache-dependency-path: sdk/python/requirements-dev.lock
+          cache-dependency-path: sdk/python/requirements-dev.txt
       - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
         with:
           version: ${{ env.FOUNDRY_VERSION }}
@@ -137,7 +137,7 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
-          cache-dependency-path: sdk/python/requirements-dev.lock
+          cache-dependency-path: sdk/python/requirements-dev.txt
       - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
         with:
           version: ${{ env.FOUNDRY_VERSION }}

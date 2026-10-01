@@ -30,7 +30,7 @@ tools: ## Install pinned protoc plugins and abigen
 	go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@$(PROTOC_GEN_GO_GRPC_VERSION)
 	go install github.com/ethereum/go-ethereum/cmd/abigen@$(ABIGEN_VERSION)
 
-LOCK := sdk/python/requirements-dev.lock
+LOCK := sdk/python/requirements-dev.txt
 
 venv: ## Create the Python venv from the hashed lock, SDK installed in editable mode
 	$(PYTHON) -m venv $(VENV)
@@ -39,7 +39,7 @@ venv: ## Create the Python venv from the hashed lock, SDK installed in editable 
 
 lock: ## Re-resolve the Python lock (needs uv: pip install uv)
 	cd sdk/python && uv pip compile pyproject.toml --extra dev --universal --python-version 3.10 \
-		--generate-hashes --custom-compile-command 'make lock' -q -o requirements-dev.lock
+		--generate-hashes --custom-compile-command 'make lock' -q -o requirements-dev.txt
 
 proto: ## Regenerate Go and Python gRPC code from proto/
 	$(PROTOC) -I proto -I $(PROTOC_INCLUDE) \

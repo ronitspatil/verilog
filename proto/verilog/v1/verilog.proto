@@ -1,0 +1,79 @@
+syntax = "proto3";
+
+package verilog.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/ronitspatil/verilog/daemon/gen/verilog/v1;verilogv1";
+
+// VeriLog ingests agent execution events, commits them into per-agent Merkle
+// trees and anchors each sealed tree's root on an EVM chain.
+service VeriLog {
+  // IngestStream is a bidirectional stream: the client sends LogEvents and the
+  // daemon answers every event with exactly one Ack, in the order received.
+  // An Ack with accepted=true means the event is durable in the daemon's
+  // write-ahead log and committed to the agent's open epoch.
+  rpc IngestStream(stream LogEvent) returns (stream Ack);
+
+  // GetProof returns the Merkle inclusion proof of one event in an anchored
+  // epoch. The event is selected by leaf index or by content digest.
+  rpc GetProof(GetProofRequest) returns (GetProofResponse);
+}
+
+// LogEvent is one step of an agent's execution trace.
+//
+// Fields 1-5 are the hashed content. The daemon canonicalizes them (RFC 8785
+// style JSON) and computes content_digest = SHA-256(canonical bytes).
+message LogEvent {
+  string agent_id = 1;
+  uint64 step_number = 2;
+  string event_type = 3;
+  // UTF-8 JSON document. Re-canonicalized by the daemon, so key order and
+  // whitespace do not matter, but the value must be valid JSON.
+  string payload_json = 4;
+  google.protobuf.Timestamp timestamp_utc = 5;
+
+  // Client-assigned stream sequence number, echoed in the Ack. Not hashed.
+  uint64 sequence = 15;
+}
+
+message Ack {
+  // Echo of LogEvent.sequence.
+  uint64 sequence = 1;
+  bool accepted = 2;
+  // Reason the event was rejected; empty when accepted.
+  string error = 3;
+  // SHA-256 of the canonical event bytes (32 bytes).
+  bytes content_digest = 4;
+  // keccak256(content_digest) (32 bytes): the Merkle leaf.
+  bytes leaf = 5;
+  // True when an identical event was already committed to the open epoch;
+  // the event is not committed twice.
+  bool duplicate = 6;
+}
+
+message GetProofRequest {
+  string agent_id = 1;
+  uint64 epoch_id = 2;
+  oneof selector {
+    uint64 leaf_index = 3;
+    bytes content_digest = 4;
+  }
+}
+
+message GetProofResponse {
+  string agent_id = 1;
+  // keccak256(utf8(agent_id)), the on-chain agent key (32 bytes).
+  bytes agent_key = 2;
+  uint64 epoch_id = 3;
+  bytes merkle_root = 4;
+  uint64 leaf_index = 5;
+  bytes leaf = 6;
+  bytes content_digest = 7;
+  // Sibling hashes from the leaf level upward (32 bytes each).
+  repeated bytes proof = 8;
+  // The canonical event JSON that hashes to content_digest.
+  string canonical_event_json = 9;
+  string tx_hash = 10;
+  uint64 block_number = 11;
+}

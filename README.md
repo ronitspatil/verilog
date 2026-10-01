@@ -76,9 +76,9 @@ cd contracts && VERILOG_ANCHORER=0xDaemonAddress forge script script/Deploy.s.so
 #    `verilog-verify keycheck` (proof of possession), then registers the pubkey.
 python -m verilog_sdk keygen --out /etc/verilog/support-bot.key --agent-id support-bot
 
-# 3. Start the daemon (its signer needs ANCHORER_ROLE).
-export VERILOG_PRIVATE_KEY=0x…            # or --private-key-file key.hex (chmod 600)
-bin/verilogd --rpc "$RPC" --contract 0xRegistry --data-dir /var/lib/verilog
+# 3. Start the daemon (its signer needs ANCHORER_ROLE). In production keep that key in AWS KMS:
+#    --signer aws-kms --kms-key-id alias/verilog-anchorer (docs/operations.md#anchoring-key).
+bin/verilogd --rpc "$RPC" --contract 0xRegistry --data-dir /var/lib/verilog --private-key-file key.hex  # chmod 600
 ```
 
 ```python

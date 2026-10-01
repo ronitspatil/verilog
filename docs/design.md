@@ -138,13 +138,17 @@ chain. Sealed epochs go to a FIFO drained by one anchor goroutine: one signer,
 one nonce source, per-agent epochs in order. Failed attempts retry with
 jittered exponential backoff; a sealed epoch is never dropped.
 
-**Anchoring.** The chain ID comes from the RPC. Transactions are EIP-1559 via
-`bind.NewKeyedTransactorWithChainID` with a fee cap of `2×baseFee + tip`,
-awaited with `bind.WaitMined` under `--confirm-timeout`. The receipt status
+**Anchoring.** The chain ID comes from the RPC. Transactions are EIP-1559,
+signed through the `signer.Signer` interface (a local key, or AWS KMS with
+low-s normalization and `v` recovery), with a fee cap of `2×baseFee + tip`
+bounded by `--max-fee-gwei` / `--max-priority-fee-gwei`, and awaited with
+`bind.WaitMined` under `--confirm-timeout`. The receipt status
 and `LogAnchored` event are checked, and the assigned `epochId` is read from
 the event. If a confirmation times out, the next attempt first looks for the
 earlier transaction's receipt and otherwise replaces it with the same nonce
-and 25% higher fees, so this process never anchors the same epoch twice.
+and 25% higher fees (at the fee ceiling it rebroadcasts the old one instead).
+The transaction is written to `anchor-pending.json` in the data dir before
+it is broadcast, so the same holds across restarts and crashes.
 Before sending, it also checks whether the agent's latest on-chain epoch
 already holds this root (a crash after confirmation but before the
 checkpoint) and, if so, recovers that epoch instead of anchoring again.
@@ -187,7 +191,9 @@ numbers depend on the disk's fsync latency.
 | `daemon/internal/merkle` | thread-safe Merkle tree, proofs, benchmarks |
 | `daemon/internal/engine` | committer, per-agent shards, sealing, WAL replay, evidence finalization |
 | `daemon/internal/wal` | JSONL write-ahead log with group-commit fsync and compaction |
-| `daemon/internal/anchor` | sequential retrying anchor worker, EIP-1559 go-ethereum client |
+| `daemon/internal/anchor` | sequential retrying anchor worker, EIP-1559 go-ethereum client, fee ceiling, pending-transaction record |
+| `daemon/internal/signer` | anchoring key signers: local key and AWS KMS (`kmsfake`: in-memory KMS for tests) |
+| `daemon/internal/redact` | strips RPC URL credentials from logs and errors |
 | `daemon/internal/ingest` | gRPC service (rejects events with a bad or unregistered signature) |
 | `daemon/internal/keys` | on-chain agent key lookup, cache and validity rule |
 | `daemon/internal/store` | checkpoint and evidence bundles |

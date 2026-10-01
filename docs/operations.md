@@ -70,9 +70,12 @@ VERILOG_ANCHORER=0xDaemonAddress forge script script/Deploy.s.sol --rpc-url "$RP
 #    as the key admin (see Key management below).
 
 # 3. Start the daemon. Its signer needs ANCHORER_ROLE (checked at startup).
-export VERILOG_PRIVATE_KEY=0x…            # or --private-key-file key.hex (chmod 600)
+#    Production: the anchoring key lives in AWS KMS (see Anchoring key below).
 bin/verilogd --rpc "$RPC" --contract 0xRegistry --data-dir /var/lib/verilog \
+             --signer aws-kms --kms-key-id alias/verilog-anchorer \
              --epoch-interval 30s --epoch-max-logs 1000
+#    Development: a local key file (mode 0600) instead.
+bin/verilogd --rpc "$RPC" --contract 0xRegistry --private-key-file anchorer.hex
 ```
 
 ```python
@@ -95,7 +98,12 @@ Flags win over environment variables.
 | `--data-dir` | `VERILOG_DATA_DIR` | `./verilog-data` | WAL, checkpoint, evidence |
 | `--rpc` | `VERILOG_RPC_URL` | required | EVM JSON-RPC |
 | `--contract` | `VERILOG_CONTRACT` | required | registry address |
-| `--private-key-file` | `VERILOG_PRIVATE_KEY_FILE` | | otherwise `VERILOG_PRIVATE_KEY` |
+| `--signer` | `VERILOG_SIGNER` | `local` | `local` (key file or env) or `aws-kms` |
+| `--kms-key-id` | `VERILOG_KMS_KEY_ID` | | KMS key ARN, id or `alias/<name>` (`aws-kms`) |
+| `--private-key-file` | `VERILOG_PRIVATE_KEY_FILE` | | `local`: hex key file, mode 0600; otherwise `VERILOG_PRIVATE_KEY` (warns) |
+| `--insecure-key-file-perms` | | off | development only: accept a group/world-readable key file |
+| `--max-fee-gwei` | `VERILOG_MAX_FEE_GWEI` | `500` | ceiling on `maxFeePerGas` (decimals allowed) |
+| `--max-priority-fee-gwei` | `VERILOG_MAX_PRIORITY_FEE_GWEI` | `50` | ceiling on `maxPriorityFeePerGas` |
 | `--epoch-interval` | `VERILOG_EPOCH_INTERVAL` | `30s` | seal every open epoch this often |
 | `--epoch-max-logs` | `VERILOG_EPOCH_MAX_LOGS` | `1000` | seal an agent's epoch at this size |
 | `--confirm-timeout` | `VERILOG_CONFIRM_TIMEOUT` | `2m` | receipt wait before retrying |
@@ -105,6 +113,129 @@ Flags win over environment variables.
 | `--max-payload-bytes` | `VERILOG_MAX_PAYLOAD_BYTES` | 1 MiB | per-event payload limit; larger payloads get a per-event rejection (the gRPC receive limit is 4× this plus 1 MiB). Keep the SDK's `max_payload_bytes` at or below it |
 | `--stream-window` | | `1024` | unacknowledged events per stream |
 | `--log-level`, `--log-format` | `VERILOG_LOG_LEVEL`, `VERILOG_LOG_FORMAT` | `info`, `text` | logging |
+
+Credentials and API keys in the RPC URL (userinfo, query parameters, provider
+tokens in the path) are replaced with `REDACTED` in every log line and error.
+
+## Anchoring key
+
+The daemon signs `anchorEpoch` transactions with a secp256k1 key that holds
+`ANCHORER_ROLE`. In production keep it in AWS KMS: the private key never
+exists on the daemon host, every signature is logged in CloudTrail, and
+access ends when the role's permission is removed. The daemon reads the
+region and credentials from the AWS SDK's default chain (environment, shared
+config, IRSA / web identity, container or instance role); AWS secrets are
+never flags.
+
+### AWS KMS setup
+
+```sh
+# 1. Create the key (spec and usage are checked at startup) and an alias.
+aws kms create-key --key-spec ECC_SECG_P256K1 --key-usage SIGN_VERIFY --description "VeriLog anchorer"
+aws kms create-alias --alias-name alias/verilog-anchorer --target-key-id <KeyId>
+
+# 2. Its Ethereum address. verilogd also logs it at startup ("aws-kms signer ready address=0x…").
+PUB=$(aws kms get-public-key --key-id alias/verilog-anchorer --query PublicKey --output text | base64 --decode | tail -c 64 | xxd -p -c 64)
+cast to-check-sum-address 0x$(cast keccak 0x$PUB | tail -c 41)
+
+# 3. Fund it for gas, and grant it ANCHORER_ROLE as the admin (the Safe in
+#    production), or pass it as VERILOG_ANCHORER when deploying.
+cast send $REGISTRY 'grantRole(bytes32,address)' $(cast keccak ANCHORER_ROLE) 0x<address> --rpc-url $RPC …
+
+# 4. Run the daemon under an AWS identity with the policy below.
+AWS_REGION=eu-west-1 bin/verilogd --signer aws-kms --kms-key-id alias/verilog-anchorer --rpc "$RPC" --contract 0xRegistry …
+```
+
+At startup the daemon calls `GetPublicKey`, checks the key spec
+(`ECC_SECG_P256K1`), usage (`SIGN_VERIFY`) and algorithm (`ECDSA_SHA_256`),
+derives and logs the address (nothing else about the key), makes one test
+signature, and checks that the address holds `ANCHORER_ROLE`. It signs each
+transaction hash with `Sign` (`MessageType=DIGEST`, `ECDSA_SHA_256`),
+normalizes the signature to low-s and recovers `v` against the known public
+key. Throttling and transient KMS errors are retried (5 attempts, backoff up
+to 3 s); after that the anchor attempt fails and the anchor worker retries it
+like any RPC error. Permanent errors (access denied, key disabled or pending
+deletion, not found) name the cause.
+
+Least-privilege IAM policy for the daemon's role (use the key ARN, not the
+alias):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "VeriLogAnchorerSign",
+      "Effect": "Allow",
+      "Action": "kms:Sign",
+      "Resource": "arn:aws:kms:eu-west-1:111122223333:key/<key-id>",
+      "Condition": {
+        "StringEquals": { "kms:SigningAlgorithm": "ECDSA_SHA_256", "kms:MessageType": "DIGEST" }
+      }
+    },
+    {
+      "Sid": "VeriLogAnchorerPublicKey",
+      "Effect": "Allow",
+      "Action": "kms:GetPublicKey",
+      "Resource": "arn:aws:kms:eu-west-1:111122223333:key/<key-id>"
+    }
+  ]
+}
+```
+
+KMS never exports the private key of an asymmetric key. In the key policy,
+also deny the daemon's role everything else, so a compromised daemon host
+cannot delete, disable, re-policy, grant or re-import the key:
+
+```json
+{
+  "Sid": "DenyVeriLogDaemonEverythingElse",
+  "Effect": "Deny",
+  "Principal": { "AWS": "arn:aws:iam::111122223333:role/verilogd" },
+  "NotAction": ["kms:Sign", "kms:GetPublicKey"],
+  "Resource": "*"
+}
+```
+
+Keep key administration (including `ScheduleKeyDeletion`) with a separate
+admin role, and alarm on `ScheduleKeyDeletion`, `DisableKey` and
+`PutKeyPolicy` for this key in CloudTrail.
+
+**Moving from a local key to KMS.** Grant `ANCHORER_ROLE` to the KMS address,
+stop the daemon when `<data-dir>/anchor-pending.json` does not exist (no
+transaction in flight), restart it with `--signer aws-kms`, then revoke the
+old address's role with `revokeRole`.
+
+### Local key (development)
+
+`--private-key-file` (or `VERILOG_PRIVATE_KEY_FILE`) names a file holding the
+hex key. A file readable by group or others is refused unless
+`--insecure-key-file-perms` is given. `VERILOG_PRIVATE_KEY` (hex in the
+environment) still works but logs a warning.
+
+### Fee ceiling
+
+Each retry of an unconfirmed transaction replaces it with the same nonce and
+25% higher fees, up to `--max-fee-gwei` and `--max-priority-fee-gwei`. When
+the ceiling leaves no room for a valid replacement (+10%), the daemon stops
+bumping, rebroadcasts the pending transaction unchanged and logs
+`anchor: fee ceiling reached` at ERROR on every retry. The epoch is never
+dropped: it is anchored once fees fall below the ceiling or the ceiling is
+raised (restart with a higher value; the pending transaction is then
+replaced). Set the ceiling well above normal fees on your chain; on L2s the
+defaults are effectively no ceiling, so lower them.
+
+### Pending-transaction recovery
+
+Before broadcasting, the daemon writes the transaction (hash of every
+version, nonce, fees, signed bytes, agent and root) atomically to
+`<data-dir>/anchor-pending.json`, and removes it once the receipt is
+processed. After a crash or restart it re-checks that record before sending
+anything: if a version was mined it resumes from that receipt; if not, it
+replaces the transaction with the same nonce, so the root is anchored at most
+once. A record made for another chain, contract or signer address is renamed
+to `anchor-pending.json.stale` with a warning; an unreadable record stops the
+daemon until you inspect it.
 
 ## Key management
 

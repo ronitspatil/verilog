@@ -5,8 +5,13 @@ hold only under the [deployment requirements](operations.md#deployment-requireme
 
 ## Threat model
 
-The attacker controls the daemon host, including the anchorer key, the WAL
-and the evidence bundles. The agent hosts and the key admin are trusted.
+The attacker controls the daemon host, including the use of the anchorer key,
+the WAL and the evidence bundles. The agent hosts and the key admin are
+trusted. With `--signer aws-kms` the attacker can make the daemon's AWS role
+sign while they hold the host, but cannot copy the private key: removing the
+role's permission (or disabling the key) ends their use of it, CloudTrail
+records every signature, and no key needs rotating afterwards. With a local
+key file the key itself must be treated as stolen.
 
 | Attack | Outcome |
 |---|---|
@@ -108,12 +113,26 @@ State these explicitly in an audit.
 - **fsync semantics.** Durability is whatever the OS's `fsync` provides. On
   macOS that does not flush the drive's write cache (`F_FULLFSYNC` is not
   used); on Linux it does.
-- **Key handling.** The daemon's anchorer key and the agents' signing keys are
-  read from an environment variable or a file and held in memory. They are
-  never logged. A KMS or HSM signer is not implemented.
+- **Key handling.** In production the anchorer key stays in AWS KMS
+  (`--signer aws-kms`); only the public key and signatures reach the daemon.
+  A local anchorer key and the agents' signing keys are read from a file or
+  an environment variable (which warns) and held in memory; a key file
+  readable by group or others is refused unless explicitly allowed for
+  development. Keys are never logged. Credentials in the RPC URL are
+  redacted from logs and errors by pattern (userinfo, query values, long
+  path tokens); an unusual provider format could slip through, so prefer
+  header-based or IP-allowlisted RPC authentication where available. Only
+  AWS KMS is supported as a remote signer.
+- **Fee ceiling stalls anchoring.** If network fees stay above
+  `--max-fee-gwei`, anchoring waits (and logs ERROR) instead of paying more.
+  Nothing is lost, but events stay unanchored, and so not yet
+  tamper-evident, until fees fall or the ceiling is raised.
 - **One daemon per data directory and signer.** The daemon locks its data
-  directory, but two daemons using the same signer key with different data
-  directories would race on nonces.
+  directory, and the in-flight anchor transaction is recorded there so a
+  restart never anchors a root twice. Two daemons using the same signer key
+  with different data directories would still race on nonces, and deleting
+  `anchor-pending.json` while a transaction is in flight gives up that
+  protection.
 - **Size limits and retention.** Event fields are size-limited (agent id 256
   bytes, run id 256 bytes, event type 128 bytes, payload
   `--max-payload-bytes`). WAL segments are deleted once everything in them is

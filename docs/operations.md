@@ -39,9 +39,54 @@ up the new vectors.
 
 Python dependencies are locked with hashes in
 `sdk/python/requirements-dev.txt`; after changing `pyproject.toml`, run
-`make lock` (needs `uv`) and commit the result. The contract libraries are
-git submodules pinned to release tags: OpenZeppelin Contracts v5.6.1 and
-forge-std v1.17.0.
+`make lock` (needs `uv`) and commit the result. `make lock` keeps existing
+pins that still satisfy `pyproject.toml`, so it does not pick up new
+releases. The contract libraries are git submodules pinned to release tags:
+OpenZeppelin Contracts v5.6.1 and forge-std v1.17.0.
+
+### Upgrading the Python lock (monthly)
+
+Dependabot opens pip PRs only for security advisories. Its version-update PRs
+are disabled because it bumps pins one at a time and cannot re-resolve the
+uv-compiled lock, which can leave the lock unsatisfiable. Routine upgrades are
+done by hand, once a month and when a security PR fails CI:
+
+```sh
+python3 -m venv /tmp/uv && /tmp/uv/bin/pip install uv   # if uv is not installed
+PATH=/tmp/uv/bin:$PATH make lock-upgrade                # newest compatible versions
+make venv PYTHON=python3.12 && make test-python
+pip-audit --require-hashes --disable-pip -r sdk/python/requirements-dev.txt
+make proto && git status --short   # a grpcio-tools bump must not change the stubs
+```
+
+Commit `requirements-dev.txt`. A package that stays behind is held by
+another pin (for example, pydantic pins pydantic-core exactly, and langsmith
+caps uuid-utils below 1.0); it moves when the package that holds it does.
+
+### Upgrading the contract libraries
+
+Dependabot does not track the submodules, because it follows their default
+branches instead of release tags. The scheduled `contract library releases`
+workflow (`.github/workflows/release-tags.yml`, weekly or on demand) fails
+with a warning when OpenZeppelin Contracts or forge-std has a release newer
+than the pinned commit. To move to a tag:
+
+```sh
+git -C contracts/lib/openzeppelin-contracts fetch --tags
+git -C contracts/lib/openzeppelin-contracts checkout v5.x.y   # the release tag
+make bindings                 # rebuilds the contract and daemon/internal/registry/registry.go
+cd contracts && forge test && cd ..
+make test-go
+git add contracts/lib/openzeppelin-contracts daemon/internal/registry/registry.go
+```
+
+Update the versions named above in this document and commit. The same steps
+apply to `contracts/lib/forge-std` (it affects tests only, so the bindings
+usually do not change). A new OpenZeppelin release usually changes the
+registry's bytecode: the reproducible CI job requires the regenerated
+bindings, and a deployed registry keeps the old code, so the change needs a
+new deployment and the daemons and verifiers pointed at it before it takes
+effect.
 
 ## CI
 
@@ -63,7 +108,9 @@ on pushes to `main`, as parallel jobs:
 Reproduce locally with the same commands: the Go and contract steps above,
 `make venv test-python`, `make tools proto bindings vectors && git diff
 --exit-code`, and `make e2e`. Actions are pinned to commit SHAs; Dependabot
-proposes weekly grouped updates for actions, Go modules, pip and submodules.
+proposes weekly grouped updates for actions and Go modules, and security
+updates for pip. Python version upgrades and contract library bumps are
+manual (see above).
 
 ## Deployment requirements
 

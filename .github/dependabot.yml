@@ -14,17 +14,16 @@ updates:
     groups:
       go:
         patterns: ["*"]
+  # The Python lock is compiled by uv as one hashed, universal resolution.
+  # Dependabot edits pins in it one by one and cannot re-resolve it, so its
+  # version-update PRs can leave the lock unsatisfiable. Version updates are
+  # off (limit 0); security updates are unaffected by this limit and still
+  # open PRs. Routine upgrades are a monthly `make lock-upgrade` (see
+  # docs/operations.md).
   - package-ecosystem: pip
     directory: /sdk/python
     schedule:
       interval: weekly
-    groups:
-      python:
-        patterns: ["*"]
-  - package-ecosystem: gitsubmodule
-    directory: /
-    schedule:
-      interval: weekly
-    groups:
-      submodules:
-        patterns: ["*"]
+    open-pull-requests-limit: 0
+  # No gitsubmodule entry: it tracks the submodules' default branches, not
+  # release tags. .github/workflows/release-tags.yml reports new tags instead.

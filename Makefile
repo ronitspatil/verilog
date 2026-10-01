@@ -14,7 +14,7 @@ PROTOC ?= protoc
 # Directory containing google/protobuf/timestamp.proto (shipped with protoc).
 PROTOC_INCLUDE ?= $(shell dirname $$(dirname $$(command -v $(PROTOC))))/include
 
-.PHONY: all tools venv lock proto bindings vectors build certs test test-go test-contracts test-python bench e2e clean
+.PHONY: all tools venv lock lock-upgrade proto bindings vectors build certs test test-go test-contracts test-python bench e2e clean
 
 all: build test
 
@@ -37,9 +37,15 @@ venv: ## Create the Python venv from the hashed lock, SDK installed in editable 
 	$(VENV)/bin/pip install -q --require-hashes -r $(LOCK)
 	$(VENV)/bin/pip install -q --no-deps --no-build-isolation -e sdk/python
 
+# `lock` keeps existing pins where they still satisfy pyproject.toml;
+# `lock-upgrade` re-resolves everything to the newest compatible versions.
+LOCK_FLAGS ?=
 lock: ## Re-resolve the Python lock (needs uv: pip install uv)
 	cd sdk/python && uv pip compile pyproject.toml --extra dev --universal --python-version 3.10 \
-		--generate-hashes --custom-compile-command 'make lock' -q -o requirements-dev.txt
+		--generate-hashes --custom-compile-command 'make lock' -q $(LOCK_FLAGS) -o requirements-dev.txt
+
+lock-upgrade: ## Upgrade every Python lock pin to the newest compatible version
+	$(MAKE) lock LOCK_FLAGS=--upgrade
 
 proto: ## Regenerate Go and Python gRPC code from proto/
 	$(PROTOC) -I proto -I $(PROTOC_INCLUDE) \

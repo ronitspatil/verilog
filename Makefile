@@ -14,7 +14,7 @@ PROTOC ?= protoc
 # Directory containing google/protobuf/timestamp.proto (shipped with protoc).
 PROTOC_INCLUDE ?= $(shell dirname $$(dirname $$(command -v $(PROTOC))))/include
 
-.PHONY: all tools venv proto bindings vectors build test test-go test-contracts test-python bench e2e clean
+.PHONY: all tools venv proto bindings vectors build certs test test-go test-contracts test-python bench e2e clean
 
 all: build test
 
@@ -54,6 +54,12 @@ vectors: ## Regenerate the cross-implementation golden vectors in testdata/
 
 build: ## Build verilogd and verilog-verify into bin/
 	cd daemon && go build -o ../bin/ ./cmd/verilogd ./cmd/verilog-verify
+
+# DEV ONLY mTLS certificates (gitignored): CA, server (localhost, 127.0.0.1),
+# agent e2e-agent and auditor dev-auditor. Use your own CA or PKI in production.
+CERTS_DIR ?= dev-certs
+certs: ## Write development-only mTLS certificates into $(CERTS_DIR)/
+	cd daemon && go run ./cmd/verilog-devcerts --out ../$(CERTS_DIR) --agent e2e-agent --auditor dev-auditor
 
 test: test-go test-contracts test-python
 

@@ -66,6 +66,20 @@ type Config struct {
 	StreamWindow    int
 	LogLevel        slog.Level
 	LogFormat       string
+	Limits          Limits
+	// MetricsListen is the Prometheus /metrics listen address ("": off).
+	MetricsListen string
+}
+
+// Limits bound unanchored events (see engine.Limits); zero disables one.
+type Limits struct {
+	MaxAgentEvents   int64
+	MaxAgentBytes    int64
+	MaxTotalBytes    int64
+	MaxAnchorQueue   int
+	AgentRate        float64
+	AgentBurst       int
+	MinFreeDiskBytes uint64
 }
 
 // Load parses args (without the program name) with env fallbacks.
@@ -117,6 +131,14 @@ func Load(args []string, getenv func(string) string, stderr io.Writer) (*Config,
 	fs.IntVar(&c.CommitBatch, "commit-batch", 4096, "max events per WAL fsync")
 	fs.StringVar(&maxPayload, "max-payload-bytes", maxPayload, "reject events with a larger payload_json (env VERILOG_MAX_PAYLOAD_BYTES)")
 	fs.IntVar(&c.StreamWindow, "stream-window", 1024, "max unacknowledged events per ingest stream")
+	fs.Int64Var(&c.Limits.MaxAgentEvents, "max-agent-unanchored-events", 100_000, "refuse (retryable) an agent's events while it has this many unanchored events (0: no limit)")
+	fs.Int64Var(&c.Limits.MaxAgentBytes, "max-agent-unanchored-bytes", 256<<20, "refuse (retryable) an agent's events while its unanchored events hold this many bytes (0: no limit)")
+	fs.Int64Var(&c.Limits.MaxTotalBytes, "max-unanchored-bytes", 4<<30, "refuse (retryable) all events while unanchored events hold this many bytes in total (0: no limit)")
+	fs.IntVar(&c.Limits.MaxAnchorQueue, "max-anchor-queue", 1024, "refuse (retryable) all events while this many sealed epochs await a final anchor (0: no limit)")
+	fs.Float64Var(&c.Limits.AgentRate, "agent-rate", 0, "per-agent ingest rate limit in events per second (0: off)")
+	fs.IntVar(&c.Limits.AgentBurst, "agent-burst", 0, "per-agent burst above --agent-rate (0: one second's worth)")
+	fs.Uint64Var(&c.Limits.MinFreeDiskBytes, "min-free-disk-bytes", 1<<30, "refuse (retryable) all events and log at ERROR while the data directory has less free space (0: off)")
+	fs.StringVar(&c.MetricsListen, "metrics-listen", env("VERILOG_METRICS_LISTEN", ""), "serve Prometheus metrics at http://<addr>/metrics, e.g. 127.0.0.1:9464 (default off; env VERILOG_METRICS_LISTEN)")
 	fs.StringVar(&logLevel, "log-level", env("VERILOG_LOG_LEVEL", "info"), "debug, info, warn or error (env VERILOG_LOG_LEVEL)")
 	fs.StringVar(&c.LogFormat, "log-format", env("VERILOG_LOG_FORMAT", "text"), "text or json (env VERILOG_LOG_FORMAT)")
 	if err := fs.Parse(args); err != nil {
@@ -166,6 +188,10 @@ func Load(args []string, getenv func(string) string, stderr io.Writer) (*Config,
 	c.Contract = common.HexToAddress(contract)
 	if err := validateTransport(); err != nil {
 		return nil, err
+	}
+	if l := c.Limits; l.MaxAgentEvents < 0 || l.MaxAgentBytes < 0 || l.MaxTotalBytes < 0 || l.MaxAnchorQueue < 0 ||
+		l.AgentRate < 0 || l.AgentBurst < 0 {
+		return nil, errors.New("resource limits (--max-*, --agent-rate, --agent-burst) must not be negative")
 	}
 	if c.CommitBatch <= 0 || c.StreamWindow <= 0 {
 		return nil, errors.New("--commit-batch and --stream-window must be positive")

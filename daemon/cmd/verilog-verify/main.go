@@ -1,8 +1,18 @@
-// Command verilog-verify checks one logged event against the Merkle root
-// anchored on chain, and exports events and proofs from evidence bundles.
+// Command verilog-verify checks logged events against the Merkle roots and
+// agent keys recorded on chain, and exports events and proofs from evidence
+// bundles.
+//
+// Single-event mode: inclusion in the anchored epoch, a valid agent
+// signature, and a signing key registered and valid at the anchor time.
 //
 //	verilog-verify --event event.json --proof proof.json --epoch N \
 //	    --agent-id ID --rpc URL --contract 0xADDR
+//
+// Run mode: every event of the run as above, plus the run's hash chain
+// (contiguous from step 1, no forks, epochs in chain order) and a terminal
+// run_end event (--allow-incomplete accepts a missing run_end with a warning).
+//
+//	verilog-verify --run-id RUN --bundles DIR --agent-id ID --rpc URL --contract 0xADDR
 //
 // stdout is exactly one verdict line:
 //
@@ -23,8 +33,10 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -35,6 +47,7 @@ import (
 
 	verilogv1 "github.com/ronitspatil/verilog/daemon/gen/verilog/v1"
 	"github.com/ronitspatil/verilog/daemon/internal/canonical"
+	"github.com/ronitspatil/verilog/daemon/internal/merkle"
 	"github.com/ronitspatil/verilog/daemon/internal/store"
 	"github.com/ronitspatil/verilog/daemon/internal/verify"
 )
@@ -69,13 +82,16 @@ func run(args []string, stdout, stderr io.Writer) int {
 func runVerify(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("verilog-verify", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	eventPath := fs.String("event", "", "raw JSON event file (required)")
-	proofPath := fs.String("proof", "", "JSON array of 0x-hex Merkle proof hashes (required)")
-	epoch := fs.Uint64("epoch", 0, "on-chain epoch id (required)")
+	eventPath := fs.String("event", "", "raw JSON event file (single-event mode)")
+	proofPath := fs.String("proof", "", "JSON array of 0x-hex Merkle proof hashes (single-event mode)")
+	epoch := fs.Uint64("epoch", 0, "on-chain epoch id (single-event mode)")
+	runID := fs.String("run-id", "", "verify a whole run (run mode, with --bundles)")
+	bundlesDir := fs.String("bundles", "", "directory of evidence bundles, searched recursively (run mode)")
+	allowIncomplete := fs.Bool("allow-incomplete", false, "run mode: accept a run without run_end, with a warning (investigations only)")
 	agentID := fs.String("agent-id", "", "agent id string, or 0x-prefixed bytes32 agent key (required)")
 	rpcURL := fs.String("rpc", os.Getenv("VERILOG_RPC_URL"), "EVM JSON-RPC endpoint (env VERILOG_RPC_URL)")
 	contract := fs.String("contract", os.Getenv("VERILOG_CONTRACT"), "VeriLogRegistry address (env VERILOG_CONTRACT)")
-	onchain := fs.Bool("onchain-check", true, "also evaluate the proof with the contract's verifyAnchoredLeaf")
+	onchain := fs.Bool("onchain-check", true, "also evaluate each proof with the contract's verifyAnchoredLeaf")
 	timeout := fs.Duration("timeout", 30*time.Second, "RPC timeout")
 	if err := fs.Parse(args); err != nil {
 		return exitOperational
@@ -84,57 +100,104 @@ func runVerify(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "error: "+format+"\n", a...)
 		return exitOperational
 	}
+	runMode := *runID != "" || *bundlesDir != ""
 	switch {
-	case *eventPath == "" || *proofPath == "" || *epoch == 0 || *agentID == "" || *rpcURL == "":
+	case *agentID == "" || *rpcURL == "":
 		fs.Usage()
-		return operational("--event, --proof, --epoch, --agent-id and --rpc are required")
+		return operational("--agent-id and --rpc are required")
+	case runMode && (*runID == "" || *bundlesDir == ""):
+		return operational("run mode needs both --run-id and --bundles")
+	case runMode && (*eventPath != "" || *proofPath != "" || *epoch != 0):
+		return operational("--event/--proof/--epoch and --run-id/--bundles are exclusive")
+	case !runMode && (*eventPath == "" || *proofPath == "" || *epoch == 0):
+		fs.Usage()
+		return operational("--event, --proof and --epoch are required (or --run-id and --bundles for run mode)")
+	case !runMode && *allowIncomplete:
+		return operational("--allow-incomplete only applies to run mode")
 	case !common.IsHexAddress(*contract):
 		return operational("--contract must be a 0x address")
-	}
-	eventJSON, err := os.ReadFile(*eventPath)
-	if err != nil {
-		return operational("reading event file: %v", err)
-	}
-	proofJSON, err := os.ReadFile(*proofPath)
-	if err != nil {
-		return operational("reading proof file: %v", err)
-	}
-	proof, err := verify.ParseProof(proofJSON)
-	if err != nil {
-		return operational("%v", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
+	var (
+		evidence  []verify.Evidence
+		eventJSON []byte
+		proof     []merkle.Hash
+	)
+	if runMode {
+		var err error
+		if evidence, err = loadEvidence(*bundlesDir); err != nil {
+			return operational("%v", err)
+		}
+	} else {
+		var err error
+		if eventJSON, err = os.ReadFile(*eventPath); err != nil {
+			return operational("reading event file: %v", err)
+		}
+		proofJSON, err := os.ReadFile(*proofPath)
+		if err != nil {
+			return operational("reading proof file: %v", err)
+		}
+		if proof, err = verify.ParseProof(proofJSON); err != nil {
+			return operational("%v", err)
+		}
+	}
+
 	client, err := ethclient.DialContext(ctx, *rpcURL)
 	if err != nil {
 		return operational("dialing RPC: %v", err)
 	}
 	defer client.Close()
-
-	rep, err := verify.Verify(ctx, client, verify.Input{
-		EventJSON:    eventJSON,
-		Proof:        proof,
-		EpochID:      *epoch,
-		AgentID:      *agentID,
-		Contract:     common.HexToAddress(*contract),
-		OnChainCheck: *onchain,
-	})
+	v, err := verify.New(ctx, client, common.HexToAddress(*contract), *onchain)
 	if err != nil {
-		var oe *verify.OperationalError
-		if errors.As(err, &oe) {
-			return operational("%v", oe)
-		}
 		return operational("%v", err)
 	}
 
+	if runMode {
+		rep, err := v.Run(ctx, verify.RunInput{AgentID: *agentID, RunID: *runID, Evidence: evidence, AllowIncomplete: *allowIncomplete})
+		if err != nil {
+			return operational("%v", err)
+		}
+		fmt.Fprintf(stderr, "agent key:      %s\n", rep.AgentKey.Hex())
+		fmt.Fprintf(stderr, "run id:         %s\n", rep.RunID)
+		fmt.Fprintf(stderr, "events:         %d (last step %d) in epochs %v\n", rep.Events, rep.LastStep, rep.Epochs)
+		if rep.SDKDropped > 0 {
+			fmt.Fprintf(stderr, "sdk dropped:    %d events (self-reported by the agent SDK, not tampering)\n", rep.SDKDropped)
+		}
+		if rep.EndStatus != "" {
+			fmt.Fprintf(stderr, "run_end:        status %q\n", rep.EndStatus)
+		}
+		if rep.Warning != "" {
+			fmt.Fprintf(stderr, "warning:        %s\n", rep.Warning)
+		}
+		if !rep.Verified {
+			fmt.Fprintf(stderr, "reason:         %s\n", rep.Reason)
+			fmt.Fprintln(stdout, failureLine)
+			return exitTampered
+		}
+		fmt.Fprintln(stdout, successLine)
+		return exitVerified
+	}
+
+	rep, err := v.Event(ctx, eventJSON, proof, *epoch, *agentID)
+	if err != nil {
+		return operational("%v", err)
+	}
 	fmt.Fprintf(stderr, "agent key:      %s\n", rep.AgentKey.Hex())
-	fmt.Fprintf(stderr, "epoch:          %d\n", *epoch)
+	fmt.Fprintf(stderr, "epoch:          %d (anchored %s)\n", *epoch, rep.AnchoredAt.Format(time.RFC3339))
 	fmt.Fprintf(stderr, "on-chain root:  %s\n", rep.OnChainRoot.Hex())
 	if rep.ContentDigest != (canonical.Digest{}) {
 		fmt.Fprintf(stderr, "content digest: %s\n", rep.ContentDigest.Hex())
 		fmt.Fprintf(stderr, "leaf:           %s\n", rep.Leaf.Hex())
 		fmt.Fprintf(stderr, "computed root:  %s\n", rep.ComputedRoot.Hex())
+	}
+	if rep.RunID != "" {
+		fmt.Fprintf(stderr, "run id / step:  %s / %d (%s)\n", rep.RunID, rep.StepNumber, rep.EventType)
+		fmt.Fprintf(stderr, "key id:         %s\n", rep.KeyID.Hex())
+	}
+	if rep.KeyStatus != "" {
+		fmt.Fprintf(stderr, "signing key:    %s\n", rep.KeyStatus)
 	}
 	fmt.Fprintf(stderr, "on-chain check: %s\n", rep.OnChainCheck)
 	if !rep.Verified {
@@ -144,6 +207,45 @@ func runVerify(args []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintln(stdout, successLine)
 	return exitVerified
+}
+
+// loadEvidence reads every evidence bundle (*.json) under dir. The bundles
+// are untrusted: each event is checked against the chain.
+func loadEvidence(dir string) ([]verify.Evidence, error) {
+	var out []verify.Evidence
+	n := 0
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+			return nil
+		}
+		b, err := store.ReadBundleFile(path)
+		if err != nil {
+			return fmt.Errorf("reading bundle: %w", err)
+		}
+		n++
+		for _, e := range b.Events {
+			proof := make([]merkle.Hash, len(e.Proof))
+			for i, p := range e.Proof {
+				d, err := canonical.ParseDigest(p)
+				if err != nil {
+					return fmt.Errorf("%s: proof of leaf %d: %w", path, e.LeafIndex, err)
+				}
+				proof[i] = d
+			}
+			out = append(out, verify.Evidence{EpochID: b.EpochID, EventJSON: []byte(e.CanonicalEvent), Proof: proof})
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("--bundles: %w", err)
+	}
+	if n == 0 {
+		return nil, fmt.Errorf("--bundles: no evidence bundles (*.json) under %s", dir)
+	}
+	return out, nil
 }
 
 func runExport(args []string, stderr io.Writer) error {

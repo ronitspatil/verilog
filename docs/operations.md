@@ -42,7 +42,7 @@ Python dependencies are locked with hashes in
 `make lock` (needs `uv`) and commit the result. `make lock` keeps existing
 pins that still satisfy `pyproject.toml`, so it does not pick up new
 releases. The contract libraries are git submodules pinned to release tags:
-OpenZeppelin Contracts v5.6.1 and forge-std v1.17.0.
+OpenZeppelin Contracts v5.7.0 and forge-std v1.17.0.
 
 ### Upgrading the Python lock (monthly)
 

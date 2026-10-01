@@ -18,10 +18,18 @@ import {MerkleProof} from "@openzeppelin/contracts/utils/cryptography/MerkleProo
 ///      Agent signing keys: every event is signed in the agent process with an
 ///      Ed25519 key registered here by KEY_ADMIN_ROLE. keyId = keccak256(pubkey).
 ///      A key is valid for an epoch when validFrom <= anchor.timestamp and
-///      (revokedAt == 0 || anchor.timestamp < revokedAt). The anchorer (the
-///      daemon) must never hold KEY_ADMIN_ROLE or DEFAULT_ADMIN_ROLE, or a
-///      compromised daemon host could register its own key and forge events;
-///      the contract refuses to give one account both sides.
+///      (revokedAt == 0 || anchor.timestamp < revokedAt), where revokedAt is the
+///      time the revocation takes effect (it can be scheduled ahead, so events
+///      already accepted can still be anchored). The anchorer (the daemon) must
+///      never hold KEY_ADMIN_ROLE or DEFAULT_ADMIN_ROLE, or a compromised daemon
+///      host could register its own key and forge events; the contract refuses
+///      to give one account both sides.
+///
+///      Registration refuses Ed25519 public keys that are small-order points or
+///      non-canonical encodings: with a small-order key (the identity point,
+///      say) a signature can be forged for any message without a private key.
+///      Mixed-order keys need curve arithmetic to detect and are rejected off
+///      chain (verilog-verify keycheck, the daemon and the verifier).
 contract VeriLogRegistry is AccessControl {
     /// @notice Role allowed to anchor epochs.
     bytes32 public constant ANCHORER_ROLE = keccak256("ANCHORER_ROLE");
@@ -30,6 +38,7 @@ contract VeriLogRegistry is AccessControl {
     bytes32 public constant KEY_ADMIN_ROLE = keccak256("KEY_ADMIN_ROLE");
 
     /// @dev Two storage slots: pubkey | validFrom (8 bytes) + revokedAt (8 bytes).
+    ///      revokedAt is when the revocation takes effect; 0 means not revoked.
     struct AgentKey {
         bytes32 pubkey;
         uint64 validFrom;
@@ -57,7 +66,9 @@ contract VeriLogRegistry is AccessControl {
     );
 
     event AgentKeyRegistered(bytes32 indexed agentId, bytes32 indexed keyId, bytes32 pubkey, uint64 validFrom);
-    event AgentKeyRevoked(bytes32 indexed agentId, bytes32 indexed keyId, uint64 revokedAt);
+    /// @param revokedAt   when the revocation takes effect (effectiveAt)
+    /// @param recordedAt  block timestamp of the revocation transaction
+    event AgentKeyRevoked(bytes32 indexed agentId, bytes32 indexed keyId, uint64 revokedAt, uint64 recordedAt);
 
     error ZeroAgentId();
     error ZeroMerkleRoot();
@@ -68,6 +79,8 @@ contract VeriLogRegistry is AccessControl {
     error KeyExists(bytes32 agentId, bytes32 keyId);
     error UnknownKey(bytes32 agentId, bytes32 keyId);
     error KeyAlreadyRevoked(bytes32 agentId, bytes32 keyId);
+    error WeakPubkey(bytes32 pubkey);
+    error RevocationInPast(uint64 effectiveAt, uint64 blockTimestamp);
     error AnchorerCannotAdminister(address account);
 
     /// @param admin    Receives DEFAULT_ADMIN_ROLE and KEY_ADMIN_ROLE. In production
@@ -94,6 +107,10 @@ contract VeriLogRegistry is AccessControl {
     }
 
     /// @notice Register an agent's Ed25519 public key, valid from this block on.
+    /// @dev Reverts with WeakPubkey for small-order points and non-canonical
+    ///      encodings. The key admin must also check the key's proof of
+    ///      possession first (verilog-verify keycheck), which rejects
+    ///      mixed-order keys as well.
     /// @return keyId keccak256(pubkey), the key_id carried by the agent's events.
     function registerAgentKey(bytes32 agentId, bytes32 pubkey)
         external
@@ -102,6 +119,7 @@ contract VeriLogRegistry is AccessControl {
     {
         if (agentId == bytes32(0)) revert ZeroAgentId();
         if (pubkey == bytes32(0)) revert ZeroPubkey();
+        if (isWeakPubkey(pubkey)) revert WeakPubkey(pubkey);
         keyId = keccak256(abi.encodePacked(pubkey));
         if (agentKeys[agentId][keyId].pubkey != bytes32(0)) revert KeyExists(agentId, keyId);
         uint64 ts = uint64(block.timestamp);
@@ -109,15 +127,53 @@ contract VeriLogRegistry is AccessControl {
         emit AgentKeyRegistered(agentId, keyId, pubkey, ts);
     }
 
-    /// @notice Revoke an agent key. Epochs anchored from this block on no longer
-    ///         accept its signatures; earlier epochs stay valid.
-    function revokeAgentKey(bytes32 agentId, bytes32 keyId) external onlyRole(KEY_ADMIN_ROLE) {
+    /// @notice Revoke an agent key, effective at `effectiveAt` (a block
+    ///         timestamp, not earlier than this block's). Epochs anchored at or
+    ///         after effectiveAt no longer accept the key's signatures; earlier
+    ///         epochs stay valid. Use effectiveAt = now for a compromised key;
+    ///         for a routine rotation, leave time for events already accepted
+    ///         to be anchored (drain before revoke, see the operations guide).
+    ///         The daemon refuses new events of a key as soon as a revocation
+    ///         is recorded, even before it takes effect.
+    function revokeAgentKey(bytes32 agentId, bytes32 keyId, uint64 effectiveAt) external onlyRole(KEY_ADMIN_ROLE) {
         AgentKey storage k = agentKeys[agentId][keyId];
         if (k.pubkey == bytes32(0)) revert UnknownKey(agentId, keyId);
         if (k.revokedAt != 0) revert KeyAlreadyRevoked(agentId, keyId);
         uint64 ts = uint64(block.timestamp);
-        k.revokedAt = ts;
-        emit AgentKeyRevoked(agentId, keyId, ts);
+        // Never retroactive: an epoch already anchored stays valid.
+        if (effectiveAt < ts) revert RevocationInPast(effectiveAt, ts);
+        k.revokedAt = effectiveAt;
+        emit AgentKeyRevoked(agentId, keyId, effectiveAt, ts);
+    }
+
+    /// @notice True for Ed25519 public key encodings that must never be
+    ///         registered: the encodings of the eight small-order points (all
+    ///         of them, including the non-canonical ones) and every encoding
+    ///         whose y coordinate is not reduced modulo p = 2^255 - 19.
+    /// @dev The encoding is little-endian y with the sign of x in the top bit
+    ///      of the last byte; bytes32 holds the encoding's first byte first.
+    function isWeakPubkey(bytes32 pubkey) public pure returns (bool) {
+        // Canonical encodings of the small-order points (orders 1, 2, 4, 8).
+        if (
+            pubkey == 0x0100000000000000000000000000000000000000000000000000000000000000 // identity
+                || pubkey == 0xecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f // order 2
+                || pubkey == 0x0000000000000000000000000000000000000000000000000000000000000000 // order 4
+                || pubkey == 0x0000000000000000000000000000000000000000000000000000000000000080 // order 4
+                || pubkey == 0x26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05 // order 8
+                || pubkey == 0x26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85 // order 8
+                || pubkey == 0xc7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a // order 8
+                || pubkey == 0xc7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa // order 8
+        ) return true;
+        // x = 0 with the sign bit set ("negative zero"): a non-canonical
+        // encoding of the identity and of the order-2 point.
+        if (
+            pubkey == 0x0100000000000000000000000000000000000000000000000000000000000080
+                || pubkey == 0xecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+        ) return true;
+        // y >= p: the low 255 bits (little-endian) are 2^255-19 .. 2^255-1, i.e.
+        // byte 0 >= 0xed, bytes 1..30 all 0xff, byte 31 & 0x7f == 0x7f.
+        uint256 x = uint256(pubkey);
+        return x >> 248 >= 0xed && (x >> 8) & ((1 << 240) - 1) == (1 << 240) - 1 && x & 0x7f == 0x7f;
     }
 
     /// @notice Anchor the Merkle root of the next epoch for `agentId`.

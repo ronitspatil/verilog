@@ -14,7 +14,7 @@ contract VeriLogRegistryTest is Test {
     );
 
     event AgentKeyRegistered(bytes32 indexed agentId, bytes32 indexed keyId, bytes32 pubkey, uint64 validFrom);
-    event AgentKeyRevoked(bytes32 indexed agentId, bytes32 indexed keyId, uint64 revokedAt);
+    event AgentKeyRevoked(bytes32 indexed agentId, bytes32 indexed keyId, uint64 revokedAt, uint64 recordedAt);
 
     VeriLogRegistry internal registry;
     address internal admin = makeAddr("admin");
@@ -115,13 +115,94 @@ contract VeriLogRegistryTest is Test {
         bytes32 keyId = registry.registerAgentKey(AGENT, PUBKEY);
         vm.warp(1_800_000_500);
         vm.expectEmit(true, true, false, true, address(registry));
-        emit AgentKeyRevoked(AGENT, keyId, 1_800_000_500);
+        emit AgentKeyRevoked(AGENT, keyId, 1_800_000_500, 1_800_000_500);
         vm.prank(admin);
-        registry.revokeAgentKey(AGENT, keyId);
+        registry.revokeAgentKey(AGENT, keyId, 1_800_000_500); // effective immediately
         (bytes32 pub, uint64 validFrom, uint64 revokedAt) = registry.agentKeys(AGENT, keyId);
         assertEq(pub, PUBKEY);
         assertEq(validFrom, 1_800_000_000);
         assertEq(revokedAt, 1_800_000_500);
+    }
+
+    /// A routine rotation schedules the revocation, so events already accepted
+    /// can still be anchored before it takes effect.
+    function test_RevocationCanBeScheduled() public {
+        vm.warp(1_800_000_000);
+        vm.prank(admin);
+        bytes32 keyId = registry.registerAgentKey(AGENT, PUBKEY);
+        vm.warp(1_800_000_100);
+        vm.expectEmit(true, true, false, true, address(registry));
+        emit AgentKeyRevoked(AGENT, keyId, 1_800_003_700, 1_800_000_100);
+        vm.prank(admin);
+        registry.revokeAgentKey(AGENT, keyId, 1_800_003_700);
+        (,, uint64 revokedAt) = registry.agentKeys(AGENT, keyId);
+        assertEq(revokedAt, 1_800_003_700);
+    }
+
+    /// A revocation is never retroactive: epochs already anchored stay valid.
+    function test_RevocationCannotBeBackdated() public {
+        vm.warp(1_800_000_000);
+        vm.prank(admin);
+        bytes32 keyId = registry.registerAgentKey(AGENT, PUBKEY);
+        vm.warp(1_800_000_500);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                VeriLogRegistry.RevocationInPast.selector, uint64(1_800_000_499), uint64(1_800_000_500)
+            )
+        );
+        vm.prank(admin);
+        registry.revokeAgentKey(AGENT, keyId, 1_800_000_499);
+        vm.expectRevert(
+            abi.encodeWithSelector(VeriLogRegistry.RevocationInPast.selector, uint64(0), uint64(1_800_000_500))
+        );
+        vm.prank(admin);
+        registry.revokeAgentKey(AGENT, keyId, 0);
+    }
+
+    // ----------------------------------------------------------- weak keys
+
+    /// Every encoding of a small-order point, and every non-canonical encoding,
+    /// is refused. With such a key (the identity, say), R = identity, S = 0 is a
+    /// valid signature of every message.
+    function test_RegisterRejectsWeakPubkeys() public {
+        bytes32[11] memory weak = [
+            bytes32(0x0100000000000000000000000000000000000000000000000000000000000000),
+            0xecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f,
+            0x0000000000000000000000000000000000000000000000000000000000000080,
+            0x26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05,
+            0x26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85,
+            0xc7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a,
+            0xc7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa,
+            0x0100000000000000000000000000000000000000000000000000000000000080, // identity, x sign set
+            0xecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff, // order 2, x sign set
+            0xeeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f, // y = p + 1 (identity)
+            0xedffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff // y = p (order 4), x sign set
+        ];
+        vm.startPrank(admin);
+        for (uint256 i = 0; i < weak.length; i++) {
+            assertTrue(registry.isWeakPubkey(weak[i]));
+            vm.expectRevert(abi.encodeWithSelector(VeriLogRegistry.WeakPubkey.selector, weak[i]));
+            registry.registerAgentKey(AGENT, weak[i]);
+        }
+        vm.stopPrank();
+        // The all-zero encoding (an order-4 point) keeps its own error.
+        assertTrue(registry.isWeakPubkey(bytes32(0)));
+    }
+
+    /// Every y in [p, 2^255) is refused, with either sign bit.
+    function testFuzz_NonCanonicalYRejected(uint8 low, bool sign) public view {
+        uint8 b0 = uint8(bound(low, 0xed, 0xff));
+        bytes32 enc = bytes32((uint256(b0) << 248) | (((uint256(1) << 240) - 1) << 8) | (sign ? 0xff : 0x7f));
+        assertTrue(registry.isWeakPubkey(enc));
+    }
+
+    /// The test key and the Go-generated signed vectors' key are ordinary keys.
+    function test_OrdinaryKeysAreNotWeak() public view {
+        string memory json = vm.readFile(string.concat(vm.projectRoot(), "/../testdata/signed_vectors.json"));
+        assertFalse(registry.isWeakPubkey(json.readBytes32(".public_key")));
+        assertFalse(registry.isWeakPubkey(PUBKEY));
+        // y = p - 1 is the order-2 point; y = p - 2 is not small order.
+        assertFalse(registry.isWeakPubkey(0xebffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f));
     }
 
     function test_AnchorerCannotRegisterOrRevokeKeys() public {
@@ -138,7 +219,7 @@ contract VeriLogRegistryTest is Test {
             abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, anchorer, role)
         );
         vm.prank(anchorer);
-        registry.revokeAgentKey(AGENT, keyId);
+        registry.revokeAgentKey(AGENT, keyId, uint64(block.timestamp));
     }
 
     function test_StrangerCannotRegisterKeys() public {
@@ -199,7 +280,7 @@ contract VeriLogRegistryTest is Test {
         vm.expectRevert(abi.encodeWithSelector(VeriLogRegistry.KeyExists.selector, AGENT, keyId));
         registry.registerAgentKey(AGENT, PUBKEY);
         // A revoked key cannot be registered again.
-        registry.revokeAgentKey(AGENT, keyId);
+        registry.revokeAgentKey(AGENT, keyId, uint64(block.timestamp));
         vm.expectRevert(abi.encodeWithSelector(VeriLogRegistry.KeyExists.selector, AGENT, keyId));
         registry.registerAgentKey(AGENT, PUBKEY);
         vm.stopPrank();
@@ -209,11 +290,12 @@ contract VeriLogRegistryTest is Test {
         bytes32 unknown = keccak256("nope");
         vm.startPrank(admin);
         vm.expectRevert(abi.encodeWithSelector(VeriLogRegistry.UnknownKey.selector, AGENT, unknown));
-        registry.revokeAgentKey(AGENT, unknown);
+        registry.revokeAgentKey(AGENT, unknown, uint64(block.timestamp));
         bytes32 keyId = registry.registerAgentKey(AGENT, PUBKEY);
-        registry.revokeAgentKey(AGENT, keyId);
+        registry.revokeAgentKey(AGENT, keyId, uint64(block.timestamp) + 60);
+        // A scheduled revocation cannot be moved (earlier or later) either.
         vm.expectRevert(abi.encodeWithSelector(VeriLogRegistry.KeyAlreadyRevoked.selector, AGENT, keyId));
-        registry.revokeAgentKey(AGENT, keyId);
+        registry.revokeAgentKey(AGENT, keyId, uint64(block.timestamp));
         vm.stopPrank();
     }
 
@@ -229,7 +311,7 @@ contract VeriLogRegistryTest is Test {
     }
 
     function testFuzz_KeyIdIsKeccakOfPubkey(bytes32 agent, bytes32 pubkey, uint64 ts) public {
-        vm.assume(agent != bytes32(0) && pubkey != bytes32(0) && ts != 0);
+        vm.assume(agent != bytes32(0) && !registry.isWeakPubkey(pubkey) && ts != 0);
         vm.warp(ts);
         vm.prank(admin);
         bytes32 keyId = registry.registerAgentKey(agent, pubkey);

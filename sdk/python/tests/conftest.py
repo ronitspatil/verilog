@@ -47,6 +47,15 @@ def check_chains(events, public_key: bytes):
     return runs
 
 
+def content_digest_of(ev) -> bytes:
+    """SHA-256 of the canonical event, as verilogd puts it in an Ack."""
+    return hashlib.sha256(event_text(
+        agent_id=ev.agent_id, run_id=ev.run_id, step_number=ev.step_number, prev_hash=ev.prev_hash,
+        event_type=ev.event_type, payload_text=ev.payload_json,
+        timestamp_ns=ev.timestamp_utc.ToNanoseconds(), key_id=ev.key_id, sig=ev.signature,
+    ).encode("utf-8")).digest()
+
+
 class FakeDaemon(verilog_pb2_grpc.VeriLogServicer):
     """In-process stand-in for verilogd's IngestStream.
 
@@ -59,10 +68,14 @@ class FakeDaemon(verilog_pb2_grpc.VeriLogServicer):
     registered" rejection for this many seconds after the first event (a key
     registered moments ago, not yet visible to the daemon).
     ``max_payload``: reject larger payload_json like verilogd's --max-payload-bytes.
+    ``bad_digests``: on each of the first this many streams, answer the first
+    accepted event with a wrong ``content_digest`` (an impersonated or buggy
+    daemon); it is not recorded as accepted.
     ``accepted`` holds the events acknowledged as accepted, in order.
     """
 
-    def __init__(self, fail_after=None, reject_types=(), gate=None, unregistered_for=None, max_payload=None):
+    def __init__(self, fail_after=None, reject_types=(), gate=None, unregistered_for=None, max_payload=None,
+                 bad_digests=0):
         self.events = []
         self.accepted = []
         self.streams = 0
@@ -72,6 +85,7 @@ class FakeDaemon(verilog_pb2_grpc.VeriLogServicer):
         self.unregistered_for = unregistered_for
         self.max_payload = max_payload
         self.first_seen = None
+        self.bad_digests = bad_digests
         self.lock = threading.Lock()
 
     def IngestStream(self, request_iterator, context):
@@ -81,6 +95,7 @@ class FakeDaemon(verilog_pb2_grpc.VeriLogServicer):
         if self.gate is not None:
             self.gate.wait(30)
         acked = 0
+        forge_next = stream_no <= self.bad_digests
         for ev in request_iterator:
             with self.lock:
                 self.events.append(ev)
@@ -99,9 +114,14 @@ class FakeDaemon(verilog_pb2_grpc.VeriLogServicer):
             elif ev.event_type in self.reject_types:
                 yield verilog_pb2.Ack(sequence=ev.sequence, accepted=False, error="rejected by test")
             else:
-                with self.lock:
-                    self.accepted.append(ev)
-                yield verilog_pb2.Ack(sequence=ev.sequence, accepted=True)
+                forged, forge_next = forge_next, False
+                if not forged:
+                    with self.lock:
+                        self.accepted.append(ev)
+                digest = content_digest_of(ev)
+                if forged:
+                    digest = bytes(32)
+                yield verilog_pb2.Ack(sequence=ev.sequence, accepted=True, content_digest=digest)
 
 
 @pytest.fixture

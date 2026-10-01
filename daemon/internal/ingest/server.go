@@ -6,6 +6,12 @@
 // signature does not verify. This check keeps garbage out of the log; the
 // verifier, not the daemon, is what an auditor trusts.
 //
+// Callers are authorized from their mTLS client certificate (package authz)
+// before any other work: an agent certificate may ingest and read proofs of
+// its own agent_id only, an auditor certificate may read every proof and
+// ingest nothing. No key registry lookup happens for an event its caller may
+// not submit.
+//
 // IngestStream is pipelined: a receive loop validates, canonicalizes and
 // hashes each event and submits it to the engine without waiting for it to be
 // durable, while a send loop resolves the submissions in order and writes one
@@ -21,11 +27,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	verilogv1 "github.com/ronitspatil/verilog/daemon/gen/verilog/v1"
+	"github.com/ronitspatil/verilog/daemon/internal/authz"
 	"github.com/ronitspatil/verilog/daemon/internal/canonical"
 	"github.com/ronitspatil/verilog/daemon/internal/engine"
 	"github.com/ronitspatil/verilog/daemon/internal/keys"
@@ -42,6 +50,8 @@ type Server struct {
 	maxPayloadBytes int
 	window          int
 	keys            keys.Source
+	authz           authz.Policy
+	idleTimeout     time.Duration
 }
 
 // Options configures a Server.
@@ -49,6 +59,12 @@ type Options struct {
 	MaxPayloadBytes int         // reject events whose payload_json is larger
 	Window          int         // max in-flight (unacked) events per stream
 	Keys            keys.Source // on-chain agent keys (usually a keys.Cache); required
+	// Authz decides what each caller may do. The zero Policy authorizes every
+	// caller (plaintext dev mode); set Required with mutual TLS.
+	Authz authz.Policy
+	// IdleTimeout closes an ingest stream that sends no event for this long
+	// (0: never). The client reconnects when it has events again.
+	IdleTimeout time.Duration
 }
 
 // MaxRecvMsgSize is the gRPC receive limit for a payload cap of maxPayload
@@ -71,7 +87,8 @@ func NewServer(eng *engine.Engine, st *store.Store, opts Options, logger *slog.L
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Server{eng: eng, store: st, log: logger, maxPayloadBytes: opts.MaxPayloadBytes, window: opts.Window, keys: opts.Keys}
+	return &Server{eng: eng, store: st, log: logger, maxPayloadBytes: opts.MaxPayloadBytes, window: opts.Window, keys: opts.Keys,
+		authz: opts.Authz, idleTimeout: opts.IdleTimeout}
 }
 
 type inflight struct {
@@ -84,6 +101,11 @@ type inflight struct {
 // IngestStream receives events and answers each with an Ack, in order.
 func (s *Server) IngestStream(stream verilogv1.VeriLog_IngestStreamServer) error {
 	ctx := stream.Context()
+	caller, authenticated, err := s.authz.CanIngest(ctx)
+	if err != nil {
+		s.log.Warn("ingest: stream refused", "err", err)
+		return err
+	}
 	queue := make(chan inflight, s.window)
 	sendErr := make(chan error, 1)
 
@@ -108,7 +130,9 @@ func (s *Server) IngestStream(stream verilogv1.VeriLog_IngestStreamServer) error
 		}
 	}()
 
-	recvErr := s.receive(ctx, stream, queue, sendErr)
+	recvErr := s.receive(ctx, stream, queue, sendErr, func(agentID string) string {
+		return authz.IngestAgent(caller, authenticated, agentID)
+	})
 	close(queue)
 	if err := <-sendErr; err != nil && recvErr == nil {
 		recvErr = err
@@ -119,14 +143,48 @@ func (s *Server) IngestStream(stream verilogv1.VeriLog_IngestStreamServer) error
 	return recvErr
 }
 
-func (s *Server) receive(ctx context.Context, stream verilogv1.VeriLog_IngestStreamServer, queue chan<- inflight, sendErr <-chan error) error {
+func (s *Server) receive(ctx context.Context, stream verilogv1.VeriLog_IngestStreamServer, queue chan<- inflight,
+	sendErr <-chan error, deny func(agentID string) string) error {
+	msgs := s.recvLoop(ctx, stream)
+	var idle <-chan time.Time
+	var timer *time.Timer
+	if s.idleTimeout > 0 {
+		timer = time.NewTimer(s.idleTimeout)
+		defer timer.Stop()
+		idle = timer.C
+	}
 	for {
-		msg, err := stream.Recv()
-		if err == io.EOF {
+		var r recvResult
+		select {
+		case r = <-msgs:
+		case <-idle:
+			return status.Errorf(codes.DeadlineExceeded, "ingest stream idle for %s", s.idleTimeout)
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		if r.err == io.EOF {
 			return nil
 		}
-		if err != nil {
-			return err
+		if r.err != nil {
+			return r.err
+		}
+		if timer != nil {
+			timer.Reset(s.idleTimeout)
+		}
+		msg := r.msg
+		if reason := deny(msg.GetAgentId()); reason != "" {
+			// Not this caller's agent: refused before any key lookup.
+			select {
+			case queue <- inflight{seq: msg.GetSequence(), ack: reject(msg.GetSequence(), reason)}:
+				continue
+			case err := <-sendErr:
+				if err == nil {
+					err = io.ErrClosedPipe
+				}
+				return err
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		}
 		item, err := s.prepare(ctx, msg)
 		if err != nil {
@@ -150,6 +208,32 @@ func (s *Server) receive(ctx context.Context, stream verilogv1.VeriLog_IngestStr
 			return ctx.Err()
 		}
 	}
+}
+
+type recvResult struct {
+	msg *verilogv1.LogEvent
+	err error
+}
+
+// recvLoop receives on its own goroutine so that receive can time out an
+// idle stream. It ends with the stream: once the handler returns, gRPC
+// cancels the stream and Recv fails.
+func (s *Server) recvLoop(ctx context.Context, stream verilogv1.VeriLog_IngestStreamServer) <-chan recvResult {
+	out := make(chan recvResult)
+	go func() {
+		for {
+			msg, err := stream.Recv()
+			select {
+			case out <- recvResult{msg, err}:
+			case <-ctx.Done():
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	return out
 }
 
 func reject(seq uint64, msg string) *verilogv1.Ack {
@@ -280,7 +364,10 @@ func (s *Server) resultAck(item inflight, res engine.Result) *verilogv1.Ack {
 }
 
 // GetProof returns an inclusion proof from an anchored epoch's evidence bundle.
-func (s *Server) GetProof(_ context.Context, req *verilogv1.GetProofRequest) (*verilogv1.GetProofResponse, error) {
+func (s *Server) GetProof(ctx context.Context, req *verilogv1.GetProofRequest) (*verilogv1.GetProofResponse, error) {
+	if err := s.authz.CanReadProof(ctx, req.GetAgentId()); err != nil {
+		return nil, err
+	}
 	if req.GetAgentId() == "" || req.GetEpochId() == 0 {
 		return nil, status.Error(codes.InvalidArgument, "agent_id and epoch_id (>= 1) are required")
 	}

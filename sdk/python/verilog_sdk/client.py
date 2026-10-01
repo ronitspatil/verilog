@@ -37,9 +37,19 @@ Nothing that is chained may later go missing, since a gap fails the run:
   own run ``<run_id>#late-<n>`` followed by a ``run_end`` with status
   ``"late"`` and ``"late_for_run": <run_id>``, so it is still signed and
   anchored (``stats().late_events``).
+* Acks the daemon did not compute. An accepting ack must carry the content
+  digest of the event as the SDK computed it. One that does not (a buggy or
+  impersonated daemon, a tampering proxy) is logged at ERROR, counted in
+  ``stats().ack_mismatches``, and the event is treated as unacknowledged and
+  sent again.
 * Runs that never end. At most ``max_open_runs`` runs are kept open; beyond
   that the least recently used run is closed with ``run_end`` status
   ``"evicted"`` (``stats().evicted_runs``) and later events of it are late.
+
+Transport security: the client connects with TLS by default and presents the
+agent's client certificate (``tls_cert``/``tls_key``, with the URI SAN
+``verilog://agent/<agent_id>``), since verilogd requires mutual TLS. Plaintext
+needs an explicit ``insecure=True`` and is for local development only.
 """
 
 from __future__ import annotations
@@ -79,6 +89,42 @@ _MAX_TIMESTAMP_NS = 253_402_300_799_999_999_999
 
 # Longest run_id the daemon accepts, in UTF-8 bytes.
 _MAX_RUN_ID_BYTES = 256
+
+
+def _read(path: str, what: str) -> bytes:
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError as err:
+        raise ValueError(f"cannot read {what} {path!r}: {err}") from err
+
+
+def _channel_credentials(
+    credentials: Optional[grpc.ChannelCredentials],
+    tls_ca: Optional[str],
+    tls_cert: Optional[str],
+    tls_key: Optional[str],
+    insecure: bool,
+    target: str,
+) -> Optional[grpc.ChannelCredentials]:
+    """The channel credentials, or None for an (explicitly) insecure channel."""
+    if insecure:
+        if credentials is not None or tls_ca or tls_cert or tls_key:
+            raise ValueError("insecure=True cannot be combined with credentials or tls_ca/tls_cert/tls_key")
+        log.warning("verilog_sdk: insecure=True: connecting to %s over PLAINTEXT, without TLS; events can be read "
+                    "and acknowledgements forged by anyone on the network path. Development only.", target)
+        return None
+    if credentials is not None:
+        if tls_ca or tls_cert or tls_key:
+            raise ValueError("pass either credentials or tls_ca/tls_cert/tls_key, not both")
+        return credentials
+    if bool(tls_cert) != bool(tls_key):
+        raise ValueError("tls_cert and tls_key must be given together")
+    return grpc.ssl_channel_credentials(
+        root_certificates=_read(tls_ca, "tls_ca") if tls_ca else None,
+        private_key=_read(tls_key, "tls_key") if tls_key else None,
+        certificate_chain=_read(tls_cert, "tls_cert") if tls_cert else None,
+    )
 
 
 class _EndedFilter:
@@ -144,6 +190,7 @@ class ClientStats:
     truncated: int = 0  # oversized payloads replaced by a signed hash-and-size stand-in
     late_events: int = 0  # events after their run's run_end, chained as their own late run
     evicted_runs: int = 0  # open runs closed with run_end "evicted" (max_open_runs)
+    ack_mismatches: int = 0  # accepting acks whose content_digest is not the event's; the event is re-sent
 
 
 @dataclass
@@ -189,7 +236,14 @@ class VeriLogClient:
         block_timeout: seconds ``submit`` may wait under ``OverflowPolicy.BLOCK``.
         max_in_flight: maximum sent-but-unacknowledged events.
         backoff_initial / backoff_max: reconnect delay bounds in seconds.
-        credentials: optional ``grpc.ChannelCredentials`` (TLS); insecure if None.
+        credentials: ``grpc.ChannelCredentials`` to use as is, e.g. from
+            ``grpc.ssl_channel_credentials``; overrides the ``tls_*`` paths.
+        tls_ca: PEM file of the CA that issued the daemon's certificate
+            (the system roots if omitted).
+        tls_cert / tls_key: PEM files of the agent's client certificate and
+            key, for the daemon's mutual TLS.
+        insecure: connect over plaintext, with no TLS at all. Development
+            only; logs a warning. Cannot be combined with the TLS options.
         channel_options: extra gRPC channel options.
         max_payload_bytes: the daemon's ``--max-payload-bytes``; larger payloads
             are replaced by a signed hash-and-size stand-in before chaining.
@@ -217,6 +271,10 @@ class VeriLogClient:
         backoff_initial: float = 0.2,
         backoff_max: float = 10.0,
         credentials: Optional[grpc.ChannelCredentials] = None,
+        tls_ca: Optional[str] = None,
+        tls_cert: Optional[str] = None,
+        tls_key: Optional[str] = None,
+        insecure: bool = False,
         channel_options: Optional[list] = None,
         max_payload_bytes: int = 1 << 20,
         on_oversize: Optional[Callable[[str, str, str, str, str], None]] = None,
@@ -241,7 +299,7 @@ class VeriLogClient:
         self._max_in_flight = max_in_flight
         self._backoff_initial = backoff_initial
         self._backoff_max = backoff_max
-        self._credentials = credentials
+        self._credentials = _channel_credentials(credentials, tls_ca, tls_cert, tls_key, insecure, target)
         self._channel_options = list(channel_options or []) + [
             ("grpc.keepalive_time_ms", 30_000),
             ("grpc.keepalive_timeout_ms", 10_000),
@@ -413,9 +471,9 @@ class VeriLogClient:
         return False
 
     def _channel(self) -> grpc.Channel:
-        if self._credentials is not None:
-            return grpc.secure_channel(self._target, self._credentials, options=self._channel_options)
-        return grpc.insecure_channel(self._target, options=self._channel_options)
+        if self._credentials is None:  # insecure=True
+            return grpc.insecure_channel(self._target, options=self._channel_options)
+        return grpc.secure_channel(self._target, self._credentials, options=self._channel_options)
 
     def _run(self) -> None:
         attempt = 0
@@ -432,7 +490,10 @@ class VeriLogClient:
                     self._call = call
                 for ack in call:
                     got_ack = True
-                    self._on_ack(ack)
+                    if not self._on_ack(ack):
+                        got_ack = False  # back off as after a failure
+                        call.cancel()
+                        break
             except grpc.RpcError as err:
                 code = err.code() if hasattr(err, "code") else None
                 if code != grpc.StatusCode.CANCELLED or not self._stopped:
@@ -639,9 +700,23 @@ class VeriLogClient:
             sequence=item.seq,
         )
 
-    def _on_ack(self, ack: verilog_pb2.Ack) -> None:
+    def _on_ack(self, ack: verilog_pb2.Ack) -> bool:
+        """Apply one ack. False if the stream must be dropped (ack mismatch)."""
         with self._cond:
             item = self._in_flight.pop(ack.sequence, None)
+            if ack.accepted and item is not None and ack.content_digest != item.digest:
+                # Not an ack for the event we sent: never take it as delivered.
+                # The stream cannot be trusted either: put the event back at the
+                # head of the unacknowledged events and reconnect (with backoff),
+                # which re-sends them all in order.
+                self._stats.ack_mismatches += 1
+                self._in_flight[item.seq] = item
+                self._in_flight.move_to_end(item.seq, last=False)
+                log.error("verilog_sdk: daemon acknowledged event %d (%s, run %s, step %s) with content digest %s, "
+                          "but the event's digest is %s; treating it as unacknowledged, reconnecting and sending "
+                          "it again", ack.sequence, item.event_type, item.run_id, item.step_number,
+                          ack.content_digest.hex() or "(none)", item.digest.hex())
+                return False
             if ack.accepted:
                 self._stats.acked += 1
                 self._retry_attempt = 0
@@ -665,6 +740,7 @@ class VeriLogClient:
                           "has a gap and will not verify: %s", ack.sequence, item.event_type if item else "?",
                           item.run_id if item else "?", item.step_number if item else "?", ack.error)
             self._cond.notify_all()
+        return True
 
     def _retry_window_open(self, item: _Item) -> bool:
         now = time.monotonic()

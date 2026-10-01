@@ -13,7 +13,7 @@ anchorer key but not the agent's signing key.
       writes an evidence bundle and prints "<merkle root> <event count>" for
       the caller to anchor with cast.
 
-  replay --bundle FILE --target HOST:PORT
+  replay --bundle FILE --target HOST:PORT --tls-ca CA --tls-cert CERT --tls-key KEY
       Sends every event of a bundle to a daemon again, byte for byte (what
       anyone who can reach the ingest port can do). Prints accepted/rejected.
 """
@@ -132,7 +132,11 @@ def replay(args) -> int:
             prev_hash=bytes.fromhex(ev["prev_hash"][2:]), event_type=ev["event_type"],
             payload_json=canonical_json(ev["payload"]), timestamp_utc=ts,
             key_id=bytes.fromhex(ev["key_id"][2:]), signature=bytes.fromhex(ev["sig"][2:]), sequence=i + 1))
-    with grpc.insecure_channel(args.target) as ch:
+    creds = grpc.ssl_channel_credentials(
+        root_certificates=pathlib.Path(args.tls_ca).read_bytes(),
+        private_key=pathlib.Path(args.tls_key).read_bytes(),
+        certificate_chain=pathlib.Path(args.tls_cert).read_bytes())
+    with grpc.secure_channel(args.target, creds) as ch:
         acks = list(verilog_pb2_grpc.VeriLogStub(ch).IngestStream(iter(msgs), timeout=30))
     accepted = sum(a.accepted for a in acks)
     print(f"accepted={accepted} rejected={len(acks) - accepted}")
@@ -158,6 +162,9 @@ def main() -> int:
     p = sub.add_parser("replay")
     p.add_argument("--bundle", required=True)
     p.add_argument("--target", required=True)
+    p.add_argument("--tls-ca", required=True)
+    p.add_argument("--tls-cert", required=True, help="client certificate of the bundle's agent")
+    p.add_argument("--tls-key", required=True)
     args = ap.parse_args()
     return {"resign": resign, "bundle": bundle, "replay": replay}[args.cmd](args)
 

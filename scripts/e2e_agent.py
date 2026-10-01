@@ -11,10 +11,12 @@ compromised daemon instead, which writes the signed canonical events to FILE
 --big-output N makes the tool of the first run return N bytes (an oversized
 tool output). --open-run ID also records two events of run ID that never
 ends (an agent crash). --key-wait S bounds how long events rejected as "key
-not registered" are retried.
+not registered" are retried. --tls-ca/--tls-cert/--tls-key are the daemon's
+CA and the agent's client certificate for mutual TLS.
 """
 
 import argparse
+import hashlib
 import json
 import sys
 import threading
@@ -47,7 +49,8 @@ class CaptureDaemon(verilog_pb2_grpc.VeriLogServicer):
             with self.lock:
                 self.lines.append({"run_id": ev.run_id, "step_number": ev.step_number,
                                    "event_type": ev.event_type, "canonical_event": text})
-            yield verilog_pb2.Ack(sequence=ev.sequence, accepted=True)
+            yield verilog_pb2.Ack(sequence=ev.sequence, accepted=True,
+                                  content_digest=hashlib.sha256(text.encode("utf-8")).digest())
 
 
 BIG_OUTPUT = 0
@@ -72,6 +75,9 @@ def main() -> int:
     ap.add_argument("--big-output", type=int, default=0)
     ap.add_argument("--open-run")
     ap.add_argument("--key-wait", type=float, default=60.0)
+    ap.add_argument("--tls-ca")
+    ap.add_argument("--tls-cert")
+    ap.add_argument("--tls-key")
     args = ap.parse_args()
     global BIG_OUTPUT
     BIG_OUTPUT = args.big_output
@@ -93,7 +99,11 @@ def main() -> int:
         server.start()
     elif not target:
         ap.error("--target or --capture is required")
-    client = VeriLogClient(target, key_wait_timeout=args.key_wait)
+    if capture is not None:
+        transport = {"insecure": True}  # the in-process capture server
+    else:
+        transport = {"tls_ca": args.tls_ca, "tls_cert": args.tls_cert, "tls_key": args.tls_key}
+    client = VeriLogClient(target, key_wait_timeout=args.key_wait, **transport)
     handler = VeriLogLangGraphCallback(args.agent_id, client=client)
     for i in range(args.runs):
         out = chain.invoke({"question": f"trip #{i}"}, config={"callbacks": [handler]})

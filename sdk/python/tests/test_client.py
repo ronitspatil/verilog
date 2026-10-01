@@ -15,7 +15,7 @@ PUB = Signer.from_hex(TEST_SEED_HEX).public_key
 
 
 def test_streams_events_in_order(fake_daemon):
-    client = VeriLogClient(fake_daemon.target)
+    client = VeriLogClient(fake_daemon.target, insecure=True)
     for i in range(200):
         assert client.submit("agent-a", "run-1", "tool_start", {"i": i, "b": [1, 2], "a": "x"})
     assert client.flush(timeout=10)
@@ -35,7 +35,7 @@ def test_streams_events_in_order(fake_daemon):
 
 
 def test_runs_are_independent_chains(fake_daemon):
-    client = VeriLogClient(fake_daemon.target)
+    client = VeriLogClient(fake_daemon.target, insecure=True)
     for i in range(30):
         client.submit("agent-a", f"run-{i % 3}", "t", {"i": i})
     client.submit("agent-b", "run-0", "t", {})  # same run id, other agent: its own chain
@@ -52,11 +52,11 @@ def test_runs_are_independent_chains(fake_daemon):
 def test_requires_a_signing_key(monkeypatch):
     monkeypatch.delenv("VERILOG_SIGNING_KEY")
     with pytest.raises(ValueError, match="no signing key"):
-        VeriLogClient(unused_target())
+        VeriLogClient(unused_target(), insecure=True)
 
 
 def test_submit_never_blocks_when_daemon_is_down():
-    client = VeriLogClient(unused_target(), queue_size=100, backoff_initial=0.05)
+    client = VeriLogClient(unused_target(), insecure=True, queue_size=100, backoff_initial=0.05)
     start = time.perf_counter()
     for i in range(10_000):
         client.submit("agent-a", "run-1", "llm_start", {"i": i})
@@ -70,7 +70,7 @@ def test_submit_never_blocks_when_daemon_is_down():
 
 
 def test_drop_oldest_keeps_newest():
-    client = VeriLogClient(unused_target(), queue_size=3, max_in_flight=1)
+    client = VeriLogClient(unused_target(), insecure=True, queue_size=3, max_in_flight=1)
     time.sleep(0.05)
     for i in range(10):
         client.submit("a", "r", "t", {"i": i})
@@ -86,7 +86,7 @@ def test_drop_oldest_keeps_newest():
 def test_overflow_drops_are_reported_in_a_contiguous_chain(fake_daemon):
     """Drops never leave a gap: the chain stays contiguous and carries a signed
     sdk_dropped event with the number of lost events."""
-    client = VeriLogClient(fake_daemon.target, queue_size=5, max_in_flight=1)
+    client = VeriLogClient(fake_daemon.target, insecure=True, queue_size=5, max_in_flight=1)
     for i in range(50):
         client.submit("agent-a", "run-1", "tool_start", {"i": i})
     client.submit("agent-a", "run-1", "run_end", {"status": "ok"})
@@ -109,7 +109,7 @@ def test_overflow_drops_are_reported_in_a_contiguous_chain(fake_daemon):
 
 def test_block_policy_times_out_and_drops_new_event():
     client = VeriLogClient(
-        unused_target(), queue_size=1, max_in_flight=1,
+        unused_target(), insecure=True, queue_size=1, max_in_flight=1,
         overflow_policy=OverflowPolicy.BLOCK, block_timeout=0.05,
     )
     results = [client.submit("a", "r", "t", {}) for i in range(5)]
@@ -124,7 +124,7 @@ def test_block_policy_times_out_and_drops_new_event():
 
 @pytest.mark.parametrize("fake_daemon", [{"fail_after": 5}], indirect=True)
 def test_reconnects_and_resends_unacked(fake_daemon):
-    client = VeriLogClient(fake_daemon.target, backoff_initial=0.05)
+    client = VeriLogClient(fake_daemon.target, insecure=True, backoff_initial=0.05)
     for i in range(50):
         client.submit("agent-a", "run-1", "chain_start", {"i": i})
     assert client.flush(timeout=15)
@@ -146,7 +146,7 @@ def test_reconnects_and_resends_unacked(fake_daemon):
 
 @pytest.mark.parametrize("fake_daemon", [{"reject_types": {"bad"}}], indirect=True)
 def test_rejections_are_counted_not_raised(fake_daemon):
-    client = VeriLogClient(fake_daemon.target)
+    client = VeriLogClient(fake_daemon.target, insecure=True)
     client.submit("a", "r", "bad", {})
     client.submit("a", "r", "good", {})
     assert client.flush(timeout=10)
@@ -156,7 +156,7 @@ def test_rejections_are_counted_not_raised(fake_daemon):
 
 
 def test_unserializable_payload_is_reported_without_raising(fake_daemon):
-    client = VeriLogClient(fake_daemon.target)
+    client = VeriLogClient(fake_daemon.target, insecure=True)
     assert client.submit("a", "r", "t", {"obj": object()}) is True  # serialized later, off-thread
     client.submit("a", "r", "t", {"ok": True})
     assert client.flush(timeout=10)
@@ -172,7 +172,7 @@ def test_unserializable_payload_is_reported_without_raising(fake_daemon):
 def test_events_after_run_end_become_late_runs(fake_daemon):
     """L5: a late event is never dropped silently and never extends the ended
     run: it is signed as its own run, closed by a run_end naming the original."""
-    client = VeriLogClient(fake_daemon.target)
+    client = VeriLogClient(fake_daemon.target, insecure=True)
     client.submit("a", "r", "t", {})
     client.submit("a", "r", "run_end", {"status": "ok"})
     client.submit("a", "r", "late", {"x": 1})
@@ -194,7 +194,7 @@ def test_late_event_after_ended_run_memory_is_not_a_fork(fake_daemon, monkeypatc
     """L5: after many runs have ended, a late event still does not restart its
     run at step 1 (which the verifier would report as a fork)."""
     monkeypatch.setattr(client_mod, "_ENDED_RUNS_MEMORY", 3)
-    client = VeriLogClient(fake_daemon.target)
+    client = VeriLogClient(fake_daemon.target, insecure=True)
     for i in range(10):
         client.submit("a", f"r{i}", "t", {})
         client.submit("a", f"r{i}", "run_end", {"status": "ok"})
@@ -209,7 +209,7 @@ def test_late_event_after_ended_run_memory_is_not_a_fork(fake_daemon, monkeypatc
 
 def test_open_runs_are_bounded(fake_daemon):
     """L5: runs that never end are closed with run_end "evicted" beyond max_open_runs."""
-    client = VeriLogClient(fake_daemon.target, max_open_runs=2)
+    client = VeriLogClient(fake_daemon.target, insecure=True, max_open_runs=2)
     for i in range(4):
         client.submit("a", f"open-{i}", "t", {})
     assert client.flush(timeout=10)
@@ -230,7 +230,7 @@ def test_oversized_payload_is_replaced_by_signed_stand_in(fake_daemon):
     a stand-in committing to it by SHA-256 and size is chained instead, so
     the run stays verifiable."""
     kept = []
-    client = VeriLogClient(fake_daemon.target, on_oversize=lambda *a: kept.append(a))
+    client = VeriLogClient(fake_daemon.target, insecure=True, on_oversize=lambda *a: kept.append(a))
     big = {"output": "x" * ((1 << 20) + 10)}
     client.submit("agent", "run-1", "tool_start", {"i": 1})
     client.submit("agent", "run-1", "tool_end", big)
@@ -252,7 +252,7 @@ def test_oversized_payload_is_replaced_by_signed_stand_in(fake_daemon):
 def test_key_not_yet_visible_is_retried_in_order(fake_daemon):
     """H2: "not registered" rejections are retried with backoff, so an agent
     that starts right after its key registration has no gap."""
-    client = VeriLogClient(fake_daemon.target, key_wait_timeout=10)
+    client = VeriLogClient(fake_daemon.target, insecure=True, key_wait_timeout=10)
     for i in range(5):
         client.submit("a", "r", "t", {"i": i})
     client.submit("a", "r", "run_end", {"status": "ok"})
@@ -267,7 +267,7 @@ def test_key_not_yet_visible_is_retried_in_order(fake_daemon):
 
 @pytest.mark.parametrize("fake_daemon", [{"unregistered_for": 60}], indirect=True)
 def test_retry_window_is_bounded(fake_daemon, caplog):
-    client = VeriLogClient(fake_daemon.target, key_wait_timeout=0.5)
+    client = VeriLogClient(fake_daemon.target, insecure=True, key_wait_timeout=0.5)
     client.submit("a", "r", "t", {})
     assert client.flush(timeout=10)
     client.close()
@@ -278,7 +278,7 @@ def test_retry_window_is_bounded(fake_daemon, caplog):
 
 @pytest.mark.parametrize("fake_daemon", [{"reject_types": {"bad"}}], indirect=True)
 def test_rejected_chained_event_is_an_error_and_counted(fake_daemon, caplog):
-    client = VeriLogClient(fake_daemon.target)
+    client = VeriLogClient(fake_daemon.target, insecure=True)
     client.submit("a", "r", "bad", {})
     assert client.flush(timeout=10)
     client.close()
@@ -287,7 +287,7 @@ def test_rejected_chained_event_is_an_error_and_counted(fake_daemon, caplog):
 
 
 def test_far_future_timestamp_is_signed(fake_daemon):
-    client = VeriLogClient(fake_daemon.target)
+    client = VeriLogClient(fake_daemon.target, insecure=True)
     client.submit("a", "r", "t", {}, timestamp_ns=10**20)  # year 5138: valid
     assert client.flush(timeout=10)
     client.close()
@@ -299,7 +299,7 @@ def test_far_future_timestamp_is_signed(fake_daemon):
 def test_bad_timestamp_does_not_poison_the_sender(fake_daemon, ts):
     """L4: a caller timestamp the canonical form cannot carry is reported as
     a dropped event; later events still flow."""
-    client = VeriLogClient(fake_daemon.target)
+    client = VeriLogClient(fake_daemon.target, insecure=True)
     client.submit("a", "r", "t", {}, timestamp_ns=ts)
     client.submit("a", "r", "t", {"ok": True})
     assert client.flush(timeout=10)
@@ -311,6 +311,50 @@ def test_bad_timestamp_does_not_poison_the_sender(fake_daemon, ts):
 
 
 def test_submit_after_close_is_dropped(fake_daemon):
-    client = VeriLogClient(fake_daemon.target)
+    client = VeriLogClient(fake_daemon.target, insecure=True)
     client.close()
     assert client.submit("a", "r", "t", {}) is False
+
+
+@pytest.mark.parametrize("fake_daemon", [{"bad_digests": 2}], indirect=True)
+def test_ack_with_wrong_digest_is_not_accepted(fake_daemon, caplog):
+    client = VeriLogClient(fake_daemon.target, insecure=True, backoff_initial=0.05)
+    for i in range(5):
+        client.submit("agent-a", "run-1", "t", {"i": i})
+    assert client.flush(timeout=10)
+    client.close()
+    stats = client.stats()
+    assert stats.ack_mismatches == 2
+    assert stats.acked == 5 and stats.rejected == 0 and stats.chain_gaps == 0
+    assert stats.resent >= 2 and stats.reconnects >= 2
+    assert any(r.levelname == "ERROR" and "content digest" in r.getMessage() for r in caplog.records)
+    # Every event really reached the daemon, in chain order.
+    steps = [e.step_number for e in fake_daemon.accepted]
+    assert sorted(set(steps)) == [1, 2, 3, 4, 5]
+    check_chains(list({e.step_number: e for e in fake_daemon.accepted}.values()), PUB)
+
+
+def test_transport_security_defaults(tmp_path, caplog):
+    import grpc
+
+    # TLS by default; plaintext only on request, with a warning.
+    tls = VeriLogClient(unused_target())
+    tls.close(timeout=0.1)
+    assert tls._credentials is not None
+    with caplog.at_level("WARNING", logger="verilog_sdk"):
+        c = VeriLogClient(unused_target(), insecure=True)
+    c.close(timeout=0.1)
+    assert c._credentials is None
+    assert any("PLAINTEXT" in r.getMessage() for r in caplog.records)
+    creds = grpc.ssl_channel_credentials()
+    with pytest.raises(ValueError, match="cannot be combined"):
+        VeriLogClient(unused_target(), insecure=True, credentials=creds)
+    with pytest.raises(ValueError, match="cannot be combined"):
+        VeriLogClient(unused_target(), insecure=True, tls_ca="ca.pem")
+    with pytest.raises(ValueError, match="together"):
+        VeriLogClient(unused_target(), tls_cert="c.pem")
+    with pytest.raises(ValueError, match="cannot read tls_ca"):
+        VeriLogClient(unused_target(), tls_ca=str(tmp_path / "missing.pem"))
+    c = VeriLogClient(unused_target(), credentials=creds)
+    c.close(timeout=0.1)
+    assert c._credentials is creds

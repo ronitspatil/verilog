@@ -20,7 +20,8 @@ make tools                    # protoc-gen-go, protoc-gen-go-grpc, abigen
 make venv PYTHON=python3.12   # sdk/python/.venv with the SDK installed editable
 make build                    # bin/verilogd, bin/verilog-verify
 make test                     # go vet + go test -race, forge test, pytest
-make e2e                      # anvil → deploy → daemon → SDK → anchor → verify
+make e2e                      # anvil → deploy → daemon (mTLS) → SDK → anchor → verify
+make certs                    # DEV-ONLY mTLS certificates in dev-certs/ (gitignored)
 make bench                    # Merkle and ingestion benchmarks
 ```
 
@@ -71,18 +72,25 @@ VERILOG_ANCHORER=0xDaemonAddress forge script script/Deploy.s.sol --rpc-url "$RP
 
 # 3. Start the daemon. Its signer needs ANCHORER_ROLE (checked at startup).
 #    Production: the anchoring key lives in AWS KMS (see Anchoring key below).
+#    Mutual TLS is required; see Transport security below for the certificates.
 bin/verilogd --rpc "$RPC" --contract 0xRegistry --data-dir /var/lib/verilog \
              --signer aws-kms --kms-key-id alias/verilog-anchorer \
+             --tls-cert server.pem --tls-key server-key.pem --tls-client-ca clients-ca.pem \
              --epoch-interval 30s --epoch-max-logs 1000
 #    Development: a local key file (mode 0600) instead.
-bin/verilogd --rpc "$RPC" --contract 0xRegistry --private-key-file anchorer.hex
+bin/verilogd --rpc "$RPC" --contract 0xRegistry --private-key-file anchorer.hex --tls-cert … (or --insecure-plaintext)
 ```
 
 ```python
 # 4. Instrument the agent (on the agent host, with VERILOG_SIGNING_KEY_FILE set).
 from verilog_sdk import VeriLogLangGraphCallback
 
-handler = VeriLogLangGraphCallback(agent_id="support-bot", target="daemon.internal:50051")
+handler = VeriLogLangGraphCallback(
+    agent_id="support-bot", target="daemon.internal:50051",
+    tls_ca="/etc/verilog/server-ca.pem",         # CA of the daemon's server certificate
+    tls_cert="/etc/verilog/support-bot.pem",      # URI SAN verilog://agent/support-bot
+    tls_key="/etc/verilog/support-bot-key.pem",
+)
 graph.invoke(inputs, config={"callbacks": [handler]})
 handler.close()
 ```
@@ -94,7 +102,13 @@ Flags win over environment variables.
 | Flag | Env | Default | Purpose |
 |---|---|---|---|
 | `--listen` | `VERILOG_LISTEN` | `127.0.0.1:50051` | gRPC address |
-| `--tls-cert`, `--tls-key` | `VERILOG_TLS_CERT`, `VERILOG_TLS_KEY` | unset (plaintext) | server TLS |
+| `--tls-cert`, `--tls-key` | `VERILOG_TLS_CERT`, `VERILOG_TLS_KEY` | | server certificate and key |
+| `--tls-client-ca` | `VERILOG_TLS_CLIENT_CA` | | CA bundle for client certificates; turns on mutual TLS ([Transport security](#transport-security-mtls)) |
+| `--insecure-plaintext` | `VERILOG_INSECURE_PLAINTEXT` | `false` | **dev only**: no TLS, no authentication or authorization |
+| `--max-connections` | `VERILOG_MAX_CONNECTIONS` | `1024` | concurrent client connections (0: no limit) |
+| `--max-concurrent-streams` | `VERILOG_MAX_CONCURRENT_STREAMS` | `64` | concurrent RPCs per connection |
+| `--stream-idle-timeout` | `VERILOG_STREAM_IDLE_TIMEOUT` | `15m` | close an ingest stream that sends nothing for this long (0: never); the SDK reconnects |
+| `--keepalive-min-time`, `--keepalive-time`, `--keepalive-timeout` | | `10s`, `30s`, `10s` | reject client pings more often than this; ping idle connections; drop unanswered ones |
 | `--data-dir` | `VERILOG_DATA_DIR` | `./verilog-data` | WAL, checkpoint, evidence |
 | `--rpc` | `VERILOG_RPC_URL` | required | EVM JSON-RPC |
 | `--contract` | `VERILOG_CONTRACT` | required | registry address |
@@ -237,6 +251,69 @@ once. A record made for another chain, contract or signer address is renamed
 to `anchor-pending.json.stale` with a warning; an unreadable record stops the
 daemon until you inspect it.
 
+## Transport security (mTLS)
+
+verilogd authenticates and authorizes every connection with mutual TLS
+(TLS 1.3 only). It refuses to start without `--tls-cert`, `--tls-key` and
+`--tls-client-ca` unless given `--insecure-plaintext`, which is for local
+development only and logs a warning: in that mode anyone who can reach the
+port can read every agent's events and submit events for any agent.
+Server-only TLS is not offered, because without a client certificate there is
+no identity to authorize.
+
+**Identity.** A client certificate must chain to `--tls-client-ca` and carry
+exactly one URI SAN with the `verilog` scheme:
+
+| URI SAN | Who | IngestStream | GetProof |
+|---|---|---|---|
+| `verilog://agent/<agent_id>` | an agent | only events whose `agent_id` is `<agent_id>`; any other event is rejected per event (non-retryable) | only `<agent_id>`'s epochs |
+| `verilog://auditor/<name>` | a read-only auditor | refused (`PERMISSION_DENIED`) | every agent |
+
+`<agent_id>` is path-escaped (`team/bot 1` becomes `team%2Fbot%201`). A
+certificate without such a SAN, with two, or with another role is refused
+(`UNAUTHENTICATED`). Authorization comes first: the daemon does no on-chain
+key lookup and reads no evidence for a caller that is not allowed the
+`agent_id`.
+
+**Certificates.** Issue them from your own CA or PKI (for example a private
+intermediate used only for VeriLog, step-ca, Vault PKI or a cloud private
+CA). Use separate CAs, or at least separate intermediates, for the daemon's
+server certificate and for client certificates, so a server key cannot mint
+client identities. Keep client certificates short-lived (days to weeks) and
+issue each agent's on its own host, next to its signing key; the client
+certificate authorizes the connection, while the Ed25519 signing key is what
+the verifier trusts. `make certs` writes development-only certificates into
+`dev-certs/` (gitignored, a new throwaway CA each run).
+
+**Rotation with overlap.** To rotate the client CA, put the old and new CA
+certificates in the `--tls-client-ca` bundle and restart the daemon, reissue
+client certificates from the new CA, then drop the old CA once no client uses
+it. To rotate the server certificate, give clients a `tls_ca` bundle with
+both server CAs first, then switch the daemon. Renew client certificates well
+before they expire; a reconnecting SDK presents the files it was given, so
+restart agents (or point them at renewed files) as part of renewal. There is
+no revocation list: revoke by removing an identity's CA, or keep certificates
+short-lived.
+
+**Clients.**
+
+- SDK: TLS by default. `VeriLogClient(target, tls_ca=..., tls_cert=...,
+  tls_key=...)` (also accepted by the callback handlers), or
+  `credentials=grpc.ssl_channel_credentials(...)`. Plaintext needs
+  `insecure=True`, which logs a warning. The SDK checks every ack's
+  `content_digest` against the event it sent; a mismatch is logged at ERROR,
+  counted in `stats().ack_mismatches`, and the event is re-sent.
+- `verilog-verify export --daemon`: `--daemon-ca`, `--daemon-cert`,
+  `--daemon-key` (an auditor's certificate, or the agent's own);
+  `--daemon-insecure` for a dev daemon.
+
+**Limits.** `--max-connections` (a listener limit), `--max-concurrent-streams`,
+the keepalive flags and `--stream-idle-timeout` bound what one client can hold
+open ([Daemon configuration](#daemon-configuration)). The agent key cache is a
+bounded LRU (65,536 keys); concurrent lookups of one key share a single RPC;
+and lookups that find no key are limited per agent (a burst of 20, then one
+per second), beyond which the event is rejected as retryable without an RPC.
+
 ## Key management
 
 Each agent has its own Ed25519 key. The private key lives only in the agent
@@ -346,7 +423,9 @@ daemon host.
 ```sh
 # Export one event and its proof from an evidence bundle...
 bin/verilog-verify export --bundle /var/lib/verilog/evidence/<agentKey>/epoch-3.json --index 17 --out ./case-42
-#    ...or straight from the daemon: --daemon 127.0.0.1:50051 --agent-id support-bot --epoch 3 --index 17
+#    ...or straight from the daemon, with an auditor's (or the agent's) client certificate:
+#    --daemon daemon.internal:50051 --daemon-ca server-ca.pem --daemon-cert auditor.pem --daemon-key auditor-key.pem \
+#    --agent-id support-bot --epoch 3 --index 17
 
 # Single-event mode.
 bin/verilog-verify --event case-42/event.json --proof case-42/proof.json \

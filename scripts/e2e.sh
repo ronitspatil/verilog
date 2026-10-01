@@ -3,7 +3,8 @@
 # verilogd -> signed Python SDK events -> anchored epoch -> verilog-verify
 # SUCCESS / FAILURE / operational errors in single-event and run mode,
 # including a daemon restart and attacks by a compromised daemon host that
-# holds the anchorer key.
+# holds the anchorer key. The daemon runs with mutual TLS (dev certificates
+# from verilog-devcerts); scripts/e2e_mtls.py checks its authorization.
 #
 # Requires: go, forge, anvil, cast, and the SDK venv (make venv).
 set -euo pipefail
@@ -46,8 +47,21 @@ for tool in go forge anvil cast; do command -v "$tool" >/dev/null || fail "$tool
 [ -x "$PYTHON" ] || fail "Python venv not found at $PYTHON (run: make venv)"
 
 log "building Go binaries"
-(cd "$ROOT/daemon" && go build -o "$WORK/bin/" ./cmd/verilogd ./cmd/verilog-verify)
+(cd "$ROOT/daemon" && go build -o "$WORK/bin/" ./cmd/verilogd ./cmd/verilog-verify ./cmd/verilog-devcerts)
 VERIFY="$WORK/bin/verilog-verify"
+
+# DEV ONLY certificates: a throwaway CA, the daemon's server certificate, the
+# agent's client certificate (URI SAN verilog://agent/e2e-agent), a second
+# agent's and an auditor's.
+OTHER_AGENT="other-agent"
+AUDITOR="e2e-auditor"
+CERTS="$WORK/certs"
+log "issuing DEV-ONLY mTLS certificates"
+"$WORK/bin/verilog-devcerts" --out "$CERTS" --agent "$AGENT_ID" --agent "$OTHER_AGENT" --auditor "$AUDITOR" \
+  || fail "verilog-devcerts failed"
+DAEMON_TLS=(--tls-cert "$CERTS/server.pem" --tls-key "$CERTS/server-key.pem" --tls-client-ca "$CERTS/ca.pem")
+AGENT_TLS=(--tls-ca "$CERTS/ca.pem" --tls-cert "$CERTS/agent-$AGENT_ID.pem" --tls-key "$CERTS/agent-$AGENT_ID-key.pem")
+AUDITOR_TLS=(--daemon-ca "$CERTS/ca.pem" --daemon-cert "$CERTS/auditor-$AUDITOR.pem" --daemon-key "$CERTS/auditor-$AUDITOR-key.pem")
 
 log "starting anvil on :$ANVIL_PORT"
 anvil --port "$ANVIL_PORT" --silent >"$WORK/anvil.log" 2>&1 &
@@ -129,7 +143,7 @@ register_key "$WORK/agent.key"
 
 start_daemon() {
   VERILOG_PRIVATE_KEY="$ANCHOR_KEY" "$WORK/bin/verilogd" \
-    --listen "$TARGET" --rpc "$RPC" --contract "$CONTRACT" --data-dir "$DATA" \
+    --listen "$TARGET" --rpc "$RPC" --contract "$CONTRACT" --data-dir "$DATA" "${DAEMON_TLS[@]}" \
     --epoch-interval 2s --epoch-max-logs 1000 --confirm-timeout 30s --retry-initial 200ms \
     >>"$WORK/daemon.log" 2>&1 &
   DAEMON_PID=$!
@@ -188,9 +202,17 @@ INCOMPLETE="[SUCCESS-INCOMPLETE] Log Integrity Verified, Run Incomplete"
 log "starting verilogd"
 start_daemon
 
+log "a daemon with neither TLS nor --insecure-plaintext is refused"
+if VERILOG_PRIVATE_KEY="$ANCHOR_KEY" "$WORK/bin/verilogd" --listen 127.0.0.1:0 --rpc "$RPC" --contract "$CONTRACT" \
+    --data-dir "$WORK/unused" >"$WORK/notls.log" 2>&1; then
+  fail "daemon started without transport security"
+fi
+grep -q "no transport security" "$WORK/notls.log" || { cat "$WORK/notls.log"; fail "unexpected no-TLS error"; }
+echo "refused: $(tail -n 1 "$WORK/notls.log" | cut -c1-120)"
+
 log "a second daemon on the same data dir is refused"
 if VERILOG_PRIVATE_KEY="$ANCHOR_KEY" "$WORK/bin/verilogd" --listen 127.0.0.1:0 --rpc "$RPC" --contract "$CONTRACT" \
-    --data-dir "$DATA" >"$WORK/second.log" 2>&1; then
+    --data-dir "$DATA" "${DAEMON_TLS[@]}" >"$WORK/second.log" 2>&1; then
   fail "second daemon started on a locked data dir"
 fi
 grep -q "in use by another verilogd" "$WORK/second.log" || { cat "$WORK/second.log"; fail "unexpected second-daemon error"; }
@@ -198,7 +220,7 @@ echo "refused: $(tail -n 1 "$WORK/second.log")"
 
 log "an agent signing with an unregistered key is rejected by the daemon (after a bounded retry)"
 keygen "$WORK/rogue.key" >/dev/null
-if VERILOG_SIGNING_KEY_FILE="$WORK/rogue.key" "$PYTHON" "$ROOT/scripts/e2e_agent.py" --target "$TARGET" \
+if VERILOG_SIGNING_KEY_FILE="$WORK/rogue.key" "$PYTHON" "$ROOT/scripts/e2e_agent.py" --target "$TARGET" "${AGENT_TLS[@]}" \
     --agent-id "$AGENT_ID" --runs 1 --key-wait 2 >/dev/null 2>"$WORK/rogue.log"; then
   fail "events signed with an unregistered key were accepted"
 fi
@@ -210,7 +232,7 @@ echo "rejected: $(grep -o 'acked=0 rejected=[0-9]*' "$WORK/rogue.log")"
 export VERILOG_SIGNING_KEY_FILE="$WORK/agent.key"
 CRASHED_RUN="crashed-run-1"
 log "running the LangChain agent through the Python SDK (plus a run that never ends)"
-ACKED="$("$PYTHON" "$ROOT/scripts/e2e_agent.py" --target "$TARGET" --agent-id "$AGENT_ID" --runs 3 --open-run "$CRASHED_RUN")" \
+ACKED="$("$PYTHON" "$ROOT/scripts/e2e_agent.py" --target "$TARGET" "${AGENT_TLS[@]}" --agent-id "$AGENT_ID" --runs 3 --open-run "$CRASHED_RUN")" \
   || fail "agent run failed"
 echo "events acknowledged: $ACKED"
 [ "$ACKED" -gt 0 ] || fail "no events acknowledged"
@@ -231,9 +253,21 @@ log "export from bundle + verify untouched event (expect SUCCESS)"
 expect_verify 0 "$SUCCESS" --event "$WORK/ev/event.json" --proof "$WORK/ev/proof.json" "${COMMON[@]}"
 expect_stderr "signing key:    valid at anchor time"
 
-log "export via daemon GetProof + verify (expect SUCCESS)"
-"$VERIFY" export --daemon "$TARGET" --agent-id "$AGENT_ID" --epoch 1 --index 0 --out "$WORK/ev0" 2>/dev/null
+log "export via daemon GetProof as the auditor (mTLS) + verify (expect SUCCESS)"
+"$VERIFY" export --daemon "$TARGET" "${AUDITOR_TLS[@]}" --agent-id "$AGENT_ID" --epoch 1 --index 0 --out "$WORK/ev0" 2>/dev/null \
+  || fail "export via the daemon failed"
 expect_verify 0 "$SUCCESS" --event "$WORK/ev0/event.json" --proof "$WORK/ev0/proof.json" "${COMMON[@]}"
+
+log "export via daemon GetProof without a client certificate is refused"
+if "$VERIFY" export --daemon "$TARGET" --daemon-ca "$CERTS/ca.pem" --agent-id "$AGENT_ID" --epoch 1 --index 0 \
+    --out "$WORK/ev-nocert" 2>"$WORK/nocert.err"; then
+  fail "the daemon served GetProof to a client without a certificate"
+fi
+echo "refused: $(tail -n 1 "$WORK/nocert.err" | cut -c1-140)"
+
+log "mTLS authorization: no cert, plaintext, impersonation, auditor ingest, cross-agent GetProof (expect refusals)"
+"$PYTHON" "$ROOT/scripts/e2e_mtls.py" --target "$TARGET" --certs "$CERTS" --agent-id "$AGENT_ID" \
+  --other-agent "$OTHER_AGENT" --auditor "$AUDITOR" --epoch 1 2>"$WORK/mtls.err" || { cat "$WORK/mtls.err"; fail "mTLS checks failed"; }
 
 log "one-byte tamper inside the payload (expect FAILURE)"
 "$PYTHON" - "$WORK/ev/event.json" "$WORK/tampered.json" <<'PY'
@@ -332,7 +366,7 @@ grep -q "engine: recovered from WAL" "$WORK/daemon.log" || fail "no recovery log
 
 log "second agent session after restart, with a 1.5 MB tool output (over the 1 MiB payload limit)"
 BEFORE="$(anchored_count)"
-"$PYTHON" "$ROOT/scripts/e2e_agent.py" --target "$TARGET" --agent-id "$AGENT_ID" --runs 2 --big-output 1572864 \
+"$PYTHON" "$ROOT/scripts/e2e_agent.py" --target "$TARGET" "${AGENT_TLS[@]}" --agent-id "$AGENT_ID" --runs 2 --big-output 1572864 \
   >"$WORK/agent2.out" 2>"$WORK/agent2.log" || { tail -n 20 "$WORK/agent2.log"; fail "second agent run failed"; }
 ACKED2="$(cat "$WORK/agent2.out")"
 grep -Eq "truncated=[1-9][0-9]* chain_gaps=0" "$WORK/agent2.log" || { tail -n 5 "$WORK/agent2.log"; fail "the oversized payload was not replaced"; }
@@ -364,7 +398,7 @@ EPOCHS_BEFORE="$(latest_epoch)"
 NONCE_BEFORE="$(cast nonce "$ANCHORER" --rpc-url "$RPC")"
 SENT="$(grep -c "anchor: transaction sent" "$WORK/daemon.log" || true)"
 BEFORE="$(anchored_count)"
-KILLED_ACKED="$("$PYTHON" "$ROOT/scripts/e2e_agent.py" --target "$TARGET" --agent-id "$AGENT_ID" --runs 1 2>"$WORK/agent3.log")" \
+KILLED_ACKED="$("$PYTHON" "$ROOT/scripts/e2e_agent.py" --target "$TARGET" "${AGENT_TLS[@]}" --agent-id "$AGENT_ID" --runs 1 2>"$WORK/agent3.log")" \
   || { tail -n 20 "$WORK/agent3.log"; fail "agent run before the kill failed"; }
 for _ in $(seq 1 100); do [ "$(grep -c "anchor: transaction sent" "$WORK/daemon.log" || true)" -gt "$SENT" ] && break; sleep 0.1; done
 [ "$(grep -c "anchor: transaction sent" "$WORK/daemon.log" || true)" -gt "$SENT" ] || fail "no anchor transaction was sent"
@@ -436,7 +470,7 @@ LATE_EPOCH="$(attacker_anchor --event "$WORK/late/event.json")"
 log "an agent session signed with the second key, anchored by the daemon"
 start_daemon
 BEFORE="$(anchored_count)"
-OLD_ACKED="$(VERILOG_SIGNING_KEY_FILE="$WORK/old.key" "$PYTHON" "$ROOT/scripts/e2e_agent.py" --target "$TARGET" --agent-id "$AGENT_ID" --runs 1)" \
+OLD_ACKED="$(VERILOG_SIGNING_KEY_FILE="$WORK/old.key" "$PYTHON" "$ROOT/scripts/e2e_agent.py" --target "$TARGET" "${AGENT_TLS[@]}" --agent-id "$AGENT_ID" --runs 1)" \
   || fail "old-key agent run failed"
 wait_anchored $(( BEFORE + OLD_ACKED ))
 OLD_BUNDLE="$EVIDENCE/epoch-$(latest_epoch).json"
@@ -448,7 +482,7 @@ advance_time 40
 
 log "replaying the revoked key's events to the daemon: nothing is anchored (seal-time revocation check)"
 EPOCHS_BEFORE="$(latest_epoch)"
-"$PYTHON" "$FORGE" replay --bundle "$OLD_BUNDLE" --target "$TARGET" | tee "$WORK/replay.out"
+"$PYTHON" "$FORGE" replay --bundle "$OLD_BUNDLE" --target "$TARGET" "${AGENT_TLS[@]}" | tee "$WORK/replay.out"
 sleep 5
 [ "$(latest_epoch)" = "$EPOCHS_BEFORE" ] || fail "events signed with a revoked key were anchored again"
 if ! grep -q "accepted=0" "$WORK/replay.out"; then
@@ -512,4 +546,4 @@ expect_stderr "does not match the on-chain anchors"
 log "an untouched run still verifies against the complete evidence, attacks included (expect SUCCESS)"
 expect_verify 0 "$SUCCESS" --run-id "$BIG_RUN" --bundles "$WORK/all" --agent-id "$AGENT_ID" --rpc "$RPC" --contract "$CONTRACT"
 
-printf '\nE2E PASSED: %s + %s + %s signed events anchored by the daemon; weak key refused at registration; single-event and run mode SUCCESS, FAILURE (tamper, re-spelled file, withheld, decoy, missing epoch, forged, revoked key, reordered, curated re-anchor), SUCCESS-INCOMPLETE, oversized payload, replay after revocation, key rotation, kill -9 between send and receipt and operational exits verified.\n' "$ACKED" "$ACKED2" "$OLD_ACKED"
+printf '\nE2E PASSED: %s + %s + %s signed events anchored by the daemon; weak key refused at registration; single-event and run mode SUCCESS, FAILURE (tamper, re-spelled file, withheld, decoy, missing epoch, forged, revoked key, reordered, curated re-anchor), SUCCESS-INCOMPLETE, oversized payload, replay after revocation, key rotation, kill -9 between send and receipt, mTLS authorization and operational exits verified.\n' "$ACKED" "$ACKED2" "$OLD_ACKED"

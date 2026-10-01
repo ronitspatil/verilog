@@ -390,3 +390,68 @@ func BenchmarkSubmitParallel(b *testing.B) {
 		}
 	})
 }
+
+// revokedKeys reports the keys in the set as revoked now.
+type revokedKeys struct {
+	mu      sync.Mutex
+	revoked map[canonical.Digest]bool
+}
+
+func (r *revokedKeys) RevokedNow(_ context.Context, _, keyID canonical.Digest) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.revoked[keyID], nil
+}
+
+// M4: events accepted while the key cache still showed the key unrevoked
+// (a replay, say) are left out of the epoch at seal time, and the WAL
+// replays the same grouping after a crash.
+func TestSealLeavesOutEventsOfRevokedKeys(t *testing.T) {
+	dir := t.TempDir()
+	other := ed25519.NewKeyFromSeed([]byte("0123456789abcdef0123456789abcdef"))
+	check := &revokedKeys{revoked: map[canonical.Digest]bool{canonical.KeyID(other.Public().(ed25519.PublicKey)): true}}
+	cfg := slowCfg()
+	cfg.KeyCheck = check
+	h := start(t, dir, cfg)
+
+	revokedEvent := func(step uint64) canonical.Event {
+		ev := event("agent-a", step)
+		if err := ev.Sign(other); err != nil {
+			t.Fatal(err)
+		}
+		return ev
+	}
+	submit(t, h.eng, event("agent-a", 1))
+	submit(t, h.eng, revokedEvent(2))
+	submit(t, h.eng, event("agent-a", 3))
+	submit(t, h.eng, revokedEvent(4))
+	if err := h.eng.SealAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	jobs := h.sink.take()
+	if len(jobs) != 1 || jobs[0].Count != 2 {
+		t.Fatalf("jobs %+v, want one epoch of 2 events", jobs)
+	}
+	want := jobs[0].Root
+	if s := h.eng.Stats(); s.RevokedExcluded != 2 || s.Accepted != 4 {
+		t.Fatalf("stats %+v", s)
+	}
+
+	// An epoch where every event is left out anchors nothing.
+	submit(t, h.eng, revokedEvent(5))
+	h.eng.SealAll(context.Background())
+	if n := h.sink.len(); n != 0 {
+		t.Fatalf("empty epoch anchored: %d jobs", n)
+	}
+	h.stop()
+
+	// Crash before anchoring: recovery rebuilds exactly the kept events.
+	h2 := start(t, dir, cfg)
+	again := h2.sink.take()
+	if len(again) != 1 || again[0].Root != want || again[0].Count != 2 {
+		t.Fatalf("recovered %+v", again)
+	}
+	if n := h2.eng.shard("agent-a").size(); n != 0 {
+		t.Fatalf("left-out events reopened: %d", n)
+	}
+}

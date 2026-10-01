@@ -75,6 +75,15 @@ func run() error {
 	}
 	// Agent keys are re-read every minute (revocations), unknown ones after 5s.
 	agentKeys := keys.NewCache(keySource, time.Minute, 5*time.Second)
+	// At seal time keys are read again, uncached, against the chain's clock
+	// (the anchor's timestamp will be at least the latest block's).
+	sealCheck := keys.RevocationCheck{Src: keySource, Now: func(ctx context.Context) (uint64, error) {
+		h, err := eth.HeaderByNumber(ctx, nil)
+		if err != nil {
+			return 0, err
+		}
+		return max(h.Time, uint64(time.Now().Unix())), nil
+	}}
 
 	// Storage and engine.
 	lock, err := lockDataDir(cfg.DataDir)
@@ -100,6 +109,7 @@ func run() error {
 		CommitBatch:   cfg.CommitBatch,
 		ChainID:       chain.ChainID().String(),
 		Contract:      cfg.Contract.Hex(),
+		KeyCheck:      sealCheck,
 	}, w, st, worker, logger)
 	if err != nil {
 		return err
@@ -121,7 +131,9 @@ func run() error {
 		return err
 	}
 	opts := []grpc.ServerOption{
-		grpc.MaxRecvMsgSize(cfg.MaxPayloadBytes + 64<<10),
+		// Far above the payload cap, so an oversized payload is answered with
+		// a per-event rejection instead of failing the whole stream.
+		grpc.MaxRecvMsgSize(ingest.MaxRecvMsgSize(cfg.MaxPayloadBytes)),
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{MinTime: 10 * time.Second, PermitWithoutStream: true}),
 		grpc.KeepaliveParams(keepalive.ServerParameters{Time: 30 * time.Second, Timeout: 10 * time.Second}),
 	}
@@ -165,7 +177,7 @@ loop:
 		case <-statsTick.C:
 			s := eng.Stats()
 			logger.Info("stats", "accepted", s.Accepted, "duplicates", s.Duplicates, "sealed_epochs", s.SealedEpochs,
-				"anchored_epochs", s.AnchoredEpochs, "anchor_queue", worker.Pending())
+				"anchored_epochs", s.AnchoredEpochs, "anchor_queue", worker.Pending(), "revoked_excluded", s.RevokedExcluded)
 		}
 	}
 

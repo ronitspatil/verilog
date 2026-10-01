@@ -32,7 +32,9 @@ message LogEvent {
   uint64 step_number = 2;
   string event_type = 3;
   // UTF-8 JSON document. Re-canonicalized by the daemon, so key order and
-  // whitespace do not matter, but the value must be valid JSON.
+  // whitespace do not matter, but the value must be valid JSON. Events whose
+  // payload_json exceeds the daemon's --max-payload-bytes are rejected; the
+  // SDK replaces an oversized payload with a signed stand-in before chaining.
   string payload_json = 4;
   google.protobuf.Timestamp timestamp_utc = 5;
   // Root run this event belongs to; each run is its own hash chain.
@@ -64,6 +66,11 @@ message Ack {
   // True when an identical event was already committed to the open epoch;
   // the event is not committed twice.
   bool duplicate = 6;
+  // Set on a rejection that may succeed if the identical event is sent again
+  // later, for example because the agent key is not yet visible on chain.
+  // The client should retry it (with backoff, for a bounded time) instead of
+  // leaving a gap in the run's hash chain.
+  bool retryable = 7;
 }
 
 message GetProofRequest {

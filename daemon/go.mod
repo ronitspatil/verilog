@@ -10,7 +10,7 @@ require (
 	github.com/aws/smithy-go v1.28.2
 	github.com/ethereum/go-ethereum v1.17.7
 	golang.org/x/crypto v0.57.0
-	golang.org/x/net v0.58.0
+	golang.org/x/net v0.59.0
 	golang.org/x/sync v0.23.0
 	google.golang.org/grpc v1.84.0
 	google.golang.org/protobuf v1.36.12

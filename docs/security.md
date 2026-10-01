@@ -51,7 +51,8 @@ key file the key itself must be treated as stolen.
   unanchored epochs are rebuilt, their roots re-checked against the sealed
   record, and re-queued; other unanchored events reopen the agent's current
   epoch. A torn final WAL record (crash mid-write) is truncated. Corruption
-  anywhere else stops the daemon instead of guessing.
+  anywhere else stops the daemon instead of guessing. Resource limits refuse
+  an event (retryable) before it is written, never after it is acknowledged.
 - **Anchored means tamper-evident.** Once an epoch is anchored, changing any
   byte of any of its events, or of the proof, makes verification fail both
   locally and through the contract.

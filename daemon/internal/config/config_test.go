@@ -32,6 +32,10 @@ func TestLoadFlagsAndEnv(t *testing.T) {
 	if c.Contract.Hex() != "0x5FbDB2315678afecb367f032d93F642f64180aa3" {
 		t.Fatalf("contract %s", c.Contract.Hex())
 	}
+	if c.Limits.MaxAgentEvents != 100_000 || c.Limits.MaxAnchorQueue != 1024 || c.Limits.MinFreeDiskBytes != 1<<30 ||
+		c.Limits.AgentRate != 0 || c.MetricsListen != "" {
+		t.Fatalf("limit defaults %+v %q", c.Limits, c.MetricsListen)
+	}
 	if c.Finality.String() != "finalized" || c.FinalityPoll != 5*time.Second || c.FinalityTimeout != 30*time.Minute {
 		t.Fatalf("finality defaults %v %v %v", c.Finality, c.FinalityPoll, c.FinalityTimeout)
 	}
@@ -66,6 +70,9 @@ func TestLoadRejects(t *testing.T) {
 		{"--finality", "final"},
 		{"--finality-poll", "0s"},
 		{"--finality-timeout", "soon"},
+		{"--max-agent-unanchored-events", "-1"},
+		{"--agent-rate", "-2"},
+		{"--max-anchor-queue", "x"},
 	} {
 		if _, err := Load(append(append([]string{}, base...), extra...), envOf(nil), io.Discard); err == nil {
 			t.Errorf("accepted %v", extra)

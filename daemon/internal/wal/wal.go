@@ -81,6 +81,7 @@ func (r Record) validate() error {
 type segment struct {
 	index int
 	path  string
+	size  int64
 	// maxSeq is the highest event seq / sealed LastSeq per agent in this segment.
 	maxSeq map[string]uint64
 }
@@ -104,19 +105,28 @@ const segPrefix, segSuffix = "wal-", ".jsonl"
 
 func segName(i int) string { return fmt.Sprintf("%s%010d%s", segPrefix, i, segSuffix) }
 
-// Open opens (or creates) the log in dir and returns every record in it, in
-// write order. A torn final line in the newest segment (crash mid-write) is
-// truncated away; corruption anywhere else is an error.
-func Open(dir string, maxSegmentBytes int64, logger *slog.Logger) (*Log, []Record, error) {
+// Loc is where a record is stored: its segment and byte range. It stays
+// valid until the segment is compacted away.
+type Loc struct {
+	Seg int   // segment index
+	Off int64 // byte offset of the record's line
+	Len int64 // line length, newline included
+}
+
+// Open opens (or creates) the log in dir. It checks every segment, streaming
+// (records are not kept in memory): a torn final line in the newest segment
+// (crash mid-write) is truncated away; corruption anywhere else is an error.
+// Replay then yields the records.
+func Open(dir string, maxSegmentBytes int64, logger *slog.Logger) (*Log, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	var idx []int
 	for _, e := range entries {
@@ -133,72 +143,100 @@ func Open(dir string, maxSegmentBytes int64, logger *slog.Logger) (*Log, []Recor
 	sort.Ints(idx)
 
 	l := &Log{dir: dir, maxSegBytes: maxSegmentBytes, log: logger}
-	var all []Record
 	for i, n := range idx {
 		seg := &segment{index: n, path: filepath.Join(dir, segName(n)), maxSeq: map[string]uint64{}}
-		recs, err := readSegment(seg, i == len(idx)-1, logger)
-		if err != nil {
-			return nil, nil, err
+		if err := scanSegment(seg, i == len(idx)-1, logger, nil); err != nil {
+			return nil, err
 		}
-		all = append(all, recs...)
 		l.segs = append(l.segs, seg)
 	}
 	if len(l.segs) == 0 {
 		if err := l.newSegment(1); err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 	} else {
 		active := l.segs[len(l.segs)-1]
 		f, err := os.OpenFile(active.path, os.O_WRONLY|os.O_APPEND, 0o600)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		st, err := f.Stat()
 		if err != nil {
 			f.Close()
-			return nil, nil, err
+			return nil, err
 		}
 		l.f, l.size = f, st.Size()
+		active.size = l.size
 	}
-	return l, all, nil
+	return l, nil
 }
 
-func readSegment(seg *segment, last bool, logger *slog.Logger) ([]Record, error) {
+// Replay calls fn for every record in write order, with its location,
+// reading one record at a time. Call it before the first Write.
+func (l *Log) Replay(fn func(Record, Loc) error) error {
+	l.mu.Lock()
+	segs := append([]*segment(nil), l.segs...)
+	l.mu.Unlock()
+	for _, seg := range segs {
+		if err := scanSegment(seg, false, l.log, fn); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// scanSegment reads a segment one line at a time. With fn nil it checks the
+// segment, records its maxSeq and size and, for the newest segment (last),
+// truncates a torn tail; otherwise it passes each record to fn.
+func scanSegment(seg *segment, last bool, logger *slog.Logger, fn func(Record, Loc) error) error {
 	f, err := os.Open(seg.path)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer f.Close()
 	r := bufio.NewReaderSize(f, 1<<20)
-	var recs []Record
 	var good int64
+	done := func() error {
+		if fn == nil {
+			seg.size = good
+		}
+		return nil
+	}
 	for {
 		line, err := r.ReadBytes('\n')
 		if err == io.EOF {
 			if len(line) == 0 {
-				return recs, nil
+				return done()
 			}
 			// Final line without newline: an interrupted write.
 			if !last {
-				return nil, fmt.Errorf("wal: %s: truncated record in sealed segment", seg.path)
+				return fmt.Errorf("wal: %s: truncated record in sealed segment", seg.path)
 			}
-			return recs, truncate(seg.path, good, logger)
+			done()
+			return truncate(seg.path, good, logger)
 		}
 		if err != nil {
-			return nil, err
+			return err
 		}
 		var rec Record
 		if jerr := json.Unmarshal(line, &rec); jerr != nil || rec.validate() != nil {
 			if last && isTail(r) {
-				return recs, truncate(seg.path, good, logger)
+				done()
+				return truncate(seg.path, good, logger)
 			}
-			return nil, fmt.Errorf("wal: %s: corrupt record at offset %d", seg.path, good)
+			return fmt.Errorf("wal: %s: corrupt record at offset %d", seg.path, good)
 		}
+		loc := Loc{Seg: seg.index, Off: good, Len: int64(len(line))}
 		good += int64(len(line))
+		if fn != nil {
+			if err := fn(rec, loc); err != nil {
+				return err
+			}
+			continue
+		}
 		if s := rec.highSeq(); s > seg.maxSeq[rec.AgentID] {
 			seg.maxSeq[rec.AgentID] = s
 		}
-		recs = append(recs, rec)
 	}
 }
 
@@ -244,38 +282,51 @@ func (l *Log) newSegment(index int) error {
 // Write appends records and fsyncs once. It returns only after the records
 // are durable. The caller groups records to amortize the fsync.
 func (l *Log) Write(recs []Record) error {
+	_, err := l.Append(recs)
+	return err
+}
+
+// Append is Write that also returns where each record was stored.
+func (l *Log) Append(recs []Record) ([]Loc, error) {
 	if len(recs) == 0 {
-		return nil
+		return nil, nil
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.f == nil {
-		return errors.New("wal: closed")
+		return nil, errors.New("wal: closed")
 	}
 	if l.failed != nil {
-		return l.failed
+		return nil, l.failed
 	}
 	l.buf.Reset()
 	enc := json.NewEncoder(&l.buf)
 	enc.SetEscapeHTML(false)
 	active := l.segs[len(l.segs)-1]
-	for _, r := range recs {
+	locs := make([]Loc, len(recs))
+	for i, r := range recs {
 		if err := r.validate(); err != nil {
-			return fmt.Errorf("wal: %w", err)
+			return nil, fmt.Errorf("wal: %w", err)
 		}
+		start := int64(l.buf.Len())
 		if err := enc.Encode(r); err != nil { // Encode appends '\n'
-			return err
+			return nil, err
 		}
+		locs[i] = Loc{Seg: active.index, Off: l.size + start, Len: int64(l.buf.Len()) - start}
 	}
 	n, err := l.f.Write(l.buf.Bytes())
 	l.size += int64(n)
+	active.size = l.size
+	if l.buf.Cap() > 4<<20 {
+		l.buf = bytes.Buffer{} // do not keep a large batch's buffer
+	}
 	if err != nil {
 		l.failed = fmt.Errorf("wal: write failed, log is read-only until restart: %w", err)
-		return l.failed
+		return nil, l.failed
 	}
 	if err := l.f.Sync(); err != nil {
 		l.failed = fmt.Errorf("wal: fsync failed, log is read-only until restart: %w", err)
-		return l.failed
+		return nil, l.failed
 	}
 	for _, r := range recs {
 		if s := r.highSeq(); s > active.maxSeq[r.AgentID] {
@@ -284,10 +335,60 @@ func (l *Log) Write(recs []Record) error {
 	}
 	if l.size >= l.maxSegBytes {
 		if err := l.newSegment(active.index + 1); err != nil {
-			return fmt.Errorf("wal: rotate: %w", err)
+			return locs, fmt.Errorf("wal: rotate: %w", err)
 		}
 	}
-	return nil
+	return locs, nil
+}
+
+// Reader reads records back by location. It keeps the segments it has read
+// open until Close. Not safe for concurrent use.
+type Reader struct {
+	dir   string
+	files map[int]*os.File
+}
+
+// NewReader returns a Reader for the log's segments.
+func (l *Log) NewReader() *Reader { return &Reader{dir: l.dir, files: map[int]*os.File{}} }
+
+// Read returns the record stored at loc.
+func (r *Reader) Read(loc Loc) (Record, error) {
+	f := r.files[loc.Seg]
+	if f == nil {
+		var err error
+		if f, err = os.Open(filepath.Join(r.dir, segName(loc.Seg))); err != nil {
+			return Record{}, err
+		}
+		r.files[loc.Seg] = f
+	}
+	buf := make([]byte, loc.Len)
+	if _, err := f.ReadAt(buf, loc.Off); err != nil {
+		return Record{}, fmt.Errorf("wal: reading %s at %d: %w", segName(loc.Seg), loc.Off, err)
+	}
+	var rec Record
+	if err := json.Unmarshal(buf, &rec); err != nil {
+		return Record{}, fmt.Errorf("wal: corrupt record in %s at %d: %w", segName(loc.Seg), loc.Off, err)
+	}
+	return rec, nil
+}
+
+// Close closes the segments the reader opened.
+func (r *Reader) Close() {
+	for _, f := range r.files {
+		f.Close()
+	}
+	r.files = nil
+}
+
+// Bytes returns the total size of the segment files.
+func (l *Log) Bytes() int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var n int64
+	for _, s := range l.segs {
+		n += s.size
+	}
+	return n
 }
 
 // Compact deletes the oldest inactive segments whose records are all

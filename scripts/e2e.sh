@@ -38,6 +38,7 @@ fail() { printf '\nE2E FAILED: %s\n' "$*" >&2; [ -f "$WORK/daemon.log" ] && tail
 cleanup() {
   [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null || true
   [ -n "$ANVIL_PID" ] && kill "$ANVIL_PID" 2>/dev/null || true
+  [ -n "${MINER_PID:-}" ] && kill "$MINER_PID" 2>/dev/null || true
   wait 2>/dev/null || true
   if [ "${KEEP_WORK:-0}" = 1 ]; then echo "work dir kept: $WORK"; else rm -rf "$WORK"; fi
 }
@@ -146,11 +147,11 @@ echo "refused: $(grep -i -m1 -o 'revert.*' "$WORK/anchorer-register.log" | cut -
 log "registering the agent key as the key admin (after keycheck)"
 register_key "$WORK/agent.key"
 
-start_daemon() {
+start_daemon() { # [extra verilogd flags]
   VERILOG_PRIVATE_KEY="$ANCHOR_KEY" "$WORK/bin/verilogd" \
     --listen "$TARGET" --rpc "$RPC" --contract "$CONTRACT" --data-dir "$DATA" "${DAEMON_TLS[@]}" \
     --epoch-interval 2s --epoch-max-logs 1000 --confirm-timeout 30s --retry-initial 200ms \
-    --finality "$FINALITY" --finality-poll 200ms \
+    --finality "$FINALITY" --finality-poll 200ms "$@" \
     >>"$WORK/daemon.log" 2>&1 &
   DAEMON_PID=$!
   local n; n="$(grep -c "verilogd listening" "$WORK/daemon.log" || true)"
@@ -404,6 +405,45 @@ BUNDLE2="$EVIDENCE/epoch-$LATEST.json"
 expect_verify 0 "$SUCCESS" --event "$WORK/ev2/event.json" --proof "$WORK/ev2/proof.json" --epoch "$LATEST" --agent-id "$AGENT_KEY" --rpc "$RPC" --contract "$CONTRACT"
 log "an epoch-1 proof does not verify against epoch $LATEST (expect FAILURE)"
 expect_verify 1 "$FAILURE" --event "$WORK/ev/event.json" --proof "$WORK/ev/proof.json" --epoch "$LATEST" --agent-id "$AGENT_ID" --rpc "$RPC" --contract "$CONTRACT"
+
+# ------------------------------------------------------------- backpressure
+log "backpressure: a quota of 5 unanchored events per agent holds the agent back (retryable); nothing is lost"
+stop_daemon
+MINER_PID=""
+start_daemon --max-agent-unanchored-events 5 --epoch-interval 500ms --metrics-listen 127.0.0.1:0
+METRICS="$(grep 'metrics listening' "$WORK/daemon.log" | tail -n 1 | grep -o 'http://[0-9.:]*/metrics' || true)"
+[ -n "$METRICS" ] || fail "no metrics listener"
+( while true; do mine 1; sleep 0.3; done ) >/dev/null 2>&1 & # finality for depth:2 while the agent waits
+MINER_PID=$!
+EPOCHS_BEFORE="$(latest_epoch)"
+BEFORE="$(anchored_count)"
+"$PYTHON" "$ROOT/scripts/e2e_agent.py" --target "$TARGET" "${AGENT_TLS[@]}" --agent-id "$AGENT_ID" --runs 2 \
+  >"$WORK/agent-bp.out" 2>"$WORK/agent-bp.log" || { kill "$MINER_PID"; tail -n 20 "$WORK/agent-bp.log"; fail "agent run under backpressure failed"; }
+BP_ACKED="$(cat "$WORK/agent-bp.out")"
+grep -o 'acked=.*' "$WORK/agent-bp.log"
+grep -Eq "chain_gaps=0 backpressured=[1-9]" "$WORK/agent-bp.log" || { kill "$MINER_PID"; fail "the agent saw no backpressure (or has gaps)"; }
+[ "$BP_ACKED" -gt 5 ] || { kill "$MINER_PID"; fail "too few events ($BP_ACKED) to exceed the quota"; }
+wait_anchored $(( BEFORE + BP_ACKED ))
+kill "$MINER_PID"; wait "$MINER_PID" 2>/dev/null || true
+curl -fsS "$METRICS" >"$WORK/metrics.txt" || fail "GET $METRICS failed"
+grep -E '^verilog_backpressure_rejections_total\{reason="agent_unanchored_events"\} [1-9]' "$WORK/metrics.txt" \
+  || { cat "$WORK/metrics.txt"; fail "metrics show no quota rejections"; }
+grep -E '^verilog_(anchor_queue_epochs|wal_bytes|disk_free_bytes|finality_lag_seconds) ' "$WORK/metrics.txt"
+grep -q "backpressure: refusing events for now" "$WORK/daemon.log" || fail "no backpressure log line"
+log "both runs held back by the quota verify (expect SUCCESS)"
+for run in $("$PYTHON" - "$EVIDENCE" "$EPOCHS_BEFORE" <<'PY'
+import glob, json, re, sys
+runs = set()
+for f in glob.glob(sys.argv[1] + "/epoch-*.json"):
+    if int(re.search(r"epoch-(\d+)", f).group(1)) > int(sys.argv[2]):
+        runs.update(json.loads(e["canonical_event"])["run_id"] for e in json.load(open(f))["events"])
+print(" ".join(sorted(runs)))
+PY
+); do
+  expect_verify 0 "$SUCCESS" --run-id "$run" --bundles "$EVIDENCE" --agent-id "$AGENT_ID" --rpc "$RPC" --contract "$CONTRACT"
+done
+stop_daemon
+start_daemon
 
 # ---------------------------------------------- kill between send and receipt
 log "kill -9 between send and receipt: the restarted daemon reuses the nonce and anchors the root once"

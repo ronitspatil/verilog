@@ -284,6 +284,15 @@ func (s *Server) prepare(ctx context.Context, msg *verilogv1.LogEvent) (inflight
 		if errors.Is(err, engine.ErrClosed) {
 			return item, nil // neither ack nor result: shutting down
 		}
+		var bp *engine.BackpressureError
+		if errors.As(err, &bp) {
+			// Over a resource limit: nothing was written. The client keeps
+			// the event and sends it again later.
+			item.ack = reject(item.seq, bp.Error())
+			item.ack.Retryable = true
+			item.ack.RetryAfterMs = uint32(min(bp.RetryAfter.Milliseconds(), 60_000))
+			return item, nil
+		}
 		item.ack = reject(item.seq, "not accepted: "+err.Error())
 		return item, nil
 	}

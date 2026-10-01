@@ -1,9 +1,11 @@
 // Package anchor commits sealed epoch roots to the VeriLogRegistry contract.
 //
-// Worker is a FIFO of sealed epochs processed by a single goroutine in two
-// stages. The send stage anchors the jobs in order, one transaction at a
-// time from the daemon's single signer, and moves on as soon as a
-// transaction is mined. The finality stage watches the mined anchors and
+// Worker is a queue of sealed epochs processed by a single goroutine in two
+// stages. The send stage anchors the jobs one transaction at a time from the
+// daemon's single signer, and moves on as soon as a transaction is mined. It
+// takes the agents in turn (round-robin, each agent's epochs oldest first),
+// so one agent's backlog cannot hold up the other agents' epochs; a job is
+// retried until it is mined before the next one is picked. The finality stage watches the mined anchors and
 // completes a job (evidence bundle, checkpoint, WAL compaction) only once its
 // anchor is final, strictly in queue order. Sending the next epoch while an
 // earlier one awaits finality keeps nonce ordering safe because every
@@ -136,6 +138,47 @@ type Worker struct {
 
 	// Owned by the Run goroutine.
 	nextFinal time.Time
+	current   *item               // job being sent, until it is mined
+	served    map[[32]byte]uint64 // agent key -> turn it was last picked in
+	turn      uint64
+
+	// Published by the Run goroutine for Stats (guarded by mu).
+	mined       int
+	oldestMined time.Time
+}
+
+// WorkerStats is a snapshot of the queue.
+type WorkerStats struct {
+	Queued int // jobs not completed
+	Mined  int // of which mined and awaiting finality
+	// FinalityLag is how long the oldest mined anchor has awaited finality.
+	FinalityLag time.Duration
+}
+
+// Stats returns a snapshot of the queue.
+func (w *Worker) Stats() WorkerStats {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	st := WorkerStats{Queued: len(w.queue), Mined: w.mined}
+	if !w.oldestMined.IsZero() {
+		st.FinalityLag = time.Since(w.oldestMined)
+	}
+	return st
+}
+
+// publish refreshes the figures Stats reports (Run goroutine).
+func (w *Worker) publish() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.mined, w.oldestMined = 0, time.Time{}
+	for _, it := range w.queue {
+		if it.mined {
+			w.mined++
+			if w.oldestMined.IsZero() || it.minedAt.Before(w.oldestMined) {
+				w.oldestMined = it.minedAt
+			}
+		}
+	}
 }
 
 // item is a queued job and its progress (owned by the Run goroutine, except
@@ -166,7 +209,7 @@ func NewWorker(chain Chain, opts WorkerOptions, logger *slog.Logger) *Worker {
 	if opts.FinalityTimeout <= 0 {
 		opts.FinalityTimeout = 30 * time.Minute
 	}
-	return &Worker{chain: chain, opts: opts, log: logger, notify: make(chan struct{}, 1)}
+	return &Worker{chain: chain, opts: opts, log: logger, notify: make(chan struct{}, 1), served: map[[32]byte]uint64{}}
 }
 
 // Enqueue adds a job to the end of the queue. It never blocks.
@@ -225,10 +268,14 @@ func (w *Worker) Run(ctx context.Context) {
 		}
 	}
 	for {
-		if !w.finalize(ctx) || ctx.Err() != nil {
+		ok := w.finalize(ctx)
+		w.publish()
+		if !ok || ctx.Err() != nil {
 			return
 		}
-		if w.send(ctx) {
+		sent := w.send(ctx)
+		w.publish()
+		if sent {
 			continue
 		}
 		t := time.NewTimer(w.idle())
@@ -250,25 +297,76 @@ func (w *Worker) idle() time.Duration {
 	if h := w.head(); h != nil && h.mined {
 		wait = min(wait, w.nextFinal.Sub(now))
 	}
-	for _, it := range w.items() {
-		if !it.mined {
-			wait = min(wait, it.nextTry.Sub(now))
-			break
-		}
+	if it := w.next(); it != nil {
+		wait = min(wait, it.nextTry.Sub(now))
 	}
 	return max(wait, 0)
 }
 
-// send anchors the first job that is not mined, if its retry time has come.
-// It reports whether it tried.
-func (w *Worker) send(ctx context.Context) bool {
-	var it *item
-	for _, i := range w.items() {
-		if !i.mined {
-			it = i
+// next picks the job to send: the job being sent until it is mined; else a
+// job whose anchor was lost (Reanchor), which keeps its place; else the
+// oldest job of the agent whose turn it is. The pick is moved to the front
+// of the unmined jobs, so queue order stays the order anchors are sent in,
+// which is the order finalize completes them in.
+func (w *Worker) next() *item {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.current != nil && !w.current.mined {
+		for _, it := range w.queue {
+			if it == w.current {
+				return it
+			}
+		}
+	}
+	w.current = nil
+	k := -1
+	for i, it := range w.queue {
+		if !it.mined {
+			k = i
 			break
 		}
 	}
+	if k < 0 {
+		return nil
+	}
+	pick := k
+	for _, it := range w.queue[k:] {
+		if it.mined { // a reanchor ahead of mined jobs: send it first
+			w.current = w.queue[k]
+			return w.current
+		}
+	}
+	seen := map[[32]byte]bool{}
+	for i := k; i < len(w.queue); i++ {
+		a := w.queue[i].AgentKey
+		if seen[a] {
+			continue
+		}
+		seen[a] = true
+		if w.served[a] < w.served[w.queue[pick].AgentKey] {
+			pick = i
+		}
+	}
+	it := w.queue[pick]
+	copy(w.queue[k+1:pick+1], w.queue[k:pick])
+	w.queue[k] = it
+	w.turn++
+	w.served[it.AgentKey] = w.turn
+	if len(w.served) > 2*len(w.queue)+64 {
+		keep := make(map[[32]byte]uint64, len(w.queue))
+		for _, q := range w.queue {
+			keep[q.AgentKey] = w.served[q.AgentKey]
+		}
+		w.served = keep
+	}
+	w.current = it
+	return it
+}
+
+// send anchors the next job (see next), if its retry time has come. It
+// reports whether it tried.
+func (w *Worker) send(ctx context.Context) bool {
+	it := w.next()
 	if it == nil || time.Now().Before(it.nextTry) {
 		return false
 	}
@@ -318,6 +416,7 @@ func (w *Worker) finalize(ctx context.Context) bool {
 		case st == Reanchor:
 			w.log.Warn("anchor: anchoring the epoch again", "epoch", it.Label)
 			it.mined, it.attempts, it.nextTry = false, 0, time.Time{}
+			w.current = nil // it keeps its place at the head
 			return true
 		}
 		if _, ok := retry(ctx, w, "finalize", it.Label, func() (struct{}, error) { return struct{}{}, it.Done(ctx, res) }); !ok {

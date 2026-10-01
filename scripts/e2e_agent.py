@@ -114,7 +114,7 @@ def main() -> int:
     ok = handler.close(timeout=30) and client.close(timeout=30)
     stats = handler.client.stats()
     print(f"acked={stats.acked} rejected={stats.rejected} dropped={stats.dropped} truncated={stats.truncated} "
-          f"chain_gaps={stats.chain_gaps}", file=sys.stderr)
+          f"chain_gaps={stats.chain_gaps} backpressured={stats.backpressured}", file=sys.stderr)
     if capture is not None:
         server.stop(grace=None)
         with open(args.capture, "w") as f:

@@ -88,7 +88,9 @@ and all I/O run on the SDK's background thread.
   signed and chained like any payload; `on_oversize` can keep the original.
 - **Rejections.** A rejection with `Ack.retryable` set (the agent key is not
   yet visible on chain) is re-sent, byte for byte, with backoff for up to
-  `key_wait_timeout`, holding later events back to keep the order. Any other
+  `key_wait_timeout`, holding later events back to keep the order. One that
+  also carries `retry_after_ms` (daemon backpressure) is re-sent the same way
+  with no time limit. Any other
   rejection of a chained event leaves a gap: it is logged at ERROR and counted
   in `stats().chain_gaps`.
 - **Late and open runs.** An event submitted after its run's `run_end`
@@ -134,9 +136,15 @@ assigns sequence numbers, writes a whole batch to the WAL with one fsync, then
 appends leaves to per-agent shards (mutex-guarded `merkle.Tree`s). Sealing
 swaps a shard's tree for a fresh one under the lock (a pointer exchange) and
 computes the root afterwards, so ingestion never waits on hashing or the
-chain. Sealed epochs go to a FIFO drained by one anchor goroutine: one signer,
-one nonce source, per-agent epochs in order. Failed attempts retry with
-jittered exponential backoff; a sealed epoch is never dropped.
+chain. Sealed epochs go to a queue drained by one anchor goroutine: one
+signer, one nonce source, agents taken in turn, per-agent epochs in order.
+Failed attempts retry with jittered exponential backoff; a sealed epoch is
+never dropped. Epochs hold event digests and WAL locations, not payloads.
+
+**Resource limits.** Per-agent quotas, a rate limit, global byte and anchor
+queue limits and a free-disk check are applied before an event is written;
+an event over one gets a retryable rejection with `retry_after_ms` (see
+[operations](operations.md#resource-limits-and-backpressure)).
 
 **Anchoring.** The chain ID comes from the RPC. Transactions are EIP-1559,
 signed through the `signer.Signer` interface (a local key, or AWS KMS with
@@ -196,8 +204,9 @@ numbers depend on the disk's fsync latency.
 | `daemon/internal/merkle` | thread-safe Merkle tree, proofs, benchmarks |
 | `daemon/internal/engine` | committer, per-agent shards, sealing, WAL replay, evidence finalization |
 | `daemon/internal/wal` | JSONL write-ahead log with group-commit fsync and compaction |
-| `daemon/internal/anchor` | sequential retrying anchor worker, EIP-1559 go-ethereum client, fee ceiling, pending-transaction record |
+| `daemon/internal/anchor` | retrying anchor worker (agents in turn), EIP-1559 go-ethereum client, fee ceiling, pending-transaction record |
 | `daemon/internal/signer` | anchoring key signers: local key and AWS KMS (`kmsfake`: in-memory KMS for tests) |
+| `daemon/internal/diskspace`, `daemon/internal/metrics` | free-space check; Prometheus text format |
 | `daemon/internal/redact` | strips RPC URL credentials from logs and errors |
 | `daemon/internal/ingest` | gRPC service (rejects events with a bad or unregistered signature) |
 | `daemon/internal/keys` | on-chain agent key lookup, cache and validity rule |

@@ -51,6 +51,7 @@ type envOptions struct {
 	server []grpc.ServerOption              // e.g. grpc.Creds for mTLS
 	client credentials.TransportCredentials // creds of env.client (insecure if nil)
 	opts   Options                          // Authz and IdleTimeout are used
+	limits engine.Limits
 }
 
 // fakeKeys is an in-memory key registry: keyID -> key, for every agent.
@@ -84,17 +85,17 @@ func newEnv(t *testing.T) *env { return newEnvWith(t, envOptions{}) }
 func newEnvWith(t *testing.T, o envOptions) *env {
 	t.Helper()
 	dir := t.TempDir()
-	w, recs, err := wal.Open(dir+"/wal", 1<<20, nil)
+	w, err := wal.Open(dir+"/wal", 1<<20, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	st, _ := store.Open(dir)
 	sink := &jobSink{}
-	eng, err := engine.New(engine.Config{EpochInterval: time.Hour, EpochMaxLogs: 1 << 20}, w, st, sink, nil)
+	eng, err := engine.New(engine.Config{EpochInterval: time.Hour, EpochMaxLogs: 1 << 20, Limits: o.limits}, w, st, sink, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	eng.Recover(recs)
+	eng.Recover()
 	ctx, cancel := context.WithCancel(context.Background())
 	eng.Start(ctx)
 
@@ -449,10 +450,10 @@ func TestStreamFailsWhenKeyRegistryIsDown(t *testing.T) {
 func TestOversizedPayloadIsRejectedPerEvent(t *testing.T) {
 	const P = 1 << 16
 	dir := t.TempDir()
-	w, recs, _ := wal.Open(dir+"/wal", 1<<26, nil)
+	w, _ := wal.Open(dir+"/wal", 1<<26, nil)
 	st, _ := store.Open(dir)
 	eng, _ := engine.New(engine.Config{EpochInterval: time.Hour, EpochMaxLogs: 1 << 20}, w, st, &jobSink{}, nil)
-	eng.Recover(recs)
+	eng.Recover()
 	ctx, cancel := context.WithCancel(context.Background())
 	eng.Start(ctx)
 	lis := bufconn.Listen(1 << 20)

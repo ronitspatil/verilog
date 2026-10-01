@@ -34,7 +34,7 @@ class LogEvent(_message.Message):
     def __init__(self, agent_id: _Optional[str] = ..., step_number: _Optional[int] = ..., event_type: _Optional[str] = ..., payload_json: _Optional[str] = ..., timestamp_utc: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., run_id: _Optional[str] = ..., prev_hash: _Optional[bytes] = ..., key_id: _Optional[bytes] = ..., signature: _Optional[bytes] = ..., sequence: _Optional[int] = ...) -> None: ...
 
 class Ack(_message.Message):
-    __slots__ = ("sequence", "accepted", "error", "content_digest", "leaf", "duplicate", "retryable")
+    __slots__ = ("sequence", "accepted", "error", "content_digest", "leaf", "duplicate", "retryable", "retry_after_ms")
     SEQUENCE_FIELD_NUMBER: _ClassVar[int]
     ACCEPTED_FIELD_NUMBER: _ClassVar[int]
     ERROR_FIELD_NUMBER: _ClassVar[int]
@@ -42,6 +42,7 @@ class Ack(_message.Message):
     LEAF_FIELD_NUMBER: _ClassVar[int]
     DUPLICATE_FIELD_NUMBER: _ClassVar[int]
     RETRYABLE_FIELD_NUMBER: _ClassVar[int]
+    RETRY_AFTER_MS_FIELD_NUMBER: _ClassVar[int]
     sequence: int
     accepted: bool
     error: str
@@ -49,7 +50,8 @@ class Ack(_message.Message):
     leaf: bytes
     duplicate: bool
     retryable: bool
-    def __init__(self, sequence: _Optional[int] = ..., accepted: _Optional[bool] = ..., error: _Optional[str] = ..., content_digest: _Optional[bytes] = ..., leaf: _Optional[bytes] = ..., duplicate: _Optional[bool] = ..., retryable: _Optional[bool] = ...) -> None: ...
+    retry_after_ms: int
+    def __init__(self, sequence: _Optional[int] = ..., accepted: _Optional[bool] = ..., error: _Optional[str] = ..., content_digest: _Optional[bytes] = ..., leaf: _Optional[bytes] = ..., duplicate: _Optional[bool] = ..., retryable: _Optional[bool] = ..., retry_after_ms: _Optional[int] = ...) -> None: ...
 
 class GetProofRequest(_message.Message):
     __slots__ = ("agent_id", "epoch_id", "leaf_index", "content_digest")

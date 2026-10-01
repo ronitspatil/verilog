@@ -20,6 +20,11 @@
 // On restart, Recover replays the WAL: sealed-but-unanchored epochs are
 // rebuilt (and their roots re-checked) and re-queued for anchoring, and the
 // remaining unanchored events reopen each agent's current epoch.
+//
+// Memory: open and sealed epochs hold each event's digests, leaf and WAL
+// location, never its bytes; finalize reads the events back from the WAL to
+// write the evidence bundle. Resource limits (limits.go) are enforced when an
+// event is submitted, before anything is written or acknowledged.
 package engine
 
 import (
@@ -56,6 +61,10 @@ type Config struct {
 	// events after the revocation would only produce evidence that can never
 	// verify.
 	KeyCheck KeyChecker
+	// Limits bound unanchored events (limits.go); FreeDisk reads the data
+	// directory's free space for Limits.MinFreeDiskBytes (nil: not checked).
+	Limits   Limits
+	FreeDisk FreeDiskFunc
 }
 
 // KeyChecker re-checks agent keys on chain when an epoch is sealed.
@@ -105,12 +114,14 @@ type Stats struct {
 	RevokedExcluded uint64
 }
 
+// entry is one committed event. Its canonical bytes stay in the WAL at loc.
 type entry struct {
-	seq       uint64
-	canonical []byte
-	digest    [32]byte
-	leaf      merkle.Hash
-	keyID     canonical.Digest
+	seq    uint64
+	loc    wal.Loc
+	size   int64 // canonical bytes
+	digest [32]byte
+	leaf   merkle.Hash
+	keyID  canonical.Digest
 }
 
 // shard holds one agent's open epoch.
@@ -176,6 +187,16 @@ type sealedEpoch struct {
 	tree     *merkle.Sealed
 }
 
+func (b *sealedEpoch) bytes() int64 { return sumBytes(b.entries) }
+
+func sumBytes(entries []entry) int64 {
+	var n int64
+	for _, en := range entries {
+		n += en.size
+	}
+	return n
+}
+
 func (b *sealedEpoch) label() string {
 	return fmt.Sprintf("%s[seq %d-%d]", b.agentID, b.entries[0].seq, b.entries[len(b.entries)-1].seq)
 }
@@ -217,6 +238,11 @@ type Engine struct {
 
 	accepted, duplicates, sealed, anchored, revokedExcluded atomic.Uint64
 	fatal                                                   chan error
+
+	limMu      sync.Mutex
+	use        usage
+	now        func() time.Time
+	diskLogged time.Time // owned by checkDisk's callers (Start, then diskLoop)
 }
 
 // New creates an engine. Call Recover with the WAL's records, then Start.
@@ -236,6 +262,16 @@ func New(cfg Config, w *wal.Log, st *store.Store, enq Enqueuer, logger *slog.Log
 	if logger == nil {
 		logger = slog.Default()
 	}
+	if cfg.Limits.AgentRate < 0 || cfg.Limits.MaxAgentEvents < 0 || cfg.Limits.MaxAgentBytes < 0 ||
+		cfg.Limits.MaxTotalBytes < 0 || cfg.Limits.MaxAnchorQueue < 0 || cfg.Limits.AgentBurst < 0 {
+		return nil, errors.New("engine: limits must not be negative")
+	}
+	if cfg.Limits.AgentRate > 0 && cfg.Limits.AgentBurst == 0 {
+		cfg.Limits.AgentBurst = max(1, int(cfg.Limits.AgentRate))
+	}
+	if cfg.Limits.DiskCheckInterval <= 0 {
+		cfg.Limits.DiskCheckInterval = 5 * time.Second
+	}
 	cp, err := st.LoadCheckpoint()
 	if err != nil {
 		return nil, err
@@ -249,6 +285,8 @@ func New(cfg Config, w *wal.Log, st *store.Store, enq Enqueuer, logger *slog.Log
 		nextSeq:    1,
 		checkpoint: cp,
 		fatal:      make(chan error, 1),
+		use:        usage{agents: map[string]*agentUsage{}, rejected: map[string]uint64{}},
+		now:        time.Now,
 	}, nil
 }
 
@@ -274,39 +312,75 @@ func (e *Engine) anchoredSeq(agentID string) uint64 {
 	return e.checkpoint.Agents[agentID].AnchoredSeq
 }
 
-// Recover rebuilds state from WAL records. It must run before Start.
-func (e *Engine) Recover(recs []wal.Record) error {
-	type agentLog struct {
-		events []wal.Record
-		seals  []wal.Record
-	}
-	logs := map[string]*agentLog{}
+// Recover rebuilds state from the WAL, streaming it one record at a time:
+// only the metadata of unanchored events is kept. It must run before Start.
+func (e *Engine) Recover() error {
+	pending := map[string][]entry{} // per agent: unanchored events not yet in a replayed seal
 	var order []string
 	var maxSeq uint64
-	for _, r := range recs {
-		if r.Seq > maxSeq {
-			maxSeq = r.Seq
-		}
-		if r.LastSeq > maxSeq {
-			maxSeq = r.LastSeq
-		}
+	var records, requeued int
+	err := e.wal.Replay(func(r wal.Record, loc wal.Loc) error {
+		records++
+		maxSeq = max(maxSeq, r.Seq, r.LastSeq)
 		anchored := e.anchoredSeq(r.AgentID)
-		l := logs[r.AgentID]
-		if l == nil {
-			l = &agentLog{}
-			logs[r.AgentID] = l
+		if _, ok := pending[r.AgentID]; !ok {
+			pending[r.AgentID] = nil
 			order = append(order, r.AgentID)
 		}
 		switch r.Type {
 		case wal.TypeEvent:
 			if r.Seq > anchored {
-				l.events = append(l.events, r)
+				d := canonical.ContentDigest(r.Event)
+				en := entry{seq: r.Seq, loc: loc, size: int64(len(r.Event)), digest: d, leaf: merkle.LeafFromDigest(d)}
+				if ev, err := canonical.ParseEvent(r.Event); err == nil {
+					en.keyID = ev.KeyID
+				}
+				pending[r.AgentID] = append(pending[r.AgentID], en)
 			}
 		case wal.TypeSealed:
-			if r.LastSeq > anchored {
-				l.seals = append(l.seals, r)
+			if r.LastSeq <= anchored {
+				return nil
 			}
+			// A seal is written after every event it covers.
+			evs := pending[r.AgentID]
+			skip := make(map[uint64]bool, len(r.Skip))
+			for _, q := range r.Skip {
+				skip[q] = true
+			}
+			var entries []entry
+			var skippedBytes int64
+			i := 0
+			for ; i < len(evs) && evs[i].seq <= r.LastSeq; i++ {
+				if evs[i].seq < r.FirstSeq {
+					return fmt.Errorf("engine: recover %s: event seq %d precedes sealed epoch [%d,%d] and is not anchored",
+						r.AgentID, evs[i].seq, r.FirstSeq, r.LastSeq)
+				}
+				if skip[evs[i].seq] {
+					skippedBytes += evs[i].size
+					continue
+				}
+				entries = append(entries, evs[i])
+			}
+			pending[r.AgentID] = append([]entry(nil), evs[i:]...)
+			if len(entries) == 0 && r.Count == 0 {
+				return nil // every event was left out at seal time: nothing to anchor
+			}
+			b, err := e.buildSealed(r.AgentID, entries)
+			if err != nil {
+				return fmt.Errorf("engine: recover %s epoch [%d,%d]: %w", r.AgentID, r.FirstSeq, r.LastSeq, err)
+			}
+			if got := canonical.Digest(b.tree.Root()).Hex(); got != r.Root || len(entries) != r.Count {
+				return fmt.Errorf("engine: recover %s epoch [%d,%d]: rebuilt root %s/%d events does not match sealed root %s/%d",
+					r.AgentID, r.FirstSeq, r.LastSeq, got, len(entries), r.Root, r.Count)
+			}
+			e.addUsage(r.AgentID, int64(len(entries)), b.bytes())
+			e.enqueueAnchor(b)
+			requeued++
 		}
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 	e.cpMu.Lock()
 	for _, p := range e.checkpoint.Agents {
@@ -315,55 +389,19 @@ func (e *Engine) Recover(recs []wal.Record) error {
 	e.cpMu.Unlock()
 	e.nextSeq = maxSeq + 1
 
-	toEntry := func(r wal.Record) entry {
-		d := canonical.ContentDigest(r.Event)
-		en := entry{seq: r.Seq, canonical: []byte(r.Event), digest: d, leaf: merkle.LeafFromDigest(d)}
-		if ev, err := canonical.ParseEvent(r.Event); err == nil {
-			en.keyID = ev.KeyID
-		}
-		return en
-	}
-	var requeued, reopened int
+	var reopened int
 	for _, agentID := range order {
-		l := logs[agentID]
-		i := 0
-		for _, s := range l.seals {
-			var entries []entry
-			skip := make(map[uint64]bool, len(s.Skip))
-			for _, q := range s.Skip {
-				skip[q] = true
-			}
-			for i < len(l.events) && l.events[i].Seq <= s.LastSeq {
-				if l.events[i].Seq < s.FirstSeq {
-					return fmt.Errorf("engine: recover %s: event seq %d precedes sealed epoch [%d,%d] and is not anchored",
-						agentID, l.events[i].Seq, s.FirstSeq, s.LastSeq)
-				}
-				if !skip[l.events[i].Seq] {
-					entries = append(entries, toEntry(l.events[i]))
-				}
-				i++
-			}
-			if len(entries) == 0 && s.Count == 0 {
-				continue // every event was left out at seal time: nothing to anchor
-			}
-			b, err := e.buildSealed(agentID, entries)
-			if err != nil {
-				return fmt.Errorf("engine: recover %s epoch [%d,%d]: %w", agentID, s.FirstSeq, s.LastSeq, err)
-			}
-			if got := canonical.Digest(b.tree.Root()).Hex(); got != s.Root || len(entries) != s.Count {
-				return fmt.Errorf("engine: recover %s epoch [%d,%d]: rebuilt root %s/%d events does not match sealed root %s/%d",
-					agentID, s.FirstSeq, s.LastSeq, got, len(entries), s.Root, s.Count)
-			}
-			e.enqueueAnchor(b)
-			requeued++
-		}
 		sh := e.shard(agentID)
-		for ; i < len(l.events); i++ {
-			sh.append(toEntry(l.events[i]))
+		var bytes int64
+		for _, en := range pending[agentID] {
+			sh.append(en)
+			bytes += en.size
 			reopened++
 		}
+		e.addUsage(agentID, int64(len(pending[agentID])), bytes)
 	}
-	e.log.Info("engine: recovered from WAL", "records", len(recs), "requeued_epochs", requeued, "reopened_events", reopened, "next_seq", e.nextSeq)
+	e.log.Info("engine: recovered from WAL", "records", records, "requeued_epochs", requeued, "reopened_events", reopened,
+		"next_seq", e.nextSeq, "wal_bytes", e.wal.Bytes())
 	return nil
 }
 
@@ -381,9 +419,14 @@ func (e *Engine) buildSealed(agentID string, entries []entry) (*sealedEpoch, err
 // Start launches the committer and sealer. Fatal errors (WAL failure) are
 // reported on Fatal(); the engine stops accepting events after one.
 func (e *Engine) Start(ctx context.Context) {
+	e.checkDisk()
 	e.wg.Add(2)
 	go func() { defer e.wg.Done(); e.commitLoop() }()
 	go func() { defer e.wg.Done(); e.sealLoop(ctx) }()
+	if e.cfg.FreeDisk != nil {
+		e.wg.Add(1)
+		go e.diskLoop(ctx, &e.wg)
+	}
 }
 
 // Fatal delivers an unrecoverable error (at most one).
@@ -420,11 +463,16 @@ func (e *Engine) send(ctx context.Context, sub *submission) error {
 }
 
 // Submit queues a prepared event. The returned channel yields exactly one
-// Result once the event is durable (or rejected). Submit blocks only when the
-// submit queue is full (backpressure).
+// Result once the event is durable (or rejected). An event over a resource
+// limit is refused at once with a *BackpressureError; otherwise Submit
+// blocks only while the submit queue is full.
 func (e *Engine) Submit(ctx context.Context, p Prepared) (<-chan Result, error) {
+	if err := e.admit(p.AgentID, int64(len(p.Canonical))); err != nil {
+		return nil, err
+	}
 	sub := &submission{prep: p, result: make(chan Result, 1)}
 	if err := e.send(ctx, sub); err != nil {
+		e.release(p.AgentID, 1, int64(len(p.Canonical)))
 		return nil, err
 	}
 	return sub.result, nil
@@ -465,10 +513,11 @@ func (e *Engine) commitLoop() {
 // order in which leaves are appended to shards (= WAL order).
 func (e *Engine) commit(batch []*submission) {
 	type pendingEvent struct {
-		sub   *submission
-		shard *shard
-		entry entry
-		dupOf *entry // set for duplicates
+		sub    *submission
+		shard  *shard
+		entry  entry
+		recIdx int    // index of its record in recs
+		dupOf  *entry // set for duplicates
 	}
 	var recs []wal.Record
 	events := make([]pendingEvent, 0, len(batch))
@@ -493,14 +542,21 @@ func (e *Engine) commit(batch []*submission) {
 		} else {
 			inBatch[p.AgentID] = map[[32]byte]entry{}
 		}
-		en := entry{seq: e.nextSeq, canonical: p.Canonical, digest: p.Digest, leaf: p.Leaf, keyID: p.KeyID}
+		en := entry{seq: e.nextSeq, size: int64(len(p.Canonical)), digest: p.Digest, leaf: p.Leaf, keyID: p.KeyID}
 		e.nextSeq++
 		inBatch[p.AgentID][p.Digest] = en
 		recs = append(recs, wal.Record{Type: wal.TypeEvent, AgentID: p.AgentID, Seq: en.seq, Event: p.Canonical})
-		events = append(events, pendingEvent{sub: sub, shard: sh, entry: en})
+		events = append(events, pendingEvent{sub: sub, shard: sh, entry: en, recIdx: len(recs) - 1})
 	}
 
-	if err := e.wal.Write(recs); err != nil {
+	locs, err := e.wal.Append(recs)
+	if err != nil && len(locs) == len(recs) {
+		// Durable, but the segment rotation after it failed: the next write
+		// reports the problem again.
+		e.log.Warn("engine: WAL rotation failed", "err", err)
+		err = nil
+	}
+	if err != nil {
 		e.log.Error("engine: WAL write failed; rejecting batch", "err", err)
 		select {
 		case e.fatal <- err:
@@ -510,6 +566,7 @@ func (e *Engine) commit(batch []*submission) {
 			if sub.seal != nil {
 				sub.done <- err
 			} else {
+				e.release(sub.prep.AgentID, 1, int64(len(sub.prep.Canonical)))
 				sub.result <- Result{Err: fmt.Errorf("event not persisted: %w", err)}
 			}
 		}
@@ -519,10 +576,12 @@ func (e *Engine) commit(batch []*submission) {
 	needSeal := false
 	for _, pe := range events {
 		if pe.dupOf != nil {
+			e.release(pe.sub.prep.AgentID, 1, int64(len(pe.sub.prep.Canonical)))
 			e.duplicates.Add(1)
 			pe.sub.result <- Result{Seq: pe.dupOf.seq, Duplicate: true, LeafIndex: -1}
 			continue
 		}
+		pe.entry.loc = locs[pe.recIdx]
 		idx, n := pe.shard.append(pe.entry)
 		e.accepted.Add(1)
 		pe.sub.result <- Result{Seq: pe.entry.seq, LeafIndex: idx}
@@ -622,6 +681,9 @@ func (e *Engine) seal(ctx context.Context, s *shard) error {
 		// Events stay durable in the WAL; replay will reopen them.
 		return err
 	}
+	if len(skipped) > 0 {
+		e.release(s.agentID, int64(len(entries)-len(kept)), sumBytes(entries)-sumBytes(kept))
+	}
 	if b == nil {
 		e.log.Error("engine: epoch sealed empty: every event was signed with a revoked key", "agent", s.agentID,
 			"excluded", len(skipped), "first_seq", firstSeq, "last_seq", lastSeq)
@@ -683,6 +745,7 @@ func leavesOf(entries []entry) []merkle.Hash {
 }
 
 func (e *Engine) enqueueAnchor(b *sealedEpoch) {
+	e.queueDelta(1)
 	e.anchor.Enqueue(anchor.Job{
 		Request: anchor.Request{AgentKey: b.agentKey, Root: b.tree.Root(), Count: uint32(len(b.entries))},
 		Label:   b.label(),
@@ -712,10 +775,21 @@ func (e *Engine) finalize(b *sealedEpoch, res anchor.Result) error {
 		AnchoredAt:       time.Now().UTC(),
 		Events:           make([]store.EventProof, len(b.entries)),
 	}
+	// The events' bytes are read back from the WAL; it keeps them until the
+	// checkpoint below covers them.
+	rd := e.wal.NewReader()
+	defer rd.Close()
 	for i, en := range b.entries {
 		proof, err := b.tree.Proof(i)
 		if err != nil {
 			return err
+		}
+		rec, err := rd.Read(en.loc)
+		if err != nil {
+			return fmt.Errorf("reading event seq %d back from the WAL: %w", en.seq, err)
+		}
+		if rec.Type != wal.TypeEvent || rec.Seq != en.seq || canonical.ContentDigest(rec.Event) != en.digest {
+			return fmt.Errorf("WAL record at %+v is not event seq %d with the committed digest", en.loc, en.seq)
 		}
 		ps := make([]string, len(proof))
 		for j, p := range proof {
@@ -727,7 +801,7 @@ func (e *Engine) finalize(b *sealedEpoch, res anchor.Result) error {
 			ContentDigest:  canonical.Digest(en.digest).Hex(),
 			Leaf:           canonical.Digest(en.leaf).Hex(),
 			Proof:          ps,
-			CanonicalEvent: string(en.canonical),
+			CanonicalEvent: string(rec.Event),
 		}
 	}
 	if err := e.store.WriteBundle(bundle); err != nil {
@@ -754,6 +828,8 @@ func (e *Engine) finalize(b *sealedEpoch, res anchor.Result) error {
 	}
 
 	e.anchored.Add(1)
+	e.release(b.agentID, int64(len(b.entries)), b.bytes())
+	e.queueDelta(-1)
 	e.log.Info("engine: epoch anchored", "agent", b.agentID, "epoch", res.EpochID, "events", len(b.entries), "tx", res.TxHash, "block", res.BlockNumber,
 		"block_hash", res.BlockHash, "finality", res.Finality, "final_block", res.FinalBlockNumber,
 		"bundle", e.store.BundlePath(bundle.AgentKey, bundle.EpochID))

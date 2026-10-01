@@ -21,6 +21,7 @@ import (
 	verilogv1 "github.com/ronitspatil/verilog/daemon/gen/verilog/v1"
 	"github.com/ronitspatil/verilog/daemon/internal/anchor"
 	"github.com/ronitspatil/verilog/daemon/internal/config"
+	"github.com/ronitspatil/verilog/daemon/internal/diskspace"
 	"github.com/ronitspatil/verilog/daemon/internal/engine"
 	"github.com/ronitspatil/verilog/daemon/internal/finality"
 	"github.com/ronitspatil/verilog/daemon/internal/ingest"
@@ -119,7 +120,7 @@ func run() (err error) {
 	if err != nil {
 		return err
 	}
-	w, recs, err := wal.Open(cfg.DataDir+"/wal", cfg.WALSegmentBytes, logger)
+	w, err := wal.Open(cfg.DataDir+"/wal", cfg.WALSegmentBytes, logger)
 	if err != nil {
 		return err
 	}
@@ -136,14 +137,23 @@ func run() (err error) {
 		ChainID:       chain.ChainID().String(),
 		Contract:      cfg.Contract.Hex(),
 		KeyCheck:      sealCheck,
+		Limits: engine.Limits{
+			MaxAgentEvents:   cfg.Limits.MaxAgentEvents,
+			MaxAgentBytes:    cfg.Limits.MaxAgentBytes,
+			MaxTotalBytes:    cfg.Limits.MaxTotalBytes,
+			MaxAnchorQueue:   cfg.Limits.MaxAnchorQueue,
+			AgentRate:        cfg.Limits.AgentRate,
+			AgentBurst:       cfg.Limits.AgentBurst,
+			MinFreeDiskBytes: cfg.Limits.MinFreeDiskBytes,
+		},
+		FreeDisk: diskspace.Free,
 	}, w, st, worker, logger)
 	if err != nil {
 		return err
 	}
-	if err := eng.Recover(recs); err != nil {
+	if err := eng.Recover(); err != nil {
 		return err
 	}
-	recs = nil
 
 	engCtx, cancelEng := context.WithCancel(context.Background())
 	defer cancelEng()
@@ -178,6 +188,12 @@ func run() (err error) {
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(lis) }()
+	stopMetrics, err := serveMetrics(cfg.MetricsListen, eng, worker, logger)
+	if err != nil {
+		srv.Stop()
+		return err
+	}
+	defer stopMetrics()
 	logger.Info("verilogd listening", "addr", lis.Addr().String(), "mtls", cfg.Transport.MTLS(), "data_dir", cfg.DataDir,
 		"epoch_interval", cfg.EpochInterval, "epoch_max_logs", cfg.EpochMaxLogs)
 
@@ -197,9 +213,7 @@ loop:
 			runErr = fmt.Errorf("engine: %w", err)
 			break loop
 		case <-statsTick.C:
-			s := eng.Stats()
-			logger.Info("stats", "accepted", s.Accepted, "duplicates", s.Duplicates, "sealed_epochs", s.SealedEpochs,
-				"anchored_epochs", s.AnchoredEpochs, "anchor_queue", worker.Pending(), "revoked_excluded", s.RevokedExcluded)
+			logStats(logger, eng, worker)
 		}
 	}
 

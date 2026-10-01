@@ -121,7 +121,7 @@ func TestLoadKeyFromEnvWarns(t *testing.T) {
 }
 
 func TestLoadSignerAndFees(t *testing.T) {
-	base := []string{"--rpc", "http://x", "--contract", "0x5FbDB2315678afecb367f032d93F642f64180aa3"}
+	base := []string{"--rpc", "http://x", "--contract", "0x5FbDB2315678afecb367f032d93F642f64180aa3", "--insecure-plaintext"}
 	load := func(extra ...string) (*Config, error) {
 		return Load(append(append([]string{}, base...), extra...), envOf(nil), io.Discard)
 	}

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import threading
 import time
@@ -5,6 +6,7 @@ import time
 import pytest
 
 from verilog_sdk import OverflowPolicy, Signer, VeriLogClient
+from verilog_sdk import client as client_mod
 from verilog_sdk.canonical import ZERO_HASH, canonical_json
 
 from .conftest import TEST_SEED_HEX, check_chains, unused_target
@@ -167,15 +169,145 @@ def test_unserializable_payload_is_reported_without_raising(fake_daemon):
     check_chains(fake_daemon.events, PUB)
 
 
-def test_events_after_run_end_are_dropped(fake_daemon):
+def test_events_after_run_end_become_late_runs(fake_daemon):
+    """L5: a late event is never dropped silently and never extends the ended
+    run: it is signed as its own run, closed by a run_end naming the original."""
     client = VeriLogClient(fake_daemon.target)
     client.submit("a", "r", "t", {})
     client.submit("a", "r", "run_end", {"status": "ok"})
-    client.submit("a", "r", "late", {})
+    client.submit("a", "r", "late", {"x": 1})
     assert client.flush(timeout=10)
     client.close()
-    assert [e.event_type for e in fake_daemon.events] == ["t", "run_end"]
-    assert client.stats().dropped == 1
+    runs = check_chains(fake_daemon.events, PUB)
+    assert [e.event_type for e in runs["r"]] == ["t", "run_end"]
+    late_run = [r for r in runs if r.startswith("r#late-")]
+    assert len(late_run) == 1
+    late = runs[late_run[0]]
+    assert [(e.event_type, json.loads(e.payload_json)) for e in late] == [
+        ("late", {"x": 1}), ("run_end", {"status": "late", "late_for_run": "r", "steps": 1}),
+    ]
+    stats = client.stats()
+    assert stats.late_events == 1 and stats.dropped == 0
+
+
+def test_late_event_after_ended_run_memory_is_not_a_fork(fake_daemon, monkeypatch):
+    """L5: after many runs have ended, a late event still does not restart its
+    run at step 1 (which the verifier would report as a fork)."""
+    monkeypatch.setattr(client_mod, "_ENDED_RUNS_MEMORY", 3)
+    client = VeriLogClient(fake_daemon.target)
+    for i in range(10):
+        client.submit("a", f"r{i}", "t", {})
+        client.submit("a", f"r{i}", "run_end", {"status": "ok"})
+    assert client.flush(timeout=10)
+    client.submit("a", "r0", "late", {})  # r0 left the exact memory long ago
+    assert client.flush(timeout=10)
+    client.close()
+    runs = check_chains(fake_daemon.events, PUB)
+    assert [e.event_type for e in runs["r0"]] == ["t", "run_end"]
+    assert client.stats().late_events == 1
+
+
+def test_open_runs_are_bounded(fake_daemon):
+    """L5: runs that never end are closed with run_end "evicted" beyond max_open_runs."""
+    client = VeriLogClient(fake_daemon.target, max_open_runs=2)
+    for i in range(4):
+        client.submit("a", f"open-{i}", "t", {})
+    assert client.flush(timeout=10)
+    client.submit("a", "open-0", "t2", {})  # evicted: becomes a late run
+    assert client.flush(timeout=10)
+    client.close()
+    runs = check_chains(fake_daemon.events, PUB)
+    ended = {r for r, evs in runs.items() if evs[-1].event_type == "run_end"}
+    assert {"open-0", "open-1"} <= ended
+    assert json.loads(runs["open-0"][-1].payload_json) == {"status": "evicted", "steps": 1}
+    assert len(client._chains) <= 2
+    assert client.stats().evicted_runs == 2 and client.stats().late_events == 1
+
+
+@pytest.mark.parametrize("fake_daemon", [{"max_payload": 1 << 20}], indirect=True)
+def test_oversized_payload_is_replaced_by_signed_stand_in(fake_daemon):
+    """H2 / PoC 6: a payload over the daemon's limit never reaches the daemon;
+    a stand-in committing to it by SHA-256 and size is chained instead, so
+    the run stays verifiable."""
+    kept = []
+    client = VeriLogClient(fake_daemon.target, on_oversize=lambda *a: kept.append(a))
+    big = {"output": "x" * ((1 << 20) + 10)}
+    client.submit("agent", "run-1", "tool_start", {"i": 1})
+    client.submit("agent", "run-1", "tool_end", big)
+    client.submit("agent", "run-1", "tool_end", {"i": 3})
+    client.submit("agent", "run-1", "run_end", {"status": "ok"})
+    assert client.flush(timeout=10)
+    client.close()
+    stats = client.stats()
+    assert stats.rejected == 0 and stats.chain_gaps == 0 and stats.truncated == 1 and stats.acked == 4
+    events = check_chains(fake_daemon.accepted, PUB)["run-1"]
+    assert len(events) == 4
+    raw = canonical_json(big).encode()
+    stand_in = json.loads(events[1].payload_json)
+    assert stand_in == {"bytes": len(raw), "sha256": "0x" + hashlib.sha256(raw).hexdigest(), "truncated": True}
+    assert kept and kept[0][3] == stand_in["sha256"] and kept[0][4].encode() == raw
+
+
+@pytest.mark.parametrize("fake_daemon", [{"unregistered_for": 0.6}], indirect=True)
+def test_key_not_yet_visible_is_retried_in_order(fake_daemon):
+    """H2: "not registered" rejections are retried with backoff, so an agent
+    that starts right after its key registration has no gap."""
+    client = VeriLogClient(fake_daemon.target, key_wait_timeout=10)
+    for i in range(5):
+        client.submit("a", "r", "t", {"i": i})
+    client.submit("a", "r", "run_end", {"status": "ok"})
+    assert client.flush(timeout=15)
+    client.close()
+    stats = client.stats()
+    assert stats.acked == 6 and stats.rejected == 0 and stats.chain_gaps == 0 and stats.retried >= 1
+    # Accepted in chain order, every step present.
+    assert [e.step_number for e in fake_daemon.accepted] == list(range(1, 7))
+    check_chains(fake_daemon.accepted, PUB)
+
+
+@pytest.mark.parametrize("fake_daemon", [{"unregistered_for": 60}], indirect=True)
+def test_retry_window_is_bounded(fake_daemon, caplog):
+    client = VeriLogClient(fake_daemon.target, key_wait_timeout=0.5)
+    client.submit("a", "r", "t", {})
+    assert client.flush(timeout=10)
+    client.close()
+    stats = client.stats()
+    assert stats.rejected == 1 and stats.chain_gaps == 1 and stats.acked == 0
+    assert any(r.levelname == "ERROR" and "gap" in r.message for r in caplog.records)
+
+
+@pytest.mark.parametrize("fake_daemon", [{"reject_types": {"bad"}}], indirect=True)
+def test_rejected_chained_event_is_an_error_and_counted(fake_daemon, caplog):
+    client = VeriLogClient(fake_daemon.target)
+    client.submit("a", "r", "bad", {})
+    assert client.flush(timeout=10)
+    client.close()
+    assert client.stats().chain_gaps == 1
+    assert any(r.levelname == "ERROR" and "gap" in r.message for r in caplog.records)
+
+
+def test_far_future_timestamp_is_signed(fake_daemon):
+    client = VeriLogClient(fake_daemon.target)
+    client.submit("a", "r", "t", {}, timestamp_ns=10**20)  # year 5138: valid
+    assert client.flush(timeout=10)
+    client.close()
+    assert client.stats().acked == 1 and client.stats().serialization_errors == 0
+    check_chains(fake_daemon.events, PUB)
+
+
+@pytest.mark.parametrize("ts", [10**21, 2**80, -1])
+def test_bad_timestamp_does_not_poison_the_sender(fake_daemon, ts):
+    """L4: a caller timestamp the canonical form cannot carry is reported as
+    a dropped event; later events still flow."""
+    client = VeriLogClient(fake_daemon.target)
+    client.submit("a", "r", "t", {}, timestamp_ns=ts)
+    client.submit("a", "r", "t", {"ok": True})
+    assert client.flush(timeout=10)
+    client.close()
+    assert client.stats().serialization_errors == 1
+    assert [(e.event_type, json.loads(e.payload_json)) for e in fake_daemon.events] == [
+        ("sdk_dropped", {"count": 1}), ("t", {"ok": True}),
+    ]
 
 
 def test_submit_after_close_is_dropped(fake_daemon):

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -326,7 +327,7 @@ func bundlePath(ep uint64) string { return fmt.Sprintf("evidence/epoch-%d.json",
 func buildReport(a *verify.AuditReport, byRel map[string]bundleFile, loadWarnings []string, p reportParams) *Report {
 	rep := &Report{
 		Format:      reportFormat,
-		GeneratedAt: p.generatedAt.Format(time.RFC3339),
+		GeneratedAt: p.generatedAt.UTC().Format(time.RFC3339),
 		Tool:        p.tool,
 		AgentID:     p.agentID,
 		AgentKey:    a.AgentKey.Hex(),
@@ -398,11 +399,14 @@ func renderExport(rep *Report, a *verify.AuditReport, byRel map[string]bundleFil
 			files[bundlePath(e.EpochID)] = byRel[e.Evidence.Source].data
 		}
 	}
-	j, err := json.MarshalIndent(rep, "", "  ")
-	if err != nil {
+	var j bytes.Buffer
+	enc := json.NewEncoder(&j)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(rep); err != nil {
 		return nil, err
 	}
-	files["report.json"] = append(j, '\n')
+	files["report.json"] = j.Bytes()
 	files["report.md"] = []byte(reportMarkdown(rep))
 	files["README.md"] = []byte(readmeMarkdown(rep, rpc))
 	return files, nil

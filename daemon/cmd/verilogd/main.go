@@ -188,7 +188,17 @@ func run() (err error) {
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(lis) }()
-	stopMetrics, err := serveMetrics(cfg.MetricsListen, eng, worker, logger)
+	gauges := &alertGauges{signer: sgn.Address()}
+	if cfg.MetricsListen != "" {
+		if cfg.Transport.TLSCert != "" {
+			if gauges.certExpires, err = certNotAfter(cfg.Transport.TLSCert); err != nil {
+				srv.Stop()
+				return fmt.Errorf("--tls-cert: %w", err)
+			}
+		}
+		go gauges.pollBalance(engCtx, eth, balancePollInterval, logger)
+	}
+	stopMetrics, err := serveMetrics(cfg.MetricsListen, eng, worker, gauges, logger)
 	if err != nil {
 		srv.Stop()
 		return err

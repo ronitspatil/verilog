@@ -74,7 +74,7 @@ func collect(w *metrics.Writer, eng *engine.Engine, worker *anchor.Worker) {
 
 // serveMetrics serves /metrics on addr ("" disables it) and returns a stop
 // function.
-func serveMetrics(addr string, eng *engine.Engine, worker *anchor.Worker, logger *slog.Logger) (func(), error) {
+func serveMetrics(addr string, eng *engine.Engine, worker *anchor.Worker, gauges *alertGauges, logger *slog.Logger) (func(), error) {
 	if addr == "" {
 		return func() {}, nil
 	}
@@ -87,7 +87,10 @@ func serveMetrics(addr string, eng *engine.Engine, worker *anchor.Worker, logger
 			"addr", lis.Addr().String())
 	}
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", metrics.Handler(func(w *metrics.Writer) { collect(w, eng, worker) }))
+	mux.Handle("/metrics", metrics.Handler(func(w *metrics.Writer) {
+		collect(w, eng, worker)
+		gauges.collect(w)
+	}))
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, WriteTimeout: 10 * time.Second}
 	go func() {
 		if err := srv.Serve(lis); err != nil && !errors.Is(err, http.ErrServerClosed) {

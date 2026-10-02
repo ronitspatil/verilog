@@ -136,6 +136,7 @@ from the moment of anchoring. Details: [docs/operations.md](docs/operations.md#d
 | `sdk/python/` | `verilog-sdk`: signing client, LangChain callbacks, `keygen` |
 | `testdata/` | golden cross-implementation vectors (Go, Foundry, pytest) |
 | `scripts/e2e.sh` | full local run against anvil, including compromised-daemon attacks |
+| `deploy/prometheus/` | alerting rules for the daemon's metrics |
 
 ## Documentation
 
@@ -145,6 +146,7 @@ from the moment of anchoring. Details: [docs/operations.md](docs/operations.md#d
   requirements, daemon configuration, key management and rotation, the Safe
   hand-off, verifier modes and exit codes.
 - [docs/security.md](docs/security.md): threat model, guarantees and limits.
+- [docs/runbook.md](docs/runbook.md): retention, backups, alerts, routine tasks and evidence exports for auditors.
 - [sdk/python/README.md](sdk/python/README.md): Python SDK usage.
 
 `scripts/e2e.sh` and the test vectors use publicly known development keys.

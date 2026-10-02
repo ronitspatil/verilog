@@ -424,8 +424,12 @@ Prometheus metrics (`verilog_anchor_queue_epochs`, `verilog_finality_lag_seconds
 `verilog_unanchored_bytes`, `verilog_agent_unanchored_bytes{agent_id}`,
 `verilog_backpressure_rejections_total{reason}`, `verilog_wal_bytes`,
 `verilog_disk_free_bytes`, `verilog_disk_low`, ...). The endpoint has no
-authentication: keep it on loopback or a private network. Alert on
-`disk_low`, a growing anchor queue or finality lag, and sustained rejections.
+authentication: keep it on loopback or a private network. Two more gauges
+serve alerting: `verilog_signer_balance_wei{address}` (the anchoring key's
+balance, local or KMS, read every minute) and
+`verilog_tls_cert_expiry_timestamp_seconds` (the server certificate's
+notAfter). Alerting rules are in `deploy/prometheus/alerts.yml`; what to do
+when one fires is in the [runbook](runbook.md#alerts).
 
 ## Transport security (mTLS)
 
@@ -680,6 +684,12 @@ self-reported `sdk_dropped` counts) go to stderr. `--agent-id` accepts the
 string id or the raw `0x…` bytes32 key. `--onchain-check=false` skips the
 contract cross-check. Run `bin/verilog-verify --help` and
 `bin/verilog-verify export --help` for the full flag list.
+
+To hand a period's evidence to an auditor (every run in an anchor-time
+window, the bundles to re-verify them, a report and a manifest), use
+`verilog-verify audit-export`; see
+[Producing evidence for an auditor](runbook.md#producing-evidence-for-an-auditor).
+Retention, backups and alert responses are in the [runbook](runbook.md).
 
 ## Testnet deployment (Base Sepolia)
 

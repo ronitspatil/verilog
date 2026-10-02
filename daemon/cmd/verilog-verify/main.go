@@ -50,6 +50,16 @@
 // which accepts only a safe Ed25519 key (canonical, prime order) with a valid
 // proof of possession for the agent id (exit 0: "[KEY OK] ...", exit 1:
 // "[KEY REJECTED] ...", exit 2: bad arguments).
+//
+// For an auditor, audit-export verifies every run with events in epochs
+// anchored within [--from, --to) and writes a folder with the bundles needed
+// to re-verify them, report.json, report.md, a README and MANIFEST.sha256
+// (exit 0: every run SUCCESS; 1: any FAILURE; 3: none failed but a run is
+// incomplete or not final; 2: no folder written):
+//
+//	verilog-verify audit-export --agent-id ID --bundles DIR --from 2026-01-01 --to 2026-04-01 \
+//	    --rpc URL --contract 0xADDR --chain-id N --out DIR
+//	verilog-verify audit-check DIR    # re-hash against MANIFEST.sha256 (exit 0 / 1 / 2)
 package main
 
 import (
@@ -109,6 +119,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	if len(args) > 0 && args[0] == "keycheck" {
 		return runKeycheck(args[1:], stdout, stderr)
+	}
+	if len(args) > 0 && args[0] == "audit-export" {
+		return runAuditExport(args[1:], stdout, stderr)
+	}
+	if len(args) > 0 && args[0] == "audit-check" {
+		return runAuditCheck(args[1:], stdout, stderr)
 	}
 	if len(args) > 0 && args[0] == "verify" {
 		args = args[1:]

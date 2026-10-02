@@ -136,6 +136,7 @@ from the moment of anchoring. Details: [docs/operations.md](docs/operations.md#d
 | `sdk/python/` | `verilog-sdk`: signing client, LangChain callbacks, `keygen` |
 | `testdata/` | golden cross-implementation vectors (Go, Foundry, pytest) |
 | `scripts/e2e.sh` | full local run against anvil, including compromised-daemon attacks |
+| `deploy/prometheus/` | alerting rules for the daemon's metrics |
 
 ## Documentation
 

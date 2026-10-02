@@ -1,0 +1,54 @@
+{
+  "network": "base-sepolia",
+  "chain_id": 84532,
+  "testnet_only": true,
+  "deployed_at": "2026-10-02",
+  "source_commit": "eb7d8d0f24cc0474bc4b007290dd756367e9f18d",
+  "registry": {
+    "address": "0xd4735aa9414e249b2367bfb5d141a76993a5dd4c",
+    "deploy_tx": "0x9a70fcc18467ecacd21a71edba63c8124d048c384d94b34a41976f2991cc9a10",
+    "deploy_block": 47569302,
+    "source_verified": "https://base-sepolia.blockscout.com/address/0xd4735aa9414e249b2367bfb5d141a76993a5dd4c"
+  },
+  "roles": {
+    "DEFAULT_ADMIN_ROLE": ["0xDC45FD85F6517FA61a100Db76241895D69Ac3854"],
+    "KEY_ADMIN_ROLE": ["0xDC45FD85F6517FA61a100Db76241895D69Ac3854"],
+    "ANCHORER_ROLE": ["0x80869fD726F35eDF1Ae55Cb546E9873649Ef5845"],
+    "handover_txs": {
+      "grant_default_admin_to_safe": "0xb085e1e4a3444868595531b465e5ddb498177a3ab8e884edc0f69d8865d080b0",
+      "grant_key_admin_to_safe": "0xbee9c1e04c92f50700827bdf9d3d3627e9b104e6ac20a6bc625be57f83645b27",
+      "deployer_renounce_key_admin": "0x3d38ee8021d25f95753dc10827df6b0eace3f37cae1ccd12c3ac95a6a4a676d8",
+      "deployer_renounce_default_admin": "0x87b1066977a243c9439eaabf2eb03c59ecd668722451d93a92e877fa81c74261"
+    }
+  },
+  "deployer": "0x087fa32f305a883C7fBB80548F17D5bf62150c06",
+  "anchorer": "0x80869fD726F35eDF1Ae55Cb546E9873649Ef5845",
+  "safe": {
+    "address": "0xDC45FD85F6517FA61a100Db76241895D69Ac3854",
+    "version": "1.4.1",
+    "singleton": "0x29fcB43b46531BcA003ddC8FCB67FFE91900C762",
+    "proxy_factory": "0x4e1DCf7AD4e460CfD30791CCC4F9c8a4f820ec67",
+    "fallback_handler": "0xfd0732Dc9E303f09fCEf3a7388Ad10A83459Ec99",
+    "owners": [
+      "0xB21df04Dd4071FA483AC97d07a60E1CF206AD984",
+      "0xB77facB39e95AB3cec3B0c97B0C007A1ce73127F",
+      "0xC4ec51F18ee082e96Ee60477F78D25061609A0D8"
+    ],
+    "threshold": 2,
+    "creation_tx": "0xe093c479d2479a4201ac3601dd72cc622ed4e615d2595b44bd9443ce16b7c1e0",
+    "test_exec_tx": "0x8abae548674ce923b98f0287e9fcb0e695a118df4b0c635ca2a0b929f2eca500"
+  },
+  "agents": [
+    {
+      "agent_id": "testnet-agent-1",
+      "agent_key": "0x756629bcf612a2019aa0832d63026cbbd8400ff99898f06a5e8b74ffa013414c",
+      "key_id": "0xaae862efc05f4a8cd034b3a1143a2ef397d7b4cb0e6e372f4eb64e9cb20af7a7",
+      "pubkey": "0xe17303b3a390ab8af5ac915717e66479420b40167d33493d5f7c1bc3bc1c3840",
+      "register_tx": "0x229ab88845abdb5738663ddfdd7f2b7feabc6a3b1368fef34c14c8b94e787b27"
+    }
+  ],
+  "anchors": [
+    {"agent_id": "testnet-agent-1", "epoch": 1, "log_count": 24, "tx": "0x776fbab360d7426fad917ae4fa9fcd385c223d488c25fe02089f7d3f9d61d5fc"},
+    {"agent_id": "testnet-agent-1", "epoch": 2, "log_count": 9, "tx": "0x517572fc1bfaa2cac505287bba5fed5adb5f1d12d518268b8212c239bd9d2bc0"}
+  ]
+}

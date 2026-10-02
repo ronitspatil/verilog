@@ -676,3 +676,30 @@ self-reported `sdk_dropped` counts) go to stderr. `--agent-id` accepts the
 string id or the raw `0x…` bytes32 key. `--onchain-check=false` skips the
 contract cross-check. Run `bin/verilog-verify --help` and
 `bin/verilog-verify export --help` for the full flag list.
+
+## Testnet deployment (Base Sepolia)
+
+A live testnet deployment is recorded in
+[`deployments/base-sepolia.json`](../deployments/base-sepolia.json) (public
+data only): registry `0xd4735aa9414e249b2367bfb5d141a76993a5dd4c`, admin roles
+held by the 2-of-3 Safe `0xDC45FD85F6517FA61a100Db76241895D69Ac3854`, explorer
+https://sepolia.basescan.org. It was set up with the steps in this document
+(Deploy.s.sol, keygen and keycheck, the Safe handover above) and local,
+testnet-only keys; production uses the KMS signer.
+
+Observations from the first run:
+
+- **Finality:** an anchor mined on Base Sepolia reached the `finalized` tag
+  about 19 minutes later. Bundles and WAL compaction wait for it, so expect
+  evidence about 20 minutes after an epoch is anchored.
+- **Preconfirmations:** Base's public RPC can return a receipt for a
+  transaction that is not yet in a block (flashblocks), with a zero
+  `blockHash`, while `latest` nonces still lag. verilogd currently reads that
+  as a reorg, logs a spurious WARN and recovers without a double anchor. When
+  sending several transactions by hand with `cast send`, pass `--nonce`
+  explicitly.
+- **Cost:** deploy, Safe setup, key registration, role handover and two
+  anchors used about 0.000012 ETH in total.
+
+Verify a recorded event against it with `--chain-id 84532 --rpc
+https://sepolia.base.org --contract 0xd4735aa9414e249b2367bfb5d141a76993a5dd4c`.

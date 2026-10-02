@@ -208,24 +208,13 @@ func runVerify(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		return operational("%v", err)
 	}
-	// The pinned block must still be the canonical one once every read is
-	// done (a reorg deeper than the finality rule would change the answer).
-	stillCanonical := func() error {
-		h, err := client.HeaderByNumber(ctx, point.Number)
-		if err != nil {
-			return fmt.Errorf("re-reading block %s: %v", point.Number, err)
-		}
-		if h.Hash() != point.Hash() {
-			return fmt.Errorf("block %s was reorganized during verification (%s, now %s); retry, or use a stronger --finality",
-				point.Number, point.Hash().Hex(), h.Hash().Hex())
-		}
-		return nil
-	}
+	// The pinned block must still be the canonical one once every read is done.
+	pinned := func() error { return stillCanonical(ctx, client, point) }
 
 	if runMode {
 		rep, err := v.Run(ctx, verify.RunInput{AgentID: *agentID, RunID: *runID, Epochs: evidence, AllowIncomplete: *allowIncomplete})
 		if err == nil {
-			err = stillCanonical()
+			err = pinned()
 		}
 		if err != nil {
 			return operational("%v", err)
@@ -260,7 +249,7 @@ func runVerify(args []string, stdout, stderr io.Writer) int {
 
 	rep, err := v.Event(ctx, eventJSON, proof, *epoch, *agentID)
 	if err == nil {
-		err = stillCanonical()
+		err = pinned()
 	}
 	if err != nil {
 		return operational("%v", err)
@@ -316,12 +305,61 @@ func pinChain(ctx context.Context, c chainReader, want *big.Int, mode finality.M
 	return mode.Check(ctx, c)
 }
 
+// stillCanonical checks that the pinned block is still the canonical one
+// once every read is done (a reorg deeper than the finality rule would
+// change the answer).
+func stillCanonical(ctx context.Context, c finality.HeaderReader, point *types.Header) error {
+	h, err := c.HeaderByNumber(ctx, point.Number)
+	if err != nil {
+		return fmt.Errorf("re-reading block %s: %v", point.Number, err)
+	}
+	if h.Hash() != point.Hash() {
+		return fmt.Errorf("block %s was reorganized during verification (%s, now %s); retry, or use a stronger --finality",
+			point.Number, point.Hash().Hex(), h.Hash().Hex())
+	}
+	return nil
+}
+
 // loadEvidence reads every evidence bundle (*.json) under dir. The bundles
 // are untrusted: run mode checks each against the chain. A file that cannot
 // be read is an operational error; a file that is not a bundle is skipped
 // with a warning (run mode needs every epoch, so skipping can never hide one).
 func loadEvidence(dir string) ([]verify.EpochEvidence, []string, error) {
-	var out []verify.EpochEvidence
+	files, warnings, err := readBundles(dir)
+	if err != nil {
+		return nil, nil, err
+	}
+	out := make([]verify.EpochEvidence, len(files))
+	for i, f := range files {
+		out[i] = f.evidence(f.path)
+	}
+	return out, warnings, nil
+}
+
+// bundleFile is one evidence bundle as read from disk.
+type bundleFile struct {
+	path   string // as found under the directory
+	rel    string // relative to the directory, slash-separated
+	data   []byte // the file's exact bytes
+	bundle store.Bundle
+}
+
+// evidence returns the bundle's content for the verifier, labelled source.
+func (f bundleFile) evidence(source string) verify.EpochEvidence {
+	e := verify.EpochEvidence{Source: source, EpochID: f.bundle.EpochID, Events: make([][]byte, len(f.bundle.Events))}
+	if k, err := canonical.ParseDigest(f.bundle.AgentKey); err == nil {
+		e.AgentKey = &k
+	}
+	for i, ev := range f.bundle.Events {
+		e.Events[i] = []byte(ev.CanonicalEvent)
+	}
+	return e
+}
+
+// readBundles reads every *.json under dir, in lexical order; files that
+// are not bundles are skipped with a warning.
+func readBundles(dir string) ([]bundleFile, []string, error) {
+	var out []bundleFile
 	var warnings []string
 	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -339,14 +377,11 @@ func loadEvidence(dir string) ([]verify.EpochEvidence, []string, error) {
 			warnings = append(warnings, fmt.Sprintf("ignored %s: not an evidence bundle", path))
 			return nil
 		}
-		e := verify.EpochEvidence{Source: path, EpochID: b.EpochID, Events: make([][]byte, len(b.Events))}
-		if k, err := canonical.ParseDigest(b.AgentKey); err == nil {
-			e.AgentKey = &k
+		rel, err := filepath.Rel(dir, path)
+		if err != nil {
+			return err
 		}
-		for i, ev := range b.Events {
-			e.Events[i] = []byte(ev.CanonicalEvent)
-		}
-		out = append(out, e)
+		out = append(out, bundleFile{path: path, rel: filepath.ToSlash(rel), data: data, bundle: b})
 		return nil
 	})
 	if err != nil {

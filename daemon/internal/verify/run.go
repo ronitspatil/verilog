@@ -422,8 +422,8 @@ func (v *Verifier) setAsideNotFinal(ctx context.Context, agentKey canonical.Dige
 	}
 	if len(pending) > 0 {
 		sort.Slice(pending, func(i, j int) bool { return pending[i] < pending[j] })
-		return nil, opErr("epoch(s) %s hold events of run %q but are not final at block %s (final epochs: 1-%d): "+
-			"the run is not anchored yet; retry once they are final (see --finality)", ranges(pending), runID, v.at, latestFinal)
+		return nil, &OperationalError{Err: notFinalErr{fmt.Sprintf("epoch(s) %s hold events of run %q but are not final at block %s (final epochs: 1-%d): "+
+			"the run is not anchored yet; retry once they are final (see --finality)", ranges(pending), runID, v.at, latestFinal)}}
 	}
 	return kept, nil
 }

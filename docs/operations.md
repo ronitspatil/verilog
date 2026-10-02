@@ -371,8 +371,12 @@ and WAL compaction, not anchoring, sealing or ingest. Nonce order stays safe:
 a new transaction never takes a nonce at or below an anchor awaiting
 finality, and every transaction is recorded before broadcast.
 
-**Reorgs.** When the anchorer key's nonce on the canonical chain drops below
-a mined anchor's nonce, the anchor was reorged out. The daemon logs
+**Reorgs.** A receipt counts as mined only when its block hash is the
+canonical block at its number; a receipt with a zero block hash (a
+preconfirmation, as Base's flashblocks RPC serves) or from a block no longer
+canonical leaves the transaction pending. When no receipt of a mined anchor
+remains and the block it was recorded in is no longer canonical, the anchor
+was reorged out. The daemon logs
 `anchor: reorg removed the anchor transaction; sending it again` at WARN with
 the old block number and hash and the block now at that height, and sends the
 same signed transaction again (after a few checks, a same-nonce replacement
@@ -694,10 +698,14 @@ Observations from the first run:
   evidence about 20 minutes after an epoch is anchored.
 - **Preconfirmations:** Base's public RPC can return a receipt for a
   transaction that is not yet in a block (flashblocks), with a zero
-  `blockHash`, while `latest` nonces still lag. verilogd currently reads that
-  as a reorg, logs a spurious WARN and recovers without a double anchor. When
-  sending several transactions by hand with `cast send`, pass `--nonce`
-  explicitly.
+  `blockHash`, while `latest` nonces still lag. verilogd counts a receipt as
+  mined only when its block hash is the canonical block at its number, waits
+  for the sealed block (it never resends or replaces a preconfirmed
+  transaction), and calls an anchor reorged out only when its recorded block
+  is no longer canonical, never from the `latest` nonce. The first run's
+  spurious reorg WARN is fixed. The verifier reads only at the final block and
+  was never affected. When sending several transactions by hand with
+  `cast send`, still pass `--nonce` explicitly.
 - **Cost:** deploy, Safe setup, key registration, role handover and two
   anchors used about 0.000012 ETH in total.
 

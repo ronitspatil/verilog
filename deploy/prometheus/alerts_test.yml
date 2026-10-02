@@ -1,0 +1,103 @@
+# promtool test rules deploy/prometheus/alerts_test.yml
+rule_files:
+  - alerts.yml
+evaluation_interval: 1m
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'up{job="verilog", instance="d1"}'
+        values: '0x5'
+      - series: 'verilog_finality_lag_seconds{instance="d1"}'
+        values: '1200 2800x10'
+      - series: 'verilog_signer_balance_wei{instance="d1", address="0xA"}'
+        values: '9e15x15'
+      - series: 'verilog_tls_cert_expiry_timestamp_seconds{instance="d1"}'
+        values: '864000x15' # 10 days after the epoch; the test clock starts at 0
+      - series: 'verilog_disk_low{instance="d1"}'
+        values: '0 1x5'
+      - series: 'verilog_backpressure_rejections_total{instance="d1", reason="disk_low"}'
+        values: '0+10x15'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: VeriLogDown
+        exp_alerts:
+          - exp_labels: {severity: critical, job: verilog, instance: d1}
+            exp_annotations:
+              summary: verilogd d1 is down or not scraped
+              runbook: docs/runbook.md#verilogdown
+      - eval_time: 8m
+        alertname: VeriLogFinalityLagHigh
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: d1}
+            exp_annotations:
+              summary: "oldest mined anchor not final for 46m 40s on d1"
+              runbook: docs/runbook.md#verilogfinalitylaghigh
+      - eval_time: 12m
+        alertname: VeriLogSignerBalanceLow
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: d1, address: "0xA"}
+            exp_annotations:
+              summary: "anchoring key 0xA holds 9e+15 wei"
+              runbook: docs/runbook.md#verilogsignerbalancelow
+      - eval_time: 12m
+        alertname: VeriLogTLSCertExpiring
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: d1}
+            exp_annotations:
+              summary: "server TLS certificate expires in 9d 23h 48m 0s on d1"
+              runbook: docs/runbook.md#verilogtlscertexpiring
+      - eval_time: 3m
+        alertname: VeriLogDiskLow
+        exp_alerts:
+          - exp_labels: {severity: critical, instance: d1}
+            exp_annotations:
+              summary: data dir disk below --min-free-disk-bytes on d1; ingest refused
+              runbook: docs/runbook.md#verilogdisklow
+      - eval_time: 14m
+        alertname: VeriLogBackpressure
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: d1, reason: disk_low}
+            exp_annotations:
+              summary: "events refused for disk_low on d1"
+              runbook: docs/runbook.md#verilogbackpressure
+
+  - interval: 1m
+    input_series:
+      # Events keep coming, two epochs stay queued, nothing becomes final.
+      - series: 'verilog_events_accepted_total{instance="d1"}'
+        values: '0+5x90'
+      - series: 'verilog_epochs_anchored_total{instance="d1"}'
+        values: '3x90'
+      - series: 'verilog_anchor_queue_epochs{instance="d1"}'
+        values: '2x90'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: VeriLogAnchorQueueStuck
+        exp_alerts: []
+      - eval_time: 80m
+        alertname: VeriLogAnchorQueueStuck
+        exp_alerts:
+          - exp_labels: {severity: critical, instance: d1}
+            exp_annotations:
+              summary: "2 epochs queued, none anchored for an hour on d1"
+              runbook: docs/runbook.md#veriloganchorqueuestuck
+      - eval_time: 80m
+        alertname: VeriLogEpochsNotAnchored
+        exp_alerts:
+          - exp_labels: {severity: critical, instance: d1}
+            exp_annotations:
+              summary: events accepted but no epoch anchored for an hour on d1
+              runbook: docs/runbook.md#verilogepochsnotanchored
+
+  - interval: 1m
+    input_series:
+      - series: 'verilog_anchor_queue_epochs{instance="d1"}'
+        values: '5+1x90'
+    alert_rule_test:
+      - eval_time: 80m
+        alertname: VeriLogAnchorQueueGrowing
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: d1}
+            exp_annotations:
+              summary: "anchor queue at 85 epochs and growing on d1"
+              runbook: docs/runbook.md#veriloganchorqueuegrowing

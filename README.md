@@ -145,6 +145,7 @@ from the moment of anchoring. Details: [docs/operations.md](docs/operations.md#d
   requirements, daemon configuration, key management and rotation, the Safe
   hand-off, verifier modes and exit codes.
 - [docs/security.md](docs/security.md): threat model, guarantees and limits.
+- [docs/runbook.md](docs/runbook.md): retention, backups, alerts, routine tasks and evidence exports for auditors.
 - [sdk/python/README.md](sdk/python/README.md): Python SDK usage.
 
 `scripts/e2e.sh` and the test vectors use publicly known development keys.

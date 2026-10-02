@@ -210,6 +210,27 @@ expect_verify() {
 # expect_stderr <regex>: the last verify run explained itself.
 expect_stderr() { grep -q "$1" "$WORK/verify.err" || fail "expected stderr to match '$1'"; }
 
+# expect_audit <expected-exit> <out dir> args...: audit-export of the agent
+# pinned like expect_verify (mines first unless NOMINE=1).
+expect_audit() {
+  local want_code="$1" out="$2"; shift 2
+  [ "${NOMINE:-0}" = 1 ] || mine 2
+  set +e
+  "$VERIFY" audit-export --chain-id "$CHAIN_ID" --finality "$FINALITY" --agent-id "$AGENT_ID" --rpc "$RPC" \
+    --contract "$CONTRACT" --out "$out" "$@" >"$WORK/audit.out" 2>"$WORK/audit.err"
+  local code=$?
+  set -e
+  echo "exit=$code stdout='$(cat "$WORK/audit.out")'"
+  sed 's/^/    /' "$WORK/audit.err"
+  [ "$code" = "$want_code" ] || fail "audit-export: expected exit $want_code, got $code"
+}
+# report_runs <export dir>: "run_id=VERDICT" per run, from report.json.
+report_runs() {
+  "$PYTHON" -c 'import json,sys; print(" ".join(r["run_id"]+"="+r["verdict"] for r in json.load(open(sys.argv[1]+"/report.json"))["runs"]))' "$1"
+}
+# rfc3339 <unix seconds>
+rfc3339() { "$PYTHON" -c 'import datetime,sys; print(datetime.datetime.fromtimestamp(int(sys.argv[1]), datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))' "$1"; }
+
 SUCCESS="[SUCCESS] Log Integrity Verified"
 FAILURE="[FAILURE] Tampered Log Detected"
 INCOMPLETE="[SUCCESS-INCOMPLETE] Log Integrity Verified, Run Incomplete"
@@ -378,6 +399,11 @@ log "restart verilogd (SIGTERM, then start again)"
 stop_daemon
 start_daemon
 grep -q "engine: recovered from WAL" "$WORK/daemon.log" || fail "no recovery log line"
+# The audit window below starts here: every epoch anchored so far (the
+# first session, with the run that never ended) is before it.
+# anvil may give later blocks the same second, so move its clock past it.
+AUDIT_FROM="$(rfc3339 $(( $(chain_time) + 1 )))"
+advance_time 2
 
 log "second agent session after restart, with a 1.5 MB tool output (over the 1 MiB payload limit)"
 BEFORE="$(anchored_count)"
@@ -429,6 +455,10 @@ curl -fsS "$METRICS" >"$WORK/metrics.txt" || fail "GET $METRICS failed"
 grep -E '^verilog_backpressure_rejections_total\{reason="agent_unanchored_events"\} [1-9]' "$WORK/metrics.txt" \
   || { cat "$WORK/metrics.txt"; fail "metrics show no quota rejections"; }
 grep -E '^verilog_(anchor_queue_epochs|wal_bytes|disk_free_bytes|finality_lag_seconds) ' "$WORK/metrics.txt"
+grep -E "^verilog_signer_balance_wei\{address=\"$ANCHORER\"\} [1-9]" "$WORK/metrics.txt" \
+  || { cat "$WORK/metrics.txt"; fail "metrics show no signer balance"; }
+grep -E '^verilog_tls_cert_expiry_timestamp_seconds [1-9]' "$WORK/metrics.txt" \
+  || { cat "$WORK/metrics.txt"; fail "metrics show no TLS certificate expiry"; }
 grep -q "backpressure: refusing events for now" "$WORK/daemon.log" || fail "no backpressure log line"
 log "both runs held back by the quota verify (expect SUCCESS)"
 for run in $("$PYTHON" - "$EVIDENCE" "$EPOCHS_BEFORE" <<'PY'
@@ -526,6 +556,24 @@ expect_verify 2 "" --event "$WORK/ev-reorg/event.json" --proof "$WORK/ev-reorg/p
 expect_stderr "serves chain id $CHAIN_ID, not --chain-id 1"
 grep -q "VERILOG_PRIVATE_KEY environment variable" "$WORK/daemon.log" || fail "no warning for the anchoring key from the environment"
 stop_daemon
+
+# --------------------------------------------------------------- audit export
+# The audit window ends here: the attacker's epochs below come after it.
+AUDIT_TO="$(rfc3339 $(( $(chain_time) + 1 )))"
+advance_time 2
+FIRST=(--bundles "$EVIDENCE" --from 1970-01-01 --to "$AUDIT_FROM")
+log "audit-export of the first session: the run that never ended fails it (expect FAILURE, exit 1, full report)"
+expect_audit 1 "$WORK/audit-first" "${FIRST[@]}"
+report_runs "$WORK/audit-first"
+report_runs "$WORK/audit-first" | grep -q "$CRASHED_RUN=FAILURE" || fail "the run without run_end is not a FAILURE"
+report_runs "$WORK/audit-first" | grep -q "$RUN_ID=SUCCESS" || fail "the complete run is not a SUCCESS"
+grep -q "run ended without terminal event" "$WORK/audit-first/report.md" || fail "report.md lacks the failure reason"
+log "...with --allow-incomplete (expect SUCCESS-INCOMPLETE, exit 3)"
+expect_audit 3 "$WORK/audit-first-inc" "${FIRST[@]}" --allow-incomplete
+report_runs "$WORK/audit-first-inc" | grep -q "$CRASHED_RUN=SUCCESS-INCOMPLETE" || fail "the run without run_end is not SUCCESS-INCOMPLETE"
+log "audit-export into an existing folder (expect exit 2, nothing changed)"
+expect_audit 2 "$WORK/audit-first" "${FIRST[@]}"
+"$VERIFY" audit-check "$WORK/audit-first" >/dev/null || fail "the existing export was changed"
 
 # ---------------------------------------------------------------------------
 # A compromised daemon host: it holds the anchorer key and can anchor any
@@ -650,4 +698,49 @@ expect_stderr "does not match the on-chain anchors"
 log "an untouched run still verifies against the complete evidence, attacks included (expect SUCCESS)"
 expect_verify 0 "$SUCCESS" --run-id "$BIG_RUN" --bundles "$WORK/all" --agent-id "$AGENT_ID" --rpc "$RPC" --contract "$CONTRACT"
 
-printf '\nE2E PASSED: %s + %s + %s signed events anchored by the daemon; weak key refused at registration; single-event and run mode SUCCESS, FAILURE (tamper, re-spelled file, withheld, decoy, missing epoch, forged, revoked key, reordered, curated re-anchor), SUCCESS-INCOMPLETE, oversized payload, replay after revocation, key rotation, kill -9 between send and receipt, reorg between receipt and finality, finality and chain-id pinning, mTLS authorization and operational exits verified.\n' "$ACKED" "$ACKED2" "$OLD_ACKED"
+log "audit-export over the complete evidence, attacks included, for the window after the first session (expect SUCCESS)"
+all_evidence "$WORK/all"
+AUDIT="$WORK/audit"
+expect_audit 0 "$AUDIT" --bundles "$WORK/all" --from "$AUDIT_FROM" --to "$AUDIT_TO"
+RUNS="$(report_runs "$AUDIT")"
+echo "runs: $RUNS"
+[ -n "$RUNS" ] || fail "no runs in the audit window"
+echo "$RUNS" | grep -q "$BIG_RUN=SUCCESS" || fail "the oversized-payload run is not in the report"
+[ -z "$(echo "$RUNS" | tr ' ' '\n' | grep -v '=SUCCESS$')" ] || fail "a run in the window is not SUCCESS"
+"$PYTHON" - "$AUDIT" "$(latest_epoch)" <<'PY' || fail "report.json is not as expected"
+import json, os, sys
+d, latest = sys.argv[1], int(sys.argv[2])
+r = json.load(open(d + "/report.json"))
+assert r["verdict"] == "SUCCESS" and r["totals"]["failure"] == 0, r["totals"]
+assert [e["epoch"] for e in r["epochs"]] == list(range(1, latest + 1)), "every epoch is exported"
+assert r["epochs"][0]["in_window"] is False and r["epochs"][-1]["in_window"] is False, "first session and attacks are context"
+assert r["totals"]["epochs_in_window"] > 0 and r["totals"]["context_epochs"] > 0, r["totals"]
+assert all(os.path.exists(d + "/" + e["bundle"]) for e in r["epochs"])
+assert r["tool"]["commit"] != "unknown" and r["chain"]["verdict_block_hash"].startswith("0x")
+PY
+! grep -rIl -e "PRIVATE KEY" -e "${ANCHOR_KEY#0x}" -e "${ADMIN_KEY#0x}" "$AUDIT" || fail "the export holds key material"
+"$VERIFY" audit-check "$AUDIT" || fail "audit-check failed on a fresh export"
+
+log "one byte changed in an exported bundle: audit-check and run mode on the export both fail"
+TAMPERED="$("$PYTHON" - "$AUDIT" <<'PY'
+import json, sys
+d = sys.argv[1]
+e = next(e for e in json.load(open(d + "/report.json"))["epochs"] if e["in_window"])
+p = d + "/" + e["bundle"]
+b = bytearray(open(p, "rb").read())
+i = b.index(b'step_number\\":') + len(b'step_number\\":')
+b[i] = ord("0") + (b[i] - ord("0") + 1) % 10
+open(p, "wb").write(b)
+print(json.loads(json.loads(bytes(b))["events"][0]["canonical_event"])["run_id"])
+PY
+)" || fail "could not tamper with the export"
+set +e
+"$VERIFY" audit-check "$AUDIT" >"$WORK/check.out" 2>&1
+code=$?
+set -e
+cat "$WORK/check.out"
+[ "$code" = 1 ] && grep -q "^changed: evidence/epoch-" "$WORK/check.out" || fail "audit-check missed the changed byte (exit $code)"
+expect_verify 1 "$FAILURE" --run-id "$TAMPERED" --bundles "$AUDIT/evidence" --agent-id "$AGENT_ID" --rpc "$RPC" --contract "$CONTRACT"
+expect_stderr "does not match the on-chain anchors"
+
+printf '\nE2E PASSED: %s + %s + %s signed events anchored by the daemon; weak key refused at registration; single-event and run mode SUCCESS, FAILURE (tamper, re-spelled file, withheld, decoy, missing epoch, forged, revoked key, reordered, curated re-anchor), SUCCESS-INCOMPLETE, oversized payload, replay after revocation, key rotation, kill -9 between send and receipt, reorg between receipt and finality, finality and chain-id pinning, mTLS authorization, audit export and operational exits verified.\n' "$ACKED" "$ACKED2" "$OLD_ACKED"

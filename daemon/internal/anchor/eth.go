@@ -194,59 +194,117 @@ func (c *EthChain) Anchor(ctx context.Context, req Request) (Result, error) {
 
 func (c *EthChain) mine(ctx context.Context, req Request) (Result, error) {
 	// 1. A previous attempt (or an earlier version of it, or one sent before
-	//    a restart) may have been mined after we stopped waiting.
-	if res, ok, err := c.pendingReceipt(ctx, req); err != nil || ok {
+	//    a restart) may have been mined after we stopped waiting, or may be
+	//    preconfirmed: it is about to land, so it is awaited, not replaced.
+	res, ok, preconf, err := c.pendingReceipt(ctx, req)
+	if err != nil || ok {
 		return res, err
 	}
-	// 2. The root may already be anchored (e.g. crash after the receipt but
-	//    before the mined anchor was recorded).
-	if res, ok, err := c.alreadyAnchored(ctx, req); err != nil || ok {
-		return res, err
+	if !preconf {
+		// 2. The root may already be anchored (e.g. crash after the receipt
+		//    but before the mined anchor was recorded).
+		if res, ok, err := c.alreadyAnchored(ctx, req); err != nil || ok {
+			return res, err
+		}
+		// 3. Send (replace, or rebroadcast at the fee ceiling).
+		if _, err := c.sendVersion(ctx, req, c.pending, func(p *pendingTx) error {
+			c.pending = p
+			return c.save()
+		}); err != nil {
+			return Result{}, err
+		}
 	}
-	// 3. Send (replace, or rebroadcast at the fee ceiling) and wait.
-	tx, err := c.sendVersion(ctx, req, c.pending, func(p *pendingTx) error {
-		c.pending = p
-		return c.save()
-	})
-	if err != nil {
-		return Result{}, err
-	}
-
+	// 4. Wait until a version is in a canonical block.
 	wctx, cancel := context.WithTimeout(ctx, c.opts.ConfirmTimeout)
 	defer cancel()
-	rcpt, err := bind.WaitMined(wctx, c.backend, tx)
+	rcpt, err := c.awaitCanonical(wctx, c.pending.hashes)
 	if err != nil {
-		return Result{}, fmt.Errorf("awaiting confirmation of %s: %w", tx.Hash(), err)
+		return Result{}, fmt.Errorf("awaiting confirmation of %s: %w", c.pending.tx.Hash(), err)
 	}
 	return c.recordMined(req, rcpt)
 }
 
-// pendingReceipt looks for a receipt of any version of the pending
-// transaction of req.
-func (c *EthChain) pendingReceipt(ctx context.Context, req Request) (Result, bool, error) {
-	if c.pending == nil || c.pending.req != req {
-		return Result{}, false, nil
-	}
-	rcpt, err := c.receiptOf(ctx, c.pending.hashes)
-	if err != nil || rcpt == nil {
-		return Result{}, false, err
-	}
-	res, err := c.recordMined(req, rcpt)
-	return res, true, err
-}
+// receiptPoll is how often awaitCanonical asks for a receipt.
+const receiptPoll = time.Second
 
-// receiptOf returns the receipt of whichever of hashes is mined, or nil.
-func (c *EthChain) receiptOf(ctx context.Context, hashes []common.Hash) (*types.Receipt, error) {
-	for _, h := range hashes {
-		rcpt, err := c.backend.TransactionReceipt(ctx, h)
-		switch {
-		case err == nil:
+// awaitCanonical polls until one of hashes has a canonical receipt.
+func (c *EthChain) awaitCanonical(ctx context.Context, hashes []common.Hash) (*types.Receipt, error) {
+	t := time.NewTicker(receiptPoll)
+	defer t.Stop()
+	for {
+		rcpt, _, err := c.receiptOf(ctx, hashes)
+		if err == nil && rcpt != nil {
 			return rcpt, nil
-		case !errors.Is(err, ethereum.NotFound):
-			return nil, fmt.Errorf("receipt of %s: %w", h, err)
+		}
+		if err != nil {
+			c.log.Debug("anchor: reading the receipt", "err", err)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-t.C:
 		}
 	}
-	return nil, nil
+}
+
+// pendingReceipt looks for a canonical receipt of any version of the
+// pending transaction of req. preconf reports a receipt that is not (yet)
+// in a canonical block.
+func (c *EthChain) pendingReceipt(ctx context.Context, req Request) (res Result, ok, preconf bool, err error) {
+	if c.pending == nil || c.pending.req != req {
+		return Result{}, false, false, nil
+	}
+	rcpt, preconf, err := c.receiptOf(ctx, c.pending.hashes)
+	if err != nil || rcpt == nil {
+		return Result{}, false, preconf, err
+	}
+	res, err = c.recordMined(req, rcpt)
+	return res, true, false, err
+}
+
+// receiptOf returns the receipt of whichever of hashes is mined in a
+// canonical block, or nil. A receipt counts only if its block hash is set
+// and the canonical header at its number has that hash: RPC endpoints that
+// serve preconfirmations (Base flashblocks) return receipts with a zero
+// block hash for transactions not yet in a sealed block, and a lagging or
+// reorging node can return a receipt from a block no longer canonical.
+// preconf reports such a receipt: the transaction is pending, not mined and
+// not reorged out.
+func (c *EthChain) receiptOf(ctx context.Context, hashes []common.Hash) (rcpt *types.Receipt, preconf bool, err error) {
+	for _, h := range hashes {
+		r, err := c.backend.TransactionReceipt(ctx, h)
+		switch {
+		case errors.Is(err, ethereum.NotFound):
+			continue
+		case err != nil:
+			return nil, preconf, fmt.Errorf("receipt of %s: %w", h, err)
+		}
+		ok, err := c.canonical(ctx, r.BlockNumber, r.BlockHash)
+		if err != nil {
+			return nil, preconf, err
+		}
+		if ok {
+			return r, false, nil
+		}
+		preconf = true
+	}
+	return nil, preconf, nil
+}
+
+// canonical reports whether the block hash is the canonical block at
+// number. A zero hash, a missing number or a missing block is not.
+func (c *EthChain) canonical(ctx context.Context, number *big.Int, hash common.Hash) (bool, error) {
+	if hash == (common.Hash{}) || number == nil {
+		return false, nil
+	}
+	h, err := c.backend.HeaderByNumber(ctx, number)
+	switch {
+	case errors.Is(err, ethereum.NotFound):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("reading block %s: %w", number, err)
+	}
+	return h.Hash() == hash, nil
 }
 
 // resultFrom checks a receipt of req's transaction and reads its anchor.
@@ -318,12 +376,19 @@ func (c *EthChain) alreadyAnchored(ctx context.Context, req Request) (Result, bo
 	if it, err := c.contract.FilterLogAnchored(&bind.FilterOpts{Context: ctx}, [][32]byte{req.AgentKey}, []*big.Int{latest}); err != nil {
 		c.log.Warn("anchor: root already anchored but its transaction could not be located", "epoch", latest, "err", err)
 	} else {
+		var raw types.Log
 		for it.Next() {
-			m.res.TxHash = it.Event.Raw.TxHash.Hex()
-			m.res.BlockNumber = it.Event.Raw.BlockNumber
-			m.res.BlockHash = it.Event.Raw.BlockHash.Hex()
+			raw = it.Event.Raw
 		}
 		it.Close()
+		if raw.TxHash != (common.Hash{}) {
+			if ok, err := c.canonical(ctx, new(big.Int).SetUint64(raw.BlockNumber), raw.BlockHash); err != nil {
+				return Result{}, false, err
+			} else if !ok {
+				return Result{}, false, fmt.Errorf("root already anchored by %s, which is not in a canonical block yet", raw.TxHash)
+			}
+			m.res.TxHash, m.res.BlockNumber, m.res.BlockHash = raw.TxHash.Hex(), raw.BlockNumber, raw.BlockHash.Hex()
+		}
 	}
 	if m.res.TxHash != "" && (m.tx == nil || !containsHash(m.hashes, common.HexToHash(m.res.TxHash))) {
 		// Keep the transaction that holds the anchor, to resend it after a reorg.
@@ -359,11 +424,16 @@ func (c *EthChain) findMined(req Request) *minedTx {
 	return nil
 }
 
-// nextNonce is the lowest nonce a new transaction may take: above every
-// anchor awaiting finality, so a reorg never hands a later epoch the nonce
-// (and the place) of an earlier one.
+// nextNonce is the lowest nonce a new transaction may take: above the
+// in-flight transaction and every anchor awaiting finality, so a reorg never
+// hands a later epoch the nonce (and the place) of an earlier one, and a
+// node whose nonce view lags (a preconfirmation not yet counted) never makes
+// a new transaction reuse the nonce of one that may still land.
 func (c *EthChain) nextNonce() uint64 {
 	var n uint64
+	if c.pending != nil && c.pending.tx != nil {
+		n = c.pending.tx.Nonce() + 1
+	}
 	for _, m := range c.mined {
 		if m.tx != nil {
 			n = max(n, m.tx.Nonce()+1)
@@ -391,7 +461,7 @@ func (c *EthChain) Final(ctx context.Context, req Request) (Status, Result, erro
 	if m.tx == nil {
 		return c.finalFromState(ctx, m, point)
 	}
-	rcpt, err := c.receiptOf(ctx, m.hashes)
+	rcpt, _, err := c.receiptOf(ctx, m.hashes)
 	if err != nil {
 		return Pending, m.res, err
 	}
@@ -415,9 +485,14 @@ func (c *EthChain) Final(ctx context.Context, req Request) (Status, Result, erro
 				"tx", rcpt.TxHash, "block", rcpt.BlockNumber, "block_hash", rcpt.BlockHash, "err", err)
 			return c.drop(m)
 		}
-		c.log.Warn("anchor: reorg moved the anchor transaction to another block", "tx", res.TxHash,
-			"old_block", m.res.BlockNumber, "old_block_hash", m.res.BlockHash, "old_epoch", m.res.EpochID,
-			"new_block", res.BlockNumber, "new_block_hash", res.BlockHash, "new_epoch", res.EpochID)
+		if knownBlock(m.res) {
+			c.log.Warn("anchor: reorg moved the anchor transaction to another block", "tx", res.TxHash,
+				"old_block", m.res.BlockNumber, "old_block_hash", m.res.BlockHash, "old_epoch", m.res.EpochID,
+				"new_block", res.BlockNumber, "new_block_hash", res.BlockHash, "new_epoch", res.EpochID)
+		} else { // recorded from a preconfirmation by an earlier version
+			c.log.Info("anchor: anchor transaction sealed", "tx", res.TxHash,
+				"block", res.BlockNumber, "block_hash", res.BlockHash, "epoch", res.EpochID)
+		}
 		m.res, m.reorged, m.polls = res, false, 0
 		if err := c.save(); err != nil {
 			return Pending, m.res, err
@@ -425,11 +500,6 @@ func (c *EthChain) Final(ctx context.Context, req Request) (Status, Result, erro
 	}
 	if rcpt.BlockNumber.Cmp(point.Number) > 0 {
 		return Pending, m.res, nil
-	}
-	if canon, err := c.backend.HeaderByNumber(ctx, rcpt.BlockNumber); err != nil {
-		return Pending, m.res, fmt.Errorf("reading block %s: %w", rcpt.BlockNumber, err)
-	} else if canon.Hash() != rcpt.BlockHash {
-		return Pending, m.res, nil // the node's receipt index lags a reorg
 	}
 	return c.confirmAt(ctx, m, point)
 }
@@ -485,10 +555,32 @@ func (c *EthChain) anchoredAt(ctx context.Context, req Request, epoch uint64, bl
 	return a.MerkleRoot == req.Root && a.LogCount == req.Count, nil
 }
 
-// resendReorged finds the mined anchors whose nonce the canonical chain no
-// longer uses (a reorg removed them), logs each once at WARN, and sends the
-// same signed transaction again. If the oldest has not returned after a few
-// checks, it is replaced (same nonce, higher fees).
+// knownBlock reports whether res records a block hash (an anchor recorded
+// by an earlier version from a preconfirmation receipt has none).
+func knownBlock(res Result) bool {
+	return res.BlockHash != "" && common.HexToHash(res.BlockHash) != (common.Hash{})
+}
+
+// reorgedOut reports whether a reorg removed the mined anchor m: none of its
+// versions has a canonical receipt or a preconfirmation receipt, and the
+// block it was recorded in is no longer canonical. The account nonce at the
+// head is not used: endpoints serving preconfirmations report a mined
+// transaction before the "latest" nonce counts it.
+func (c *EthChain) reorgedOut(ctx context.Context, m *minedTx) (bool, error) {
+	rcpt, preconf, err := c.receiptOf(ctx, m.hashes)
+	if err != nil || rcpt != nil || preconf {
+		return false, err
+	}
+	if !knownBlock(m.res) {
+		return false, nil
+	}
+	ok, err := c.canonical(ctx, new(big.Int).SetUint64(m.res.BlockNumber), common.HexToHash(m.res.BlockHash))
+	return !ok && err == nil, err
+}
+
+// resendReorged finds the mined anchors a reorg removed, logs each once at
+// WARN, and sends the same signed transaction again. If the oldest has not
+// returned after a few checks, it is replaced (same nonce, higher fees).
 func (c *EthChain) resendReorged(ctx context.Context) error {
 	var withTx []*minedTx
 	for _, m := range c.mined {
@@ -496,17 +588,14 @@ func (c *EthChain) resendReorged(ctx context.Context) error {
 			withTx = append(withTx, m)
 		}
 	}
-	if len(withTx) == 0 {
-		return nil
-	}
-	used, err := c.backend.NonceAt(ctx, c.from, nil)
-	if err != nil {
-		return fmt.Errorf("reading the nonce: %w", err)
-	}
 	sort.Slice(withTx, func(i, j int) bool { return withTx[i].tx.Nonce() < withTx[j].tx.Nonce() })
 	first := true
 	for _, m := range withTx {
-		if m.tx.Nonce() < used {
+		gone, err := c.reorgedOut(ctx, m)
+		if err != nil {
+			return err
+		}
+		if !gone {
 			m.reorged, m.polls = false, 0 // the receipt check decides by which transaction
 			continue
 		}

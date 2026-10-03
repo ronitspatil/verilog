@@ -27,8 +27,8 @@ type GCPKMSClient interface {
 	AsymmetricSign(ctx context.Context, req *kmspb.AsymmetricSignRequest, opts ...gax.CallOption) (*kmspb.AsymmetricSignResponse, error)
 }
 
-// GCPKeyVersionPattern matches a full CryptoKeyVersion resource name.
-var GCPKeyVersionPattern = regexp.MustCompile(`^projects/[^/]+/locations/[^/]+/keyRings/[^/]+/cryptoKeys/[^/]+/cryptoKeyVersions/[^/]+$`)
+// gcpKeyVersion matches a full CryptoKeyVersion resource name.
+var gcpKeyVersion = regexp.MustCompile(`^projects/[^/]+/locations/[^/]+/keyRings/[^/]+/cryptoKeys/[^/]+/cryptoKeyVersions/[^/]+$`)
 
 const gcpService = "gcp-kms"
 
@@ -68,7 +68,7 @@ func crc32c(b []byte) int64 { return int64(crc32.Checksum(b, crc32.MakeTable(crc
 // the response's CRC32C, derives the Ethereum address and (unless disabled)
 // makes one test signature.
 func NewGCPKMS(ctx context.Context, client GCPKMSClient, name string, opts KMSOptions) (*GCPKMS, error) {
-	if !GCPKeyVersionPattern.MatchString(name) {
+	if !gcpKeyVersion.MatchString(name) {
 		return nil, fmt.Errorf("gcp-kms: %q is not a CryptoKeyVersion name "+
 			"(projects/P/locations/L/keyRings/R/cryptoKeys/K/cryptoKeyVersions/V)", name)
 	}

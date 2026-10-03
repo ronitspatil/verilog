@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"math/big"
 	"os"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -32,7 +33,11 @@ const (
 const (
 	SignerLocal  = "local"   // key file or VERILOG_PRIVATE_KEY (development)
 	SignerAWSKMS = "aws-kms" // key held in AWS KMS (production)
+	SignerGCPKMS = "gcp-kms" // key held in Google Cloud KMS (production)
 )
+
+// gcpKeyVersion matches a full Cloud KMS CryptoKeyVersion resource name.
+var gcpKeyVersion = regexp.MustCompile(`^projects/[^/]+/locations/[^/]+/keyRings/[^/]+/cryptoKeys/[^/]+/cryptoKeyVersions/[^/]+$`)
 
 // Config is the daemon configuration.
 type Config struct {
@@ -44,8 +49,9 @@ type Config struct {
 	PrivateKeyFile string
 	// InsecureKeyFilePerms accepts a key file readable by group or others.
 	InsecureKeyFilePerms bool
-	Signer               string // SignerLocal or SignerAWSKMS
+	Signer               string // SignerLocal, SignerAWSKMS or SignerGCPKMS
 	KMSKeyID             string // key ARN, key id or alias/<name>
+	GCPKMSKey            string // full CryptoKeyVersion resource name
 	// MaxFeeCap and MaxTipCap (wei) cap maxFeePerGas and maxPriorityFeePerGas.
 	MaxFeeCap      *big.Int
 	MaxTipCap      *big.Int
@@ -113,8 +119,9 @@ func Load(args []string, getenv func(string) string, stderr io.Writer) (*Config,
 	fs.StringVar(&c.DataDir, "data-dir", env("VERILOG_DATA_DIR", "./verilog-data"), "directory for the WAL, checkpoint and evidence bundles (env VERILOG_DATA_DIR)")
 	fs.StringVar(&c.RPCURL, "rpc", env("VERILOG_RPC_URL", ""), "EVM JSON-RPC endpoint (env VERILOG_RPC_URL)")
 	fs.StringVar(&contract, "contract", env("VERILOG_CONTRACT", ""), "VeriLogRegistry address (env VERILOG_CONTRACT)")
-	fs.StringVar(&c.Signer, "signer", env("VERILOG_SIGNER", SignerLocal), "anchoring key backend: local or aws-kms (env VERILOG_SIGNER)")
+	fs.StringVar(&c.Signer, "signer", env("VERILOG_SIGNER", SignerLocal), "anchoring key backend: local, aws-kms or gcp-kms (env VERILOG_SIGNER)")
 	fs.StringVar(&c.KMSKeyID, "kms-key-id", env("VERILOG_KMS_KEY_ID", ""), "AWS KMS key ARN, id or alias/<name> for --signer aws-kms (env VERILOG_KMS_KEY_ID); region and credentials come from the AWS SDK default chain")
+	fs.StringVar(&c.GCPKMSKey, "gcp-kms-key", env("VERILOG_GCP_KMS_KEY", ""), "Google Cloud KMS key version for --signer gcp-kms: projects/P/locations/L/keyRings/R/cryptoKeys/K/cryptoKeyVersions/V (env VERILOG_GCP_KMS_KEY); credentials come from Application Default Credentials")
 	fs.StringVar(&c.PrivateKeyFile, "private-key-file", env(EnvKeyFile, ""), "--signer local: file holding the hex signing key, mode 0600 (env "+EnvKeyFile+"); otherwise "+EnvPrivateKey+" is used")
 	fs.BoolVar(&c.InsecureKeyFilePerms, "insecure-key-file-perms", false, "development only: accept a key file readable by group or others")
 	fs.StringVar(&maxFee, "max-fee-gwei", maxFee, "ceiling on maxFeePerGas in gwei; retries stop bumping fees here (env VERILOG_MAX_FEE_GWEI)")
@@ -205,11 +212,14 @@ func Load(args []string, getenv func(string) string, stderr io.Writer) (*Config,
 	if c.MaxTipCap.Cmp(c.MaxFeeCap) > 0 {
 		return nil, errors.New("--max-priority-fee-gwei must not exceed --max-fee-gwei")
 	}
+	if c.KMSKeyID != "" && c.Signer != SignerAWSKMS {
+		return nil, errors.New("--kms-key-id requires --signer aws-kms")
+	}
+	if c.GCPKMSKey != "" && c.Signer != SignerGCPKMS {
+		return nil, errors.New("--gcp-kms-key requires --signer gcp-kms")
+	}
 	switch c.Signer {
 	case SignerLocal:
-		if c.KMSKeyID != "" {
-			return nil, errors.New("--kms-key-id requires --signer aws-kms")
-		}
 	case SignerAWSKMS:
 		if c.KMSKeyID == "" {
 			return nil, errors.New("--signer aws-kms requires --kms-key-id (or VERILOG_KMS_KEY_ID)")
@@ -217,8 +227,18 @@ func Load(args []string, getenv func(string) string, stderr io.Writer) (*Config,
 		if c.PrivateKeyFile != "" {
 			return nil, errors.New("--private-key-file cannot be used with --signer aws-kms")
 		}
+	case SignerGCPKMS:
+		if c.GCPKMSKey == "" {
+			return nil, errors.New("--signer gcp-kms requires --gcp-kms-key (or VERILOG_GCP_KMS_KEY)")
+		}
+		if !gcpKeyVersion.MatchString(c.GCPKMSKey) {
+			return nil, fmt.Errorf("invalid --gcp-kms-key %q: want projects/P/locations/L/keyRings/R/cryptoKeys/K/cryptoKeyVersions/V", c.GCPKMSKey)
+		}
+		if c.PrivateKeyFile != "" {
+			return nil, errors.New("--private-key-file cannot be used with --signer gcp-kms")
+		}
 	default:
-		return nil, fmt.Errorf("invalid --signer %q (local or aws-kms)", c.Signer)
+		return nil, fmt.Errorf("invalid --signer %q (local, aws-kms or gcp-kms)", c.Signer)
 	}
 	return &c, nil
 }
@@ -267,7 +287,7 @@ func (c *Config) LoadKey(getenv func(string) string, logger *slog.Logger) (*ecds
 	case getenv(EnvPrivateKey) != "":
 		raw = getenv(EnvPrivateKey)
 		logger.Warn("anchoring key read from the " + EnvPrivateKey + " environment variable; " +
-			"prefer --private-key-file (mode 0600) or, in production, --signer aws-kms")
+			"prefer --private-key-file (mode 0600) or, in production, --signer aws-kms or gcp-kms")
 	default:
 		return nil, fmt.Errorf("no signing key: set %s or --private-key-file", EnvPrivateKey)
 	}

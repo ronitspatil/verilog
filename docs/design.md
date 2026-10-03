@@ -147,7 +147,7 @@ an event over one gets a retryable rejection with `retry_after_ms` (see
 [operations](operations.md#resource-limits-and-backpressure)).
 
 **Anchoring.** The chain ID comes from the RPC. Transactions are EIP-1559,
-signed through the `signer.Signer` interface (a local key, or AWS KMS with
+signed through the `signer.Signer` interface (a local key, or AWS or Google Cloud KMS with
 low-s normalization and `v` recovery), with a fee cap of `2×baseFee + tip`
 bounded by `--max-fee-gwei` / `--max-priority-fee-gwei`, and awaited with
 `bind.WaitMined` under `--confirm-timeout`. The receipt status
@@ -205,7 +205,7 @@ numbers depend on the disk's fsync latency.
 | `daemon/internal/engine` | committer, per-agent shards, sealing, WAL replay, evidence finalization |
 | `daemon/internal/wal` | JSONL write-ahead log with group-commit fsync and compaction |
 | `daemon/internal/anchor` | retrying anchor worker (agents in turn), EIP-1559 go-ethereum client, fee ceiling, pending-transaction record |
-| `daemon/internal/signer` | anchoring key signers: local key and AWS KMS (`kmsfake`: in-memory KMS for tests) |
+| `daemon/internal/signer` | anchoring key signers: local key, AWS KMS and Google Cloud KMS (`kmsfake`, `gcpkmsfake`: in-memory fakes for tests) |
 | `daemon/internal/diskspace`, `daemon/internal/metrics` | free-space check; Prometheus text format |
 | `daemon/internal/redact` | strips RPC URL credentials from logs and errors |
 | `daemon/internal/ingest` | gRPC service (rejects events with a bad or unregistered signature) |

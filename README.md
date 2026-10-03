@@ -79,7 +79,8 @@ cd contracts && VERILOG_ANCHORER=0xDaemonAddress forge script script/Deploy.s.so
 python -m verilog_sdk keygen --out /etc/verilog/support-bot.key --agent-id support-bot
 
 # 3. Start the daemon (its signer needs ANCHORER_ROLE). In production keep that key in AWS KMS:
-#    --signer aws-kms --kms-key-id alias/verilog-anchorer (docs/operations.md#anchoring-key).
+#    --signer aws-kms --kms-key-id alias/verilog-anchorer (docs/operations.md#anchoring-key),
+#    or Google Cloud KMS: --signer gcp-kms --gcp-kms-key projects/…/cryptoKeyVersions/1.
 #    Mutual TLS is required (`make certs` writes dev-only certificates; --insecure-plaintext for local dev only).
 bin/verilogd --rpc "$RPC" --contract 0xRegistry --data-dir /var/lib/verilog --private-key-file key.hex \
     --tls-cert server.pem --tls-key server-key.pem --tls-client-ca clients-ca.pem

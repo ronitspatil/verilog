@@ -117,7 +117,7 @@ func NewKMS(ctx context.Context, client KMSClient, keyID string, opts KMSOptions
 	}
 	opts.defaults()
 	k := &KMS{client: client, keyID: keyID, opts: opts}
-	out, err := do(ctx, k, "GetPublicKey", func(ctx context.Context) (*kms.GetPublicKeyOutput, error) {
+	out, err := do(ctx, &k.opts, "kms", "GetPublicKey", classify, func(ctx context.Context) (*kms.GetPublicKeyOutput, error) {
 		return client.GetPublicKey(ctx, &kms.GetPublicKeyInput{KeyId: aws.String(keyID)})
 	})
 	if err != nil {
@@ -153,7 +153,7 @@ func (k *KMS) Address() common.Address { return k.addr }
 // ECDSA_SHA_256), the DER signature is normalized to low-s and the recovery
 // id is found by matching the known public key.
 func (k *KMS) SignHash(ctx context.Context, hash [32]byte) ([]byte, error) {
-	out, err := do(ctx, k, "Sign", func(ctx context.Context) (*kms.SignOutput, error) {
+	out, err := do(ctx, &k.opts, "kms", "Sign", classify, func(ctx context.Context) (*kms.SignOutput, error) {
 		return k.client.Sign(ctx, &kms.SignInput{
 			KeyId:            aws.String(k.keyID),
 			Message:          hash[:],
@@ -237,8 +237,9 @@ func EthSignature(hash [32]byte, der, pub []byte) ([]byte, error) {
 
 // KMSError is a failed KMS operation after retries.
 type KMSError struct {
-	Op        string // GetPublicKey or Sign
-	Code      string // AWS error code, if any
+	Service   string // "kms" (AWS) or "gcp-kms"; empty means "kms"
+	Op        string // GetPublicKey, Sign or AsymmetricSign
+	Code      string // AWS error code or gRPC status code, if any
 	Hint      string // what the operator should check
 	Attempts  int
 	Retryable bool // the last failure was transient (retries exhausted)
@@ -246,7 +247,11 @@ type KMSError struct {
 }
 
 func (e *KMSError) Error() string {
-	msg := "kms " + e.Op
+	svc := e.Service
+	if svc == "" {
+		svc = "kms"
+	}
+	msg := svc + " " + e.Op
 	if e.Hint != "" {
 		msg += ": " + e.Hint
 	}
@@ -291,25 +296,30 @@ var hints = map[string]string{
 	"ThrottlingException":         "KMS throttled the request",
 }
 
-// classify reports whether err is transient and its AWS error code.
-func classify(err error) (retryable bool, code string) {
+// classify reports whether err is transient, its AWS error code and an
+// operator hint.
+func classify(err error) (retryable bool, code, hint string) {
 	var apiErr smithy.APIError
 	if errors.As(err, &apiErr) {
 		code = apiErr.ErrorCode()
 		if retryableCodes[code] {
-			return true, code
+			return true, code, hints[code]
 		}
 	}
-	return retry.IsErrorRetryables(retry.DefaultRetryables).IsErrorRetryable(err) == aws.TrueTernary, code
+	return retry.IsErrorRetryables(retry.DefaultRetryables).IsErrorRetryable(err) == aws.TrueTernary, code, hints[code]
 }
 
+// classifier reports whether an error is transient, its service error code
+// and a hint for the operator.
+type classifier func(error) (retryable bool, code, hint string)
+
 // do runs fn with a per-attempt timeout and bounded exponential backoff on
-// transient errors. It stops early when ctx ends.
-func do[T any](ctx context.Context, k *KMS, op string, fn func(context.Context) (T, error)) (T, error) {
+// transient errors. It stops early when ctx ends. Errors are *KMSError.
+func do[T any](ctx context.Context, o *KMSOptions, service, op string, cl classifier, fn func(context.Context) (T, error)) (T, error) {
 	var zero T
-	delay := k.opts.BaseDelay
+	delay := o.BaseDelay
 	for attempt := 1; ; attempt++ {
-		actx, cancel := context.WithTimeout(ctx, k.opts.CallTimeout)
+		actx, cancel := context.WithTimeout(ctx, o.CallTimeout)
 		v, err := fn(actx)
 		attemptTimedOut := errors.Is(actx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
 		cancel()
@@ -317,16 +327,16 @@ func do[T any](ctx context.Context, k *KMS, op string, fn func(context.Context) 
 			return v, nil
 		}
 		if ctx.Err() != nil {
-			return zero, &KMSError{Op: op, Attempts: attempt, Err: err}
+			return zero, &KMSError{Service: service, Op: op, Attempts: attempt, Err: err}
 		}
-		retryable, code := classify(err)
+		retryable, code, hint := cl(err)
 		retryable = retryable || attemptTimedOut
-		if !retryable || attempt >= k.opts.MaxAttempts {
-			return zero, &KMSError{Op: op, Code: code, Hint: hints[code], Attempts: attempt, Retryable: retryable, Err: err}
+		if !retryable || attempt >= o.MaxAttempts {
+			return zero, &KMSError{Service: service, Op: op, Code: code, Hint: hint, Attempts: attempt, Retryable: retryable, Err: err}
 		}
-		if err := k.opts.sleep(ctx, delay); err != nil {
-			return zero, &KMSError{Op: op, Code: code, Attempts: attempt, Err: err}
+		if err := o.sleep(ctx, delay); err != nil {
+			return zero, &KMSError{Service: service, Op: op, Code: code, Attempts: attempt, Err: err}
 		}
-		delay = min(2*delay, k.opts.MaxDelay)
+		delay = min(2*delay, o.MaxDelay)
 	}
 }

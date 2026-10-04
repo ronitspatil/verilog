@@ -738,6 +738,16 @@ https://sepolia.basescan.org. It was set up with the steps in this document
 (Deploy.s.sol, keygen and keycheck, the Safe handover above) and local,
 testnet-only keys; production uses the KMS signer.
 
+Since 2026-10-04 the testnet anchors with a Google Cloud KMS HSM key
+(`--signer gcp-kms`, address `0xd1656A4bB9bb632d1808c2F94B879F4e286aa35C`);
+the Safe granted it `ANCHORER_ROLE` and revoked the old local anchorer
+`0x80869fD726F35eDF1Ae55Cb546E9873649Ef5845`. The switch drained in-flight
+epochs first, to avoid re-anchoring them under the new key: stop the agent,
+wait for `verilog_anchor_queue_epochs` and
+`verilog_anchor_awaiting_finality_epochs` to reach 0, then restart it with the
+new signer. Anchors are the registry's `LogAnchored` events
+(https://sepolia.basescan.org/address/0xd4735aa9414e249b2367bfb5d141a76993a5dd4c#events).
+
 Observations from the first run:
 
 - **Finality:** an anchor mined on Base Sepolia reached the `finalized` tag

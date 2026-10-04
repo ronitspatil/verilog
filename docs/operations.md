@@ -187,8 +187,9 @@ Flags win over environment variables.
 | `--data-dir` | `VERILOG_DATA_DIR` | `./verilog-data` | WAL, checkpoint, evidence |
 | `--rpc` | `VERILOG_RPC_URL` | required | EVM JSON-RPC |
 | `--contract` | `VERILOG_CONTRACT` | required | registry address |
-| `--signer` | `VERILOG_SIGNER` | `local` | `local` (key file or env) or `aws-kms` |
+| `--signer` | `VERILOG_SIGNER` | `local` | `local` (key file or env), `aws-kms` or `gcp-kms` |
 | `--kms-key-id` | `VERILOG_KMS_KEY_ID` | | KMS key ARN, id or `alias/<name>` (`aws-kms`) |
+| `--gcp-kms-key` | `VERILOG_GCP_KMS_KEY` | | full CryptoKeyVersion name (`gcp-kms`) |
 | `--private-key-file` | `VERILOG_PRIVATE_KEY_FILE` | | `local`: hex key file, mode 0600; otherwise `VERILOG_PRIVATE_KEY` (warns) |
 | `--insecure-key-file-perms` | | off | development only: accept a group/world-readable key file |
 | `--max-fee-gwei` | `VERILOG_MAX_FEE_GWEI` | `500` | ceiling on `maxFeePerGas` (decimals allowed) |
@@ -224,7 +225,7 @@ exists on the daemon host, every signature is logged in CloudTrail, and
 access ends when the role's permission is removed. The daemon reads the
 region and credentials from the AWS SDK's default chain (environment, shared
 config, IRSA / web identity, container or instance role); AWS secrets are
-never flags.
+never flags. Google Cloud KMS works the same way (see below).
 
 ### AWS KMS setup
 
@@ -304,6 +305,42 @@ admin role, and alarm on `ScheduleKeyDeletion`, `DisableKey` and
 stop the daemon when `<data-dir>/anchor-pending.json` does not exist (no
 transaction in flight), restart it with `--signer aws-kms`, then revoke the
 old address's role with `revokeRole`.
+
+### Google Cloud KMS setup
+
+```sh
+# 1. Enable the API and create an HSM-backed secp256k1 signing key.
+gcloud services enable cloudkms.googleapis.com
+gcloud kms keyrings create verilog --location us-east1
+gcloud kms keys create anchorer --keyring verilog --location us-east1 \
+  --purpose asymmetric-signing --default-algorithm ec-sign-secp256k1-sha256 --protection-level hsm
+KEY=projects/$PROJECT/locations/us-east1/keyRings/verilog/cryptoKeys/anchorer/cryptoKeyVersions/1
+
+# 2. Grant the daemon's service account signerVerifier on this key only.
+gcloud kms keys add-iam-policy-binding anchorer --keyring verilog --location us-east1 \
+  --member serviceAccount:verilogd@$PROJECT.iam.gserviceaccount.com --role roles/cloudkms.signerVerifier
+
+# 3. Its Ethereum address. verilogd also logs it at startup ("gcp-kms signer ready address=0x…").
+gcloud kms keys versions get-public-key 1 --key anchorer --keyring verilog --location us-east1 --output-file anchorer.pem
+PUB=$(openssl pkey -pubin -in anchorer.pem -outform DER | tail -c 64 | xxd -p -c 64)
+cast to-check-sum-address 0x$(cast keccak 0x$PUB | tail -c 41)
+
+# 4. Fund it and grant it ANCHORER_ROLE (as for AWS above), then run the
+#    daemon with Application Default Credentials for that service account.
+bin/verilogd --signer gcp-kms --gcp-kms-key "$KEY" --rpc "$RPC" --contract 0xRegistry …
+```
+
+Credentials come only from Application Default Credentials (the attached
+service account, `GOOGLE_APPLICATION_CREDENTIALS`, or `gcloud auth
+application-default login` for testing). At startup the daemon checks the
+algorithm (`EC_SIGN_SECP256K1_SHA256`) and the PEM's CRC32C, logs the
+address and protection level (it warns unless `HSM`), makes one test
+signature and checks `ANCHORER_ROLE`. Each transaction hash is sent as the
+SHA-256 digest (signed as given, not hashed again) with its CRC32C, and the
+response's checksums are verified. Retries and error hints (API not enabled,
+permission denied, key version disabled or destroyed) match the AWS signer.
+Keep key administration with a separate principal; `signerVerifier` cannot
+disable, destroy or re-permission the key.
 
 ### Local key (development)
 

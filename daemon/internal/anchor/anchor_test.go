@@ -19,6 +19,7 @@ import (
 	"github.com/ronitspatil/verilog/daemon/internal/merkle"
 	"github.com/ronitspatil/verilog/daemon/internal/registry"
 	"github.com/ronitspatil/verilog/daemon/internal/signer"
+	"github.com/ronitspatil/verilog/daemon/internal/signer/gcpkmsfake"
 	"github.com/ronitspatil/verilog/daemon/internal/signer/kmsfake"
 )
 
@@ -201,6 +202,25 @@ func TestEthChainAnchorsWithKMSSigner(t *testing.T) {
 		t.Fatalf("KMS address %s, want %s", kmsSigner.Address(), env.addr)
 	}
 	anchorAndVerify(t, env, kmsSigner)
+	if fake.HighSReturned == 0 {
+		t.Fatal("no high-s signature was exercised")
+	}
+}
+
+// The Google Cloud KMS path: PEM public key, CRC32C-checked DER
+// signatures, high-s included.
+func TestEthChainAnchorsWithGCPKMSSigner(t *testing.T) {
+	const name = "projects/verilog/locations/us-east1/keyRings/verilog/cryptoKeys/anchorer/cryptoKeyVersions/1"
+	fake := gcpkmsfake.New(name)
+	env := newSimEnvWith(t, fake.Key, true)
+	gcpSigner, err := signer.NewGCPKMS(context.Background(), fake, name, signer.KMSOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gcpSigner.Address() != env.addr {
+		t.Fatalf("Cloud KMS address %s, want %s", gcpSigner.Address(), env.addr)
+	}
+	anchorAndVerify(t, env, gcpSigner)
 	if fake.HighSReturned == 0 {
 		t.Fatal("no high-s signature was exercised")
 	}

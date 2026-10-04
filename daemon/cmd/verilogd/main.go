@@ -252,7 +252,7 @@ loop:
 }
 
 // newSigner returns the anchoring key's signer: a local key, or a key held
-// in AWS KMS (its private key never reaches this host).
+// in AWS KMS or Google Cloud KMS (its private key never reaches this host).
 func newSigner(ctx context.Context, cfg *config.Config, logger *slog.Logger) (signer.Signer, error) {
 	switch cfg.Signer {
 	case config.SignerAWSKMS:
@@ -270,6 +270,27 @@ func newSigner(ctx context.Context, cfg *config.Config, logger *slog.Logger) (si
 			return nil, err
 		}
 		logger.Info("aws-kms signer ready", "address", s.Address())
+		return s, nil
+	case config.SignerGCPKMS:
+		if os.Getenv(config.EnvPrivateKey) != "" {
+			logger.Warn(config.EnvPrivateKey + " is set but ignored with --signer gcp-kms; unset it")
+		}
+		kctx, cancel := context.WithTimeout(ctx, time.Minute)
+		defer cancel()
+		// The client lives as long as the process.
+		client, err := signer.NewGCPKMSClient(kctx)
+		if err != nil {
+			return nil, err
+		}
+		s, err := signer.NewGCPKMS(kctx, client, cfg.GCPKMSKey, signer.KMSOptions{})
+		if err != nil {
+			_ = client.Close()
+			return nil, err
+		}
+		if pl := s.ProtectionLevel(); pl != "HSM" {
+			logger.Warn("gcp-kms key is not HSM-protected; HSM is recommended for the anchoring key", "protection_level", pl)
+		}
+		logger.Info("gcp-kms signer ready", "address", s.Address(), "protection_level", s.ProtectionLevel())
 		return s, nil
 	default:
 		key, err := cfg.LoadKey(os.Getenv, logger)

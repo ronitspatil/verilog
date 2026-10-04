@@ -126,14 +126,15 @@ State these explicitly in an audit.
   used); on Linux it does.
 - **Key handling.** In production the anchorer key stays in AWS KMS
   (`--signer aws-kms`); only the public key and signatures reach the daemon.
+  `--signer gcp-kms` gives the same property with Google Cloud KMS (HSM key, `roles/cloudkms.signerVerifier` on that key only).
   A local anchorer key and the agents' signing keys are read from a file or
   an environment variable (which warns) and held in memory; a key file
   readable by group or others is refused unless explicitly allowed for
   development. Keys are never logged. Credentials in the RPC URL are
   redacted from logs and errors by pattern (userinfo, query values, long
   path tokens); an unusual provider format could slip through, so prefer
-  header-based or IP-allowlisted RPC authentication where available. Only
-  AWS KMS is supported as a remote signer.
+  header-based or IP-allowlisted RPC authentication where available. AWS
+  KMS and Google Cloud KMS are the supported remote signers.
 - **Fee ceiling stalls anchoring.** If network fees stay above
   `--max-fee-gwei`, anchoring waits (and logs ERROR) instead of paying more.
   Nothing is lost, but events stay unanchored, and so not yet

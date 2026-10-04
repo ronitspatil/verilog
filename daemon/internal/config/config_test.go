@@ -173,7 +173,24 @@ func TestLoadSignerAndFees(t *testing.T) {
 	if err != nil || c.Signer != SignerAWSKMS {
 		t.Fatalf("env: %+v %v", c, err)
 	}
+	const gcpKey = "projects/p/locations/us-east1/keyRings/verilog/cryptoKeys/anchorer/cryptoKeyVersions/1"
+	c, err = load("--signer", "gcp-kms", "--gcp-kms-key", gcpKey)
+	if err != nil || c.Signer != SignerGCPKMS || c.GCPKMSKey != gcpKey {
+		t.Fatalf("gcp-kms: %+v %v", c, err)
+	}
+	c, err = Load(base, envOf(map[string]string{"VERILOG_SIGNER": "gcp-kms", "VERILOG_GCP_KMS_KEY": gcpKey}), io.Discard)
+	if err != nil || c.Signer != SignerGCPKMS || c.GCPKMSKey != gcpKey {
+		t.Fatalf("gcp-kms env: %+v %v", c, err)
+	}
 	for _, extra := range [][]string{
+		{"--signer", "gcp-kms"},
+		{"--gcp-kms-key", gcpKey},
+		{"--signer", "aws-kms", "--kms-key-id", "alias/x", "--gcp-kms-key", gcpKey},
+		{"--signer", "gcp-kms", "--gcp-kms-key", gcpKey, "--kms-key-id", "alias/x"},
+		{"--signer", "gcp-kms", "--gcp-kms-key", gcpKey, "--private-key-file", "k"},
+		{"--signer", "gcp-kms", "--gcp-kms-key", "projects/p/locations/l/keyRings/r/cryptoKeys/k"},
+		{"--signer", "gcp-kms", "--gcp-kms-key", gcpKey + "/x"},
+		{"--signer", "gcp-kms", "--gcp-kms-key", "alias/x"},
 		{"--signer", "aws-kms"},
 		{"--signer", "vault"},
 		{"--kms-key-id", "alias/x"},

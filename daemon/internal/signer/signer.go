@@ -1,6 +1,6 @@
 // Package signer provides the anchoring key behind a small interface, so the
 // daemon can sign transactions with a local secp256k1 key (development) or
-// with a key that never leaves AWS KMS (production).
+// with a key that never leaves AWS KMS or Google Cloud KMS (production).
 package signer
 
 import (

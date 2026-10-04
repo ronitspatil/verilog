@@ -1,13 +1,11 @@
 name: CI
 
-# Docs-only changes (every changed file matches paths-ignore) start no jobs:
-# nothing here checks prose, and no code, test or script reads these paths.
+# No paths-ignore: main requires these checks, so every PR (docs-only ones
+# included) must produce them or it can never merge.
 on:
   pull_request:
-    paths-ignore: ["**/*.md", "docs/**", "deployments/**"]
   push:
     branches: [main]
-    paths-ignore: ["**/*.md", "docs/**", "deployments/**"]
 
 permissions:
   contents: read

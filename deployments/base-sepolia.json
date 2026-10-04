@@ -13,16 +13,36 @@
   "roles": {
     "DEFAULT_ADMIN_ROLE": ["0xDC45FD85F6517FA61a100Db76241895D69Ac3854"],
     "KEY_ADMIN_ROLE": ["0xDC45FD85F6517FA61a100Db76241895D69Ac3854"],
-    "ANCHORER_ROLE": ["0x80869fD726F35eDF1Ae55Cb546E9873649Ef5845"],
+    "ANCHORER_ROLE": ["0xd1656A4bB9bb632d1808c2F94B879F4e286aa35C"],
     "handover_txs": {
       "grant_default_admin_to_safe": "0xb085e1e4a3444868595531b465e5ddb498177a3ab8e884edc0f69d8865d080b0",
       "grant_key_admin_to_safe": "0xbee9c1e04c92f50700827bdf9d3d3627e9b104e6ac20a6bc625be57f83645b27",
       "deployer_renounce_key_admin": "0x3d38ee8021d25f95753dc10827df6b0eace3f37cae1ccd12c3ac95a6a4a676d8",
       "deployer_renounce_default_admin": "0x87b1066977a243c9439eaabf2eb03c59ecd668722451d93a92e877fa81c74261"
+    },
+    "anchorer_switch_txs": {
+      "date": "2026-10-04",
+      "grant_anchorer_to_kms": {"tx": "0xf9bf5e6e94c5bb27eef323c0096a99676daa6f4ca9b7cc95aee7b946382d2d91", "safe_nonce": 1, "safe_signers": ["0xB21df04Dd4071FA483AC97d07a60E1CF206AD984", "0xB77facB39e95AB3cec3B0c97B0C007A1ce73127F"]},
+      "revoke_anchorer_from_local_key": {"tx": "0x0b875afdb31e78ec57c313f62ab3d0fd0f0cf1c253a6a77dbbe22f743dd40408", "safe_nonce": 2, "safe_signers": ["0xB21df04Dd4071FA483AC97d07a60E1CF206AD984", "0xC4ec51F18ee082e96Ee60477F78D25061609A0D8"]}
     }
   },
   "deployer": "0x087fa32f305a883C7fBB80548F17D5bf62150c06",
-  "anchorer": "0x80869fD726F35eDF1Ae55Cb546E9873649Ef5845",
+  "anchorer": {
+    "address": "0xd1656A4bB9bb632d1808c2F94B879F4e286aa35C",
+    "signer": "gcp-kms",
+    "kms_key": "projects/verilog-anchor-2383/locations/us-east1/keyRings/verilog/cryptoKeys/anchor-testnet/cryptoKeyVersions/1",
+    "protection_level": "HSM",
+    "funding_tx": "0xfcb0d0ad08a8efdc578fe2d01fd7c887593264b4b1c0a38bcd3207fe9b771c77",
+    "active_from": "2026-10-04"
+  },
+  "previous_anchorers": [
+    {
+      "address": "0x80869fD726F35eDF1Ae55Cb546E9873649Ef5845",
+      "signer": "local testnet key",
+      "revoke_tx": "0x0b875afdb31e78ec57c313f62ab3d0fd0f0cf1c253a6a77dbbe22f743dd40408",
+      "revoked_on": "2026-10-04"
+    }
+  ],
   "safe": {
     "address": "0xDC45FD85F6517FA61a100Db76241895D69Ac3854",
     "version": "1.4.1",
@@ -47,8 +67,12 @@
       "register_tx": "0x229ab88845abdb5738663ddfdd7f2b7feabc6a3b1368fef34c14c8b94e787b27"
     }
   ],
-  "anchors": [
-    {"agent_id": "testnet-agent-1", "epoch": 1, "log_count": 24, "tx": "0x776fbab360d7426fad917ae4fa9fcd385c223d488c25fe02089f7d3f9d61d5fc"},
-    {"agent_id": "testnet-agent-1", "epoch": 2, "log_count": 9, "tx": "0x517572fc1bfaa2cac505287bba5fed5adb5f1d12d518268b8212c239bd9d2bc0"}
-  ]
+  "anchors": {
+    "note": "Every anchor is a LogAnchored event emitted by the registry; list them on the explorer or with cast logs. The entries below are the first anchor from each signer, kept as examples.",
+    "events": "https://sepolia.basescan.org/address/0xd4735aa9414e249b2367bfb5d141a76993a5dd4c#events",
+    "first_by_signer": [
+      {"signer": "0x80869fD726F35eDF1Ae55Cb546E9873649Ef5845", "agent_id": "testnet-agent-1", "epoch": 1, "log_count": 24, "tx": "0x776fbab360d7426fad917ae4fa9fcd385c223d488c25fe02089f7d3f9d61d5fc"},
+      {"signer": "0xd1656A4bB9bb632d1808c2F94B879F4e286aa35C", "agent_id": "testnet-agent-1", "epoch": 109, "log_count": 11, "tx": "0x27157788f19a484eefd21dea5df4bd13463f7b0262f3079653a2e8bf31ecf9d7"}
+    ]
+  }
 }

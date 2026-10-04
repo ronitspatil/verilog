@@ -14,7 +14,7 @@ PROTOC ?= protoc
 # Directory containing google/protobuf/timestamp.proto (shipped with protoc).
 PROTOC_INCLUDE ?= $(shell dirname $$(dirname $$(command -v $(PROTOC))))/include
 
-.PHONY: all tools venv lock lock-upgrade proto bindings vectors build certs test test-go test-contracts test-python bench e2e clean
+.PHONY: all tools venv lock lock-upgrade proto bindings vectors build certs test test-go test-contracts test-python bench e2e ci clean
 
 all: build test
 
@@ -96,6 +96,9 @@ bench:
 
 e2e: ## Full local run against anvil
 	./scripts/e2e.sh
+
+ci: ## Run every GitHub CI job locally on the committed HEAD (see scripts/ci-local.sh)
+	./scripts/ci-local.sh
 
 clean:
 	rm -rf bin contracts/out contracts/cache contracts/broadcast

@@ -91,7 +91,10 @@ effect.
 ## CI
 
 GitHub Actions (`.github/workflows/ci.yml`) runs on every pull request and
-on pushes to `main`, as parallel jobs:
+on pushes to `main`, as parallel jobs. Docs-only changes (every changed file
+is `*.md`, under `docs/` or under `deployments/`) start no jobs; there is no
+separate docs check. e2e runs on pull requests only (see the comment in the
+workflow); the other jobs also run on `main`.
 
 - **go**: `gofmt -l`, `go build`, `go vet`, `go test -race -count=1`, `govulncheck`.
   `scripts/govulncheck.sh` fails on any called vulnerability not in
@@ -105,12 +108,27 @@ on pushes to `main`, as parallel jobs:
   and vectors must match their sources. Uses protoc 3.20.3 and Foundry v1.7.1.
 - **e2e**: `make e2e` against anvil; logs are uploaded as an artifact on failure.
 
-Reproduce locally with the same commands: the Go and contract steps above,
-`make venv test-python`, `make tools proto bindings vectors && git diff
---exit-code`, and `make e2e`. Actions are pinned to commit SHAs; Dependabot
-proposes weekly grouped updates for actions and Go modules, and security
-updates for pip. Python version upgrades and contract library bumps are
-manual (see above).
+Actions are pinned to commit SHAs; Dependabot proposes weekly grouped updates
+for actions and Go modules, and security updates for pip. Python version
+upgrades and contract library bumps are manual (see above).
+
+### Local CI
+
+`make ci` (`scripts/ci-local.sh`) runs every job above on your machine, with
+the same commands and the versions pinned in `ci.yml` (Foundry, protoc,
+govulncheck, pip-audit, Python; it reads them from the workflow and fails if
+a local tool differs). It runs all five jobs even when one fails, writes each
+job's log to `ci-logs/<job>.log`, and ends with a pass/fail and duration table;
+the exit status is non-zero if any job failed. It prints the HEAD it tests and
+refuses a dirty tree (`ALLOW_DIRTY=1` overrides, for informal runs only).
+`CI_JOBS="go python"` runs a subset. e2e runs under a 900 s limit on
+`CI_E2E_ANVIL_PORT` (default 28545) and `CI_E2E_GRPC_PORT` (default 25051);
+it refuses the ports of a live daemon and Prometheus (50551, 9464, 9090) and
+any port already in use. `PROTOC` and `PYTHON` select the tools when the ones
+on `PATH` are not the pinned versions.
+
+While GitHub Actions is unavailable, `make ci` passing on the PR head is the
+merge gate.
 
 ## Deployment requirements
 

@@ -1,9 +1,13 @@
 name: CI
 
+# Docs-only changes (every changed file matches paths-ignore) start no jobs:
+# nothing here checks prose, and no code, test or script reads these paths.
 on:
   pull_request:
+    paths-ignore: ["**/*.md", "docs/**", "deployments/**"]
   push:
     branches: [main]
+    paths-ignore: ["**/*.md", "docs/**", "deployments/**"]
 
 permissions:
   contents: read
@@ -121,7 +125,13 @@ jobs:
           git status --short
           git diff --exit-code
 
+  # e2e is the most expensive job and runs on pull requests only. main moves
+  # only through PRs, and a pull_request run already tests the PR merged into
+  # its base (refs/pull/N/merge), so re-running it on the push to main mostly
+  # spends the same minutes on the same tree. The cheaper jobs still run on
+  # main and catch a base that moved after the PR's last run.
   e2e:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:

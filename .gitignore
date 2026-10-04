@@ -8,3 +8,4 @@ __pycache__/
 verilog-data/
 build/
 dev-certs/
+ci-logs/

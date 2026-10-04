@@ -90,11 +90,14 @@ effect.
 
 ## CI
 
-GitHub Actions (`.github/workflows/ci.yml`) runs on every pull request and
-on pushes to `main`, as parallel jobs. Docs-only changes (every changed file
-is `*.md`, under `docs/` or under `deployments/`) start no jobs; there is no
-separate docs check. e2e runs on pull requests only (see the comment in the
-workflow); the other jobs also run on `main`.
+GitHub Actions (`.github/workflows/ci.yml`) runs on every pull request,
+docs-only ones included, and on pushes to `main`, as parallel jobs. The repo
+is public, so Actions minutes are free. e2e runs on pull requests only (see
+the comment in the workflow); the other jobs also run on `main`.
+
+`main` is protected: changes land through a pull request, and the five jobs
+below (`go`, `contracts`, `python`, `generated code is reproducible`, `e2e`)
+are required checks that must pass before it merges.
 
 - **go**: `gofmt -l`, `go build`, `go vet`, `go test -race -count=1`, `govulncheck`.
   `scripts/govulncheck.sh` fails on any called vulnerability not in
@@ -126,9 +129,8 @@ refuses a dirty tree (`ALLOW_DIRTY=1` overrides, for informal runs only).
 it refuses the ports of a live daemon and Prometheus (50551, 9464, 9090) and
 any port already in use. `PROTOC` and `PYTHON` select the tools when the ones
 on `PATH` are not the pinned versions.
-
-While GitHub Actions is unavailable, `make ci` passing on the PR head is the
-merge gate.
+`make ci` is the local equivalent of the required checks; run it before
+pushing to catch failures without waiting on a PR run.
 
 ## Deployment requirements
 

@@ -1,0 +1,32 @@
+# gitleaks configuration: the default rule set plus narrow allowlists for
+# values that are public by design and only look like secrets. Used by the
+# `secrets` job in .github/workflows/ci.yml and by `make ci`
+# (scripts/secrets.sh). Keep every entry exact; never allowlist a whole file
+# or rule. A finding that is a real secret is never allowlisted: rotate it,
+# then remove it (see docs/operations.md, "CI").
+title = "verilog"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Anvil's publicly known default dev keys #0 and #1 (scripts/e2e.sh, config tests); local chains only"
+targetRules = ["generic-api-key"]
+regexTarget = "secret"
+regexes = [
+  '''^0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80$''',
+  '''^0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d$''',
+]
+
+[[allowlists]]
+description = "Public on-chain bytes32 values (tx hashes, agent key ids) whose JSON field name contains 'key'"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = [
+  '''^deployments/[^/]+\.json$''',
+  '''^testdata/[^/]+_vectors\.json$''',
+]
+regexTarget = "match"
+regexes = [
+  '''^(agent_key|grant_key_admin_to_safe|deployer_renounce_key_admin)"\s*:\s*"0x[0-9a-fA-F]{64}"?$''',
+]

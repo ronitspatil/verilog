@@ -110,6 +110,10 @@ are required checks that must pass before it merges.
   so committed stubs, bindings (including the bytecode the Go tests deploy)
   and vectors must match their sources. Uses protoc 3.20.3 and Foundry v1.7.1.
 - **e2e**: `make e2e` against anvil; logs are uploaded as an artifact on failure.
+- **secrets**: gitleaks (pinned in `scripts/secrets.sh`) over the full history;
+  known non-secrets are allowlisted in `.gitleaks.toml` and `.gitleaksignore`.
+  If it flags a real key, rotate the key first, then remove it (the old value
+  stays in history; only then add its fingerprint to `.gitleaksignore`).
 
 Actions are pinned to commit SHAs; Dependabot proposes weekly grouped updates
 for actions and Go modules, and security updates for pip. Python version
@@ -120,7 +124,8 @@ upgrades and contract library bumps are manual (see above).
 `make ci` (`scripts/ci-local.sh`) runs every job above on your machine, with
 the same commands and the versions pinned in `ci.yml` (Foundry, protoc,
 govulncheck, pip-audit, Python; it reads them from the workflow and fails if
-a local tool differs). It runs all five jobs even when one fails, writes each
+a local tool differs; gitleaks is pinned in `scripts/secrets.sh`, which both
+run). It runs all six jobs even when one fails, writes each
 job's log to `ci-logs/<job>.log`, and ends with a pass/fail and duration table;
 the exit status is non-zero if any job failed. It prints the HEAD it tests and
 refuses a dirty tree (`ALLOW_DIRTY=1` overrides, for informal runs only).

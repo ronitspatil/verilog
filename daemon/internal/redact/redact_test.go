@@ -13,21 +13,24 @@ import (
 	"github.com/ethereum/go-ethereum/ethclient"
 )
 
-// Made-up credentials in each provider's URL shape.
+// Made-up credentials in each provider's URL shape: obviously fake values
+// (deadbeef..., 0000..., EXAMPLE..., fake-...) with each real key's length
+// and character set, so the token heuristics are still exercised but secret
+// scanners do not mistake them for real keys.
 var providers = []struct {
 	url     string
 	secrets []string
 	keep    []string
 }{
-	{"https://mainnet.infura.io/v3/9aa3d95b3bc440fa88ea12eaa4456161", []string{"9aa3d95b3bc440fa88ea12eaa4456161"}, []string{"mainnet.infura.io", "/v3/"}},
-	{"https://eth-mainnet.g.alchemy.com/v2/Abc_dEf-123ghIJkl456MNop789qrSTu", []string{"Abc_dEf-123ghIJkl456MNop789qrSTu"}, []string{"eth-mainnet.g.alchemy.com", "/v2/"}},
-	{"https://late-wild-sun.quiknode.pro/0f1e2d3c4b5a69788796a5b4c3d2e1f0a9b8c7d6/", []string{"0f1e2d3c4b5a69788796a5b4c3d2e1f0a9b8c7d6"}, []string{"quiknode.pro"}},
-	{"https://rpc.ankr.com/eth/4c7a1f0e9d8b7a6c5e4d3c2b1a0f9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1", []string{"4c7a1f0e9d8b7a6c5e4d3c2b1a0f9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1"}, []string{"rpc.ankr.com/eth/"}},
-	{"https://nd-123-456-789.p2pify.com/3c6e0b8a9c15224a8228b9a98ca1531d", []string{"3c6e0b8a9c15224a8228b9a98ca1531d"}, []string{"p2pify.com"}},
-	{"https://lb.drpc.org/ogrpc?network=ethereum&dkey=AmXq5Lk2pQ9rT7vW3yZ1bC4", []string{"AmXq5Lk2pQ9rT7vW3yZ1bC4"}, []string{"lb.drpc.org/ogrpc"}},
-	{"https://node.example.com/rpc?apikey=s3cr3t-key", []string{"s3cr3t-key"}, []string{"node.example.com/rpc"}},
-	{"https://operator:hunter2-pass@rpc.example.com:8545", []string{"operator", "hunter2-pass"}, []string{"rpc.example.com:8545"}},
-	{"wss://ws.example.com/ws/v3/a1b2c3d4e5f60718293a4b5c6d7e8f90?token=zzTop99", []string{"a1b2c3d4e5f60718293a4b5c6d7e8f90", "zzTop99"}, []string{"ws.example.com/ws/v3/"}},
+	{"https://mainnet.infura.io/v3/deadbeefdeadbeefdeadbeefdeadbeef", []string{"deadbeefdeadbeefdeadbeefdeadbeef"}, []string{"mainnet.infura.io", "/v3/"}},
+	{"https://eth-mainnet.g.alchemy.com/v2/EXAMPLE_alchemy-key_000000000000", []string{"EXAMPLE_alchemy-key_000000000000"}, []string{"eth-mainnet.g.alchemy.com", "/v2/"}},
+	{"https://late-wild-sun.quiknode.pro/feedfacefeedfacefeedfacefeedfacefeedface/", []string{"feedfacefeedfacefeedfacefeedfacefeedface"}, []string{"quiknode.pro"}},
+	{"https://rpc.ankr.com/eth/c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee000", []string{"c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee000"}, []string{"rpc.ankr.com/eth/"}},
+	{"https://nd-123-456-789.p2pify.com/00000000000000000000000000000000", []string{"00000000000000000000000000000000"}, []string{"p2pify.com"}},
+	{"https://lb.drpc.org/ogrpc?network=ethereum&dkey=EXAMPLE-dkey-0000000000", []string{"EXAMPLE-dkey-0000000000"}, []string{"lb.drpc.org/ogrpc"}},
+	{"https://node.example.com/rpc?apikey=fake-key", []string{"fake-key"}, []string{"node.example.com/rpc"}},
+	{"https://operator:fake-password@rpc.example.com:8545", []string{"operator", "fake-password"}, []string{"rpc.example.com:8545"}},
+	{"wss://ws.example.com/ws/v3/abcdef0123456789abcdef0123456789?token=fake-token", []string{"abcdef0123456789abcdef0123456789", "fake-token"}, []string{"ws.example.com/ws/v3/"}},
 }
 
 func TestURL(t *testing.T) {
@@ -64,7 +67,7 @@ func TestRedactorText(t *testing.T) {
 		}
 	}
 	// Harmless short query values stay readable.
-	if got := New("https://lb.drpc.org/ogrpc?network=ethereum&dkey=AmXq5Lk2pQ9rT7vW3yZ1bC4").String("network ethereum"); got != "network ethereum" {
+	if got := New("https://lb.drpc.org/ogrpc?network=ethereum&dkey=EXAMPLE-dkey-0000000000").String("network ethereum"); got != "network ethereum" {
 		t.Errorf("over-redacted: %s", got)
 	}
 }
@@ -72,7 +75,7 @@ func TestRedactorText(t *testing.T) {
 // A real dial/call error from go-ethereum's HTTP client, as main.go and the
 // anchor worker would log it.
 func TestRedactsRealRPCErrors(t *testing.T) {
-	const rpc = "http://operator:hunter2-pass@127.0.0.1:1/v3/9aa3d95b3bc440fa88ea12eaa4456161?apikey=s3cr3t-key"
+	const rpc = "http://operator:fake-password@127.0.0.1:1/v3/deadbeefdeadbeefdeadbeefdeadbeef?apikey=fake-key"
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	c, err := ethclient.DialContext(ctx, rpc)
@@ -90,7 +93,7 @@ func TestRedactsRealRPCErrors(t *testing.T) {
 	logger.Warn("anchor: attempt failed, retrying "+rpc, "err", err, "rpc", rpc, slog.Group("g", "u", rpc), "any", []string{rpc})
 	logger.With("rpc", rpc).Info("chain ready")
 	slog.New(r.Handler(slog.NewJSONHandler(&buf, nil))).Error("x", "err", err)
-	for _, s := range []string{"operator", "hunter2-pass", "9aa3d95b3bc440fa88ea12eaa4456161", "s3cr3t-key"} {
+	for _, s := range []string{"operator", "fake-password", "deadbeefdeadbeefdeadbeefdeadbeef", "fake-key"} {
 		if strings.Contains(wrapped.Error(), s) {
 			t.Errorf("error leaks %q: %s", s, wrapped)
 		}

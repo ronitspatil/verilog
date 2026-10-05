@@ -1,0 +1,14 @@
+# Historical gitleaks findings that are not secrets, ignored by exact
+# fingerprint (commit:file:rule:line) so scanning the full history passes.
+# Each entry pins one finding in one old commit; the same value added again
+# in a new commit is reported. Never add a real secret here before it has
+# been rotated (see docs/operations.md, "CI").
+
+# Made-up RPC-URL fixture in the redaction tests (the drpc dkey), replaced
+# with obviously fake values since.
+8e86c3174c8adc9600a6a26a936b2dbba777f516:daemon/internal/redact/redact_test.go:generic-api-key:27
+8e86c3174c8adc9600a6a26a936b2dbba777f516:daemon/internal/redact/redact_test.go:generic-api-key:67
+
+# A garbled copy of anvil's public dev key #0 in an early config test,
+# corrected to the real anvil key in a later commit.
+baa423bfeeaa0a28fe4e3b5c6d65e9d7cf18be36:daemon/internal/config/config_test.go:generic-api-key:13

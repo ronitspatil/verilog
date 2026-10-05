@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Local CI: runs the same checks as every job in .github/workflows/ci.yml
-# (go, contracts, python, reproducible, e2e) on this machine, against the
-# committed HEAD. Every job runs even if an earlier one fails; a summary table
-# follows, and the exit status is non-zero if any job failed.
+# (go, contracts, python, reproducible, e2e, secrets) on this machine, against
+# the committed HEAD. Every job runs even if an earlier one fails; a summary
+# table follows, and the exit status is non-zero if any job failed.
 #
 # Usage: make ci   (or scripts/ci-local.sh)
 #
@@ -16,7 +16,8 @@
 #   CI_E2E_GRPC_PORT       daemon gRPC port for e2e (default 25051)
 #
 # Pinned versions (Foundry, protoc, govulncheck, pip-audit, Python) are read
-# from ci.yml so the two cannot drift. Logs go to ci-logs/<job>.log.
+# from ci.yml so the two cannot drift; gitleaks is pinned in scripts/secrets.sh,
+# which both run. Logs go to ci-logs/<job>.log.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -184,12 +185,16 @@ job_e2e() {
   return "$rc"
 }
 
-# Job timeouts mirror timeout-minutes in ci.yml.
-job_timeout() {
-  case "$1" in go) echo 1200 ;; contracts) echo 900 ;; python) echo 900 ;; reproducible) echo 1200 ;; e2e) echo 1500 ;; esac
+job_secrets() {
+  echo "+ scripts/secrets.sh"; ./scripts/secrets.sh
 }
 
-ALL_JOBS="go contracts python reproducible e2e"
+# Job timeouts mirror timeout-minutes in ci.yml.
+job_timeout() {
+  case "$1" in go) echo 1200 ;; contracts) echo 900 ;; python) echo 900 ;; reproducible) echo 1200 ;; e2e) echo 1500 ;; secrets) echo 300 ;; esac
+}
+
+ALL_JOBS="go contracts python reproducible e2e secrets"
 JOBS="${CI_JOBS:-$ALL_JOBS}"
 for j in $JOBS; do
   case " $ALL_JOBS " in *" $j "*) ;; *) echo "ci-local: unknown job '$j' (jobs: $ALL_JOBS)" >&2; exit 2 ;; esac

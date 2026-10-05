@@ -167,3 +167,17 @@ jobs:
           name: e2e-logs
           path: ${{ runner.temp }}/e2e
           retention-days: 7
+
+  # Secret scan over the full history of the tested commit (the PR merge
+  # commit, or the push to main), so every new commit is covered. gitleaks
+  # is a pinned, checksum-verified release binary (scripts/secrets.sh, also
+  # run by make ci). Allowlists: .gitleaks.toml and .gitleaksignore.
+  secrets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: scripts/secrets.sh
